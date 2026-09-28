@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flowdivide"
+version = "1.0.0"
+description = "A partition of a flow-direction grid that fits a memory capacity, and the hydrographic attributes computed on it region by region"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+classifiers = ["License :: OSI Approved :: MIT License", "Programming Language :: Python :: 3"]
+authors = [{name = "Lulu Jiang", email = "lulu_jiang@pku.edu.cn"}]
+dependencies = ["numpy", "numba", "rasterio", "GDAL", "pandas", "geopandas", "pyogrio", "pyarrow", "shapely", "scipy", "matplotlib"]
+
+[project.urls]
+Homepage = "https://fullhydro.org/tools/"
+
+[project.scripts]
+flowdivide = "flowdivide:main"
+
+[tool.setuptools]
+py-modules = ["flowdivide", "fd_tables", "fd1_partition", "fd2_views", "fd3_attributes", "tile_kernels", "three_ways"]

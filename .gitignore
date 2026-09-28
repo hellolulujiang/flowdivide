@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+flowdivide_output/
+.DS_Store
