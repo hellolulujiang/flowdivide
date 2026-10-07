@@ -40,12 +40,19 @@ are computed for the basins of at least min_basin_area_km2 (1 km2 by default) an
 cut basins; every other pixel keeps the nodata value.
 """
 import collections
+import contextlib
+import glob
 import math
 import os
 import platform
 import resource
 import shutil
 import time
+
+try:
+    import fcntl                                   # not on Windows: there the output is not locked
+except ImportError:
+    fcntl = None
 
 import numpy as np
 import pandas as pd
@@ -64,7 +71,7 @@ SWEPT_ATTRIBUTES = ("shv", "ldn", "hck", "lup", "ord")   # every class but the l
 PARTITION_BASIN_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_lon", "outlet_lat", "basin_grid_count", "basin_area_km2",
                            "basin_row_min", "basin_row_max", "basin_col_min", "basin_col_max")
 # the output blocks two regions share are held in memory up to this many bytes, the rest on disk (HeldBlocks);
-# FLOWDIVIDE_HELD_MEMORY_MB sets another budget
+# FLOWDIVIDE_HELD_MEMORY_MB sets another budget, in MiB
 HELD_MEMORY_BYTES_DEFAULT = 512 * 2 ** 20
 
 
@@ -74,12 +81,12 @@ def peak_memory_gb():
 
 
 def held_memory_bytes():
-    """the memory budget of the held output blocks: FLOWDIVIDE_HELD_MEMORY_MB, or 512 MB"""
+    """the memory budget of the held output blocks: FLOWDIVIDE_HELD_MEMORY_MB (MiB), or 512 MiB"""
     text = os.environ.get("FLOWDIVIDE_HELD_MEMORY_MB")
     if text is None:
         return HELD_MEMORY_BYTES_DEFAULT
     if not text.isdigit():
-        raise FlowDivideError("FLOWDIVIDE_HELD_MEMORY_MB is a whole number of megabytes, got '%s'" % text)
+        raise FlowDivideError("FLOWDIVIDE_HELD_MEMORY_MB is a whole number of MiB, got '%s'" % text)
     return int(text) * 2 ** 20
 
 
@@ -88,12 +95,13 @@ class HeldBlocks:
 
     A block is kept whole in the raster's own type.  The most recently held blocks stay in memory up to a budget of
     bytes; the older ones go to a scratch directory as raw .npy files and come back from there when a region needs
-    them (np.save and np.load keep the dtype and every bit, so a block comes back as it went).  Without the budget the
+    them (np.save and np.load keep the dtype and every bit, so a block comes back as it went).  The directory is
+    <prefix>.<process id>: a run removes the directories of runs that are no longer alive, never one in use.  Without the budget the
     held blocks grew with the continent and not with the capacity: up to 12,024 blocks, 12.6 GB, for the upstream flow
     length on North America at 2^30.  Used as a dictionary by RegionWindow.write_back: `in`, pop, item assignment, len."""
 
-    def __init__(self, directory, budget_bytes):
-        self.directory = directory
+    def __init__(self, prefix, budget_bytes):
+        self.directory = "%s.%d" % (prefix, os.getpid())
         self.budget_bytes = int(budget_bytes)
         self.memory = collections.OrderedDict()        # block index -> values, the oldest first
         self.memory_bytes = 0
@@ -101,7 +109,7 @@ class HeldBlocks:
         self.largest_memory_bytes = 0
         self.largest_count = 0
         self.written_to_disk = 0
-        self.remove_directory()                        # what a run that stopped left there
+        self._remove_what_stopped_runs_left(prefix)
 
     def _path(self, index):
         return os.path.join(self.directory, "block_%d_%d.npy" % index)
@@ -158,6 +166,36 @@ class HeldBlocks:
     def remove_directory(self):
         if os.path.isdir(self.directory):
             shutil.rmtree(self.directory)
+
+    def remove_quietly(self, tag="fd3"):
+        """on the way out of an error: the scratch directory goes if it can, and a failure here is logged, not raised,
+        so that it does not hide the error"""
+        try:
+            if os.path.isdir(self.directory):
+                shutil.rmtree(self.directory)
+        except Exception as failure:
+            log(tag, "the scratch directory %s could not be removed: %s" % (self.directory, failure))
+
+    @staticmethod
+    def _remove_what_stopped_runs_left(prefix):
+        """the scratch directories of this output whose run is gone: <prefix> itself (0.7.4 named it so) and every
+        <prefix>.<process id> whose process no longer exists; a directory of a live process is left alone"""
+        for path in [prefix] + glob.glob(glob.escape(prefix) + ".*"):
+            if not os.path.isdir(path):
+                continue
+            if path != prefix:
+                suffix = path[len(prefix) + 1:]
+                if not suffix.isdigit():
+                    continue
+                try:
+                    os.kill(int(suffix), 0)
+                    if int(suffix) != os.getpid():
+                        continue                       # a live run's: not ours to remove
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    continue                           # alive, another user's
+            shutil.rmtree(path)
 
 
 # =============================================================================
@@ -949,7 +987,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
             remaining -= length
     # the blocks two regions share, until the last of them has written: in memory up to the budget, the rest on disk
     held = HeldBlocks(out_path + ".held_blocks", held_memory_bytes())
-    log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB; held blocks kept in memory up to %d MB"
+    log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB; held blocks kept in memory up to %d MiB"
         % (len(regions_in_order), peak_memory_gb(), held.budget_bytes // 2 ** 20))
     # every dataset opened is closed on any error too, not on the normal path only, and
     # the channel mask and the upstream area are checked to lie on the grid of the flow directions before they are
@@ -969,8 +1007,11 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
         _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dataset, area_dataset)
     except BaseException:
         for dataset in opened:
-            dataset.close()
-        held.clear()
+            try:
+                dataset.close()
+            except Exception as failure:          # logged: the error that brought the run here is the one raised
+                log(tag, "closing %s after the error failed too: %s" % (getattr(dataset, "name", "a dataset"), failure))
+        held.remove_quietly(tag)
         raise
     try:
         for visit, region_id in enumerate(regions_in_order):
@@ -1285,10 +1326,13 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
         held.clear()
     except BaseException:
         for dataset in opened:
-            dataset.close()
-        held.clear()
+            try:
+                dataset.close()
+            except Exception as failure:          # logged: the error that brought the run here is the one raised
+                log(tag, "closing %s after the error failed too: %s" % (getattr(dataset, "name", "a dataset"), failure))
+        held.remove_quietly(tag)
         raise
-    log(tag, "the regions are done %.1f s into the run; held blocks: at most %d at once, at most %.0f MB of them in "
+    log(tag, "the regions are done %.1f s into the run; held blocks: at most %d at once, at most %.0f MiB of them in "
              "memory, %d written to disk; peak memory %.1f GB"
         % (time.time() - started, held.largest_count, held.largest_memory_bytes / 2 ** 20, held.written_to_disk,
            peak_memory_gb()))
@@ -1590,12 +1634,39 @@ def derive_attribute(attribute, partition, dir_path, out_path, table_path, membe
     covers_small_basins = attribute in ("ldn", "lup") and partition.small_basin_id.size > 0
     if not partition.basins and not covers_small_basins:
         raise FlowDivideError("no basin reaches the area the attributes are computed for; nothing to compute")
-    if attribute in SWEPT_ATTRIBUTES:
-        return derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_path,
-                                         member_table_path, channel_path, area_path, tag, started)
-    if attribute == "lfp":
-        return _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started)
+    with _the_only_run_writing(out_path):
+        if attribute in SWEPT_ATTRIBUTES:
+            return derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_path,
+                                             member_table_path, channel_path, area_path, tag, started)
+        if attribute == "lfp":
+            return _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started)
     raise FlowDivideError("the attribute '%s' has no traversal: every class but the longest flow path is swept in order (section [2b])" % attribute)
+
+@contextlib.contextmanager
+def _the_only_run_writing(out_path):
+    """an exclusive lock on <out_path>.lock for as long as one run writes the output: a second run on the same output
+    (it would write the same partial raster and scratch directory) is refused before it touches anything.  flock is
+    released by the system when the process ends, however it ends, so a run that was killed leaves no stale lock.  The
+    file stays (empty): flock locks the file, not its name, and a run that removed it could let two later runs lock two
+    files of one name."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = out_path + ".lock"
+    os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
+    handle = open(lock_path, "a")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise FlowDivideError("another run is writing %s (it holds %s)" % (out_path, lock_path))
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
 
 class _nothing:
     """a stand-in for a raster that is not needed, usable in a with statement"""

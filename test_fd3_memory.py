@@ -1,4 +1,4 @@
-"""test_fd3_memory.py -- the three changes of 0.7.4 that bound the memory of FD3, checked on made-up data.
+"""test_fd3_memory.py -- the changes of 0.7.4 and 0.7.5 that bound the memory of FD3, checked on made-up data.
 
     python3 test_fd3_memory.py
 
@@ -51,13 +51,29 @@ def test_held_blocks():
     rng = np.random.default_rng(7)
     scratch = tempfile.mkdtemp(prefix="held_blocks_test_")
     try:
-        directory = os.path.join(scratch, "out.tif.held_blocks")
-        os.makedirs(directory)
-        with open(os.path.join(directory, "block_9_9.npy"), "w") as handle:
-            handle.write("left over by a run that stopped")
+        prefix = os.path.join(scratch, "out.tif.held_blocks")
+        directory = "%s.%d" % (prefix, os.getpid())
+        dead = 999999
+        while True:                                   # a process id that is not alive
+            try:
+                os.kill(dead, 0)
+                dead += 1
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                dead += 1
         for budget in (0, 3 * 2 ** 20, 2 ** 40):
-            held = fd3.HeldBlocks(directory, budget)
-            check("budget %d: a scratch directory left over is cleared at the start" % budget, not os.path.exists(directory))
+            for left_over in (prefix, "%s.%d" % (prefix, dead), "%s.%d" % (prefix, os.getppid())):
+                os.makedirs(left_over, exist_ok=True)
+                with open(os.path.join(left_over, "block_9_9.npy"), "w") as handle:
+                    handle.write("left over by a run")
+            held = fd3.HeldBlocks(prefix, budget)
+            check("budget %d: the directory is the prefix and this process's id" % budget, held.directory == directory)
+            check("budget %d: what a stopped run left is cleared at the start (0.7.4's name, a dead process's)" % budget,
+                  not os.path.exists(prefix) and not os.path.exists("%s.%d" % (prefix, dead)))
+            check("budget %d: a live process's directory is left alone" % budget,
+                  os.path.isdir("%s.%d" % (prefix, os.getppid())))
+            shutil.rmtree("%s.%d" % (prefix, os.getppid()))
             kinds = blocks_of_every_kind(rng)
             kept = {}
             for number, (name, block) in enumerate(kinds * 3):
@@ -99,6 +115,10 @@ def test_held_blocks():
             held.clear()
             check("budget %d: clear leaves nothing, the scratch directory gone" % budget,
                   len(held) == 0 and not os.path.exists(directory))
+            held[(5, 5)] = kinds[0][1].copy()
+            held[(6, 6)] = kinds[1][1].copy()
+            held.remove_quietly()
+            check("budget %d: remove_quietly takes the directory away" % budget, not os.path.exists(directory))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -184,6 +204,14 @@ def test_read_basin_table_columns():
             "a row cut off the end": lambda lines: lines.pop(len(lines) - 2),
             "a header column renamed": lambda lines: lines.__setitem__(0, lines[0].replace("outlet_flag", "flag")),
             "a header column missing": lambda lines: lines.__setitem__(0, " ".join(lines[0].split(" ")[:-1])),
+            "two faults, the later column in the first chunk": lambda lines: (set_field(lines, 1, "global_basin_id", "0.5"),
+                                                                            set_field(lines, 1001, "basin_id", "x")),
+            "one column out of range in a chunk and not whole in a later one": lambda lines: (
+                set_field(lines, 2, "region_id", "4294967296"), set_field(lines, 3001, "region_id", "1.5")),
+            "a row with one value too many opening a later chunk": lambda lines: lines.__setitem__(5001, lines[5001] + " 7"),
+            "a row with one value too many inside a chunk": lambda lines: lines.__setitem__(5017, lines[5017] + " 7"),
+            "a value too many in the middle of a row": lambda lines: lines.__setitem__(4001, lines[4001].replace(" ", " 9 ", 1)),
+            "a row with one value too few": lambda lines: lines.__setitem__(2001, lines[2001].rsplit(" ", 1)[0]),
         }
         for name, damage in damages.items():
             copy = os.path.join(scratch, "damaged", "global", "table", "basin_table_fine_test.csv")
@@ -194,6 +222,25 @@ def test_read_basin_table_columns():
             expected = message_of(lambda: fd_tables.read_basin_table(copy))
             found = message_of(lambda: fd_tables.read_basin_table_columns(copy, fd3.PARTITION_BASIN_COLUMNS, chunk_rows=1000))
             check("%s: refused%s" % (name, "" if expected == found else "\n          read_basin_table: %s\n          the columns:      %s" % (expected, found)),
+                  expected is not None and expected == found)
+        # a blank line is skipped by both readers alike
+        copy = os.path.join(scratch, "blank", "global", "table", "basin_table_fine_test.csv")
+        os.makedirs(os.path.dirname(copy), exist_ok=True)
+        shutil.copy(path, copy)
+        shutil.copy(path + ".done", copy + ".done")
+        damaged(copy, lambda lines: lines.insert(3001, ""))
+        whole_blank = fd_tables.read_basin_table(copy)
+        part_blank = fd_tables.read_basin_table_columns(copy, fd3.PARTITION_BASIN_COLUMNS, chunk_rows=1000)
+        check("a blank line between rows: skipped by both, the same rows read",
+              len(whole_blank) == len(part_blank) == 10007 and
+              all(np.array_equal(whole_blank[name].to_numpy(), part_blank[name].to_numpy()) for name in part_blank.columns))
+        for blanks in (30, 3):
+            shutil.copy(path, copy)
+            damaged(copy, lambda lines: lines.insert(5001, " " * blanks))
+            expected = message_of(lambda: fd_tables.read_basin_table(copy))
+            found = message_of(lambda: fd_tables.read_basin_table_columns(copy, fd3.PARTITION_BASIN_COLUMNS, chunk_rows=1000))
+            check("a line of %d blanks only: refused as read_basin_table refuses it%s" % (blanks, "" if expected == found else
+                  "\n          read_basin_table: %s\n          the columns:      %s" % (expected, found)),
                   expected is not None and expected == found)
         with open(path + ".done") as handle:
             marker = handle.read()
@@ -264,7 +311,36 @@ def test_main_stem_donor():
               np.array_equal(old_donor, new_donor.astype(np.int64)))
 
 
+def test_the_lock():
+    if fd3.fcntl is None:
+        check("the lock: not on this system (no fcntl), skipped", True)
+        return
+    scratch = tempfile.mkdtemp(prefix="lock_test_")
+    try:
+        out_path = os.path.join(scratch, "x.tif")
+        with fd3._the_only_run_writing(out_path):
+            check("the lock: held while the run writes", os.path.exists(out_path + ".lock"))
+            try:
+                with fd3._the_only_run_writing(out_path):
+                    pass
+                check("the lock: a second run on the same output is refused", False)
+            except fd3.FlowDivideError:
+                check("the lock: a second run on the same output is refused", True)
+        with fd3._the_only_run_writing(out_path):
+            check("the lock: free again when the run ends (its file stays, empty)", os.path.exists(out_path + ".lock"))
+        try:
+            with fd3._the_only_run_writing(out_path):
+                raise ValueError("a run that fails")
+        except ValueError:
+            pass
+        with fd3._the_only_run_writing(out_path):
+            check("the lock: a run that failed leaves the output free", True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 if __name__ == "__main__":
+    test_the_lock()
     test_held_blocks()
     test_read_basin_table_columns()
     test_main_stem_donor()

@@ -54,7 +54,7 @@ Every step checks its own output, and a stopped run resumes where it stopped.
 
     python test_region_numbering.py
 
-Five tests need no data; the rest run on a basin cut from a finished run
+Eight tests need no data; the rest run on a basin cut from a finished run
 (see the [user guide](docs/user-guide.md#tests)).
 
 ## Acknowledgements

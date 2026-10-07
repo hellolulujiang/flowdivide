@@ -56,8 +56,9 @@ two 30 m grids, the figures. The attributes are a separate step on one capacity:
     python flowdivide.py run south-america --out-root /data/flowdivide --steps fd3 --attributes shv,ldn,hck,lup,lfp,ord --capacity 2^31
 
 FD3 holds one region's window at a time. The output blocks that two regions share wait for the second region in
-memory up to 512 MB (`FLOWDIVIDE_HELD_MEMORY_MB` sets another budget) and on disk beyond it, beside the output raster
-(`<raster>.held_blocks/`, removed when the step ends; on North America at 2^30 up to about 12 GB). Every region line
+memory up to 512 MiB (`FLOWDIVIDE_HELD_MEMORY_MB` sets another budget, in MiB) and on disk beyond it, beside the
+output raster (`<raster>.held_blocks.<process id>/`, removed when the step ends; on North America at 2^30 up to
+about 12 GB). Every region line
 of the log gives the peak memory so far.
 
 The HydroSHEDS ACC mosaic of a built-in grid can be replaced by a count made from the flow directions
@@ -294,11 +295,14 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_pixel_area_and_basin_ids.py       # pixel areas, carried-over basin ids
     python test_level_fold.py                     # the fold of the Level-03 groups to Level-02 and Level-01
     python test_color_id_style.py                 # the default style of a GeoPackage view
+    python test_grid_and_step_selection.py        # the grid check of FD3 and the --only selection
+    python test_native_cache_provenance.py        # the native inputs in the step markers
+    python test_fd3_memory.py                     # the held blocks, the chunked basin table, the Hack donor
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first five need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first eight need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their

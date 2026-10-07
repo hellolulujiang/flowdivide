@@ -38,6 +38,8 @@ Function index:
     [4] The region and piece tables: write_region_table, read_region_table, write_piece_table, read_piece_table
     [5] Basin maps: region_map_key, write_basin_map, read_basin_map, region_of_basin
 """
+import io
+import itertools
 import os
 import platform
 import time
@@ -45,7 +47,7 @@ import time
 import numpy as np
 import pandas as pd
 
-VERSION = "0.7.4"
+VERSION = "0.7.5"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -177,27 +179,59 @@ def _write_frame(frame, columns, float_formats, path, checks_summary, text_colum
     publish_with_marker(temporary, path, checks_summary)
 
 
-def _check_column_types(frame, path, float_columns, text_columns):
-    """what the reader refuses: an integer column holding a fraction or a word, a number
-    column holding inf or nan, and an id or a code outside 0 .. 2^32 - 1 (it would wrap when taken as unsigned)"""
+def _column_faults(frame, float_columns, text_columns):
+    """what _check_column_types refuses in a frame, column by column, without raising: {column: "finite", "whole" or
+    "range"}; a chunk's faults are gathered with merge_column_faults so that a table read in chunks is refused as it
+    would be read whole"""
+    faults = {}
     if len(frame) == 0:
-        return
+        return faults
     for name in frame.columns:
         if name in text_columns:
             continue
         kind = frame[name].dtype.kind
         if name in float_columns:
             if kind not in "iuf" or not np.isfinite(frame[name].to_numpy(np.float64)).all():
-                raise TableError("column %s of %s holds a value that is not a finite number" % (name, path))
+                faults[name] = "finite"
             continue
         if kind not in "iu":
-            raise TableError("column %s of %s holds a value that is not a whole number" % (name, path))
+            faults[name] = "whole"
+            continue
         # an id is unsigned 32-bit and a code signed 32-bit
         if name.endswith("_id") or name.endswith("_code"):
             values = frame[name].to_numpy(np.int64)
             largest = 2 ** 32 - 1 if name.endswith("_id") else 2 ** 31 - 1
             if (values < 0).any() or (values > largest).any():
-                raise TableError("column %s of %s holds a value outside 0 .. %d" % (name, path, largest))
+                faults[name] = "range"
+    return faults
+
+
+def merge_column_faults(gathered, faults):
+    """the faults of one more chunk added: a column that is not of its type in any chunk is not of its type in the
+    table, which the reader reports before a value out of range"""
+    for name, fault in faults.items():
+        if gathered.get(name) in (None, "range"):
+            gathered[name] = fault
+    return gathered
+
+
+def _raise_column_fault(faults, columns, path):
+    """the first column of the table that holds a fault, with the message _check_column_types has always given"""
+    for name in columns:
+        fault = faults.get(name)
+        if fault == "finite":
+            raise TableError("column %s of %s holds a value that is not a finite number" % (name, path))
+        if fault == "whole":
+            raise TableError("column %s of %s holds a value that is not a whole number" % (name, path))
+        if fault == "range":
+            largest = 2 ** 32 - 1 if name.endswith("_id") else 2 ** 31 - 1
+            raise TableError("column %s of %s holds a value outside 0 .. %d" % (name, path, largest))
+
+
+def _check_column_types(frame, path, float_columns, text_columns):
+    """what the reader refuses: an integer column holding a fraction or a word, a number
+    column holding inf or nan, and an id or a code outside 0 .. 2^32 - 1 (it would wrap when taken as unsigned)"""
+    _raise_column_fault(_column_faults(frame, float_columns, text_columns), list(frame.columns), path)
 
 
 def _check_header(path, columns, what):
@@ -380,14 +414,37 @@ def read_basin_table_columns(path, columns, chunk_rows=BASIN_TABLE_CHUNK_ROWS):
     fits = promised <= os.path.getsize(path) // (2 * len(BASIN_TABLE_COLUMNS))
     arrays = {name: np.empty(promised if fits else 0, np.float64 if name in BASIN_TABLE_FLOAT_FORMATS else np.int64) for name in kept}
     rows = 0
-    for chunk in pd.read_csv(path, sep=" ", float_precision="round_trip", keep_default_na=False, chunksize=chunk_rows):
-        _check_column_types(chunk, path, BASIN_TABLE_FLOAT_FORMATS, ())
-        count = len(chunk)
-        if fits and rows + count <= promised:
-            for name in kept:
-                arrays[name][rows:rows + count] = chunk[name].to_numpy(arrays[name].dtype)
-        rows += count
-        del chunk
+    faults = {}
+    line_number = 1                                   # the header is line 1
+    with open(path, "rb") as handle:
+        handle.readline()
+        while True:
+            lines = list(itertools.islice(handle, chunk_rows))
+            if not lines:
+                break
+            # the fields of every line counted here, not by pandas: read in chunks, pandas takes a line with one value
+            # too many that opens a chunk as one with an index and drops the value without a word (pandas 2.2).  Read
+            # whole, the table is refused at such a line, and so it is here, with pandas' own message
+            for offset, line in enumerate(lines):
+                fields = line.count(b" ") + 1         # an empty line has none and pandas skips it; a line of blanks
+                                                      # pandas counts as fields, and so does this
+                if fields > len(BASIN_TABLE_COLUMNS):
+                    raise pd.errors.ParserError("Error tokenizing data. C error: Expected %d fields in line %d, saw %d\n"
+                                                % (len(BASIN_TABLE_COLUMNS), line_number + 1 + offset, fields))
+            line_number += len(lines)
+            chunk = pd.read_csv(io.BytesIO(b"".join(lines)), sep=" ", header=None, names=BASIN_TABLE_COLUMNS,
+                                index_col=False, float_precision="round_trip", keep_default_na=False)
+            del lines
+            # every chunk is read, as the whole table is, and the fault reported is the one the whole table gives:
+            # the first column, in the table's order, whose values are not all of its type
+            merge_column_faults(faults, _column_faults(chunk, BASIN_TABLE_FLOAT_FORMATS, ()))
+            count = len(chunk)
+            if not faults and fits and rows + count <= promised:
+                for name in kept:
+                    arrays[name][rows:rows + count] = chunk[name].to_numpy(arrays[name].dtype)
+            rows += count
+            del chunk
+    _raise_column_fault(faults, BASIN_TABLE_COLUMNS, path)
     if rows != promised:
         raise TableError("%s holds %d rows and its completion marker promises %d: the table was cut short" % (path, rows, promised))
     table = pd.DataFrame(index=pd.RangeIndex(rows))

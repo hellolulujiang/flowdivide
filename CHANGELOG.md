@@ -2,6 +2,23 @@
 
 Renumbered on 2026-10-06: the versions first named 1.0.0 to 1.0.4 are 0.7.0 to 0.7.4, so that 1.0.0 names the version the paper describes. The version published on GitHub on 2026-09-28 as 1.0.0 is 0.7.0.
 
+## 0.7.5 (2026-10-06)
+
+After the review of 0.7.4 by GitHub Copilot (gpt-6.1-sol) and agy; the rasters and tables do not change.
+`fd_tables.read_basin_table_columns` counts the values of every line itself: read in chunks, pandas took a line with
+one value too many that opens a chunk as a line with an index and dropped the value without a word; such a table is
+now refused with pandas' own message, as the whole reader refuses it, and a table with faults in several columns is
+refused for the first column in the table's order, also as the whole reader does (`_column_faults`,
+`merge_column_faults`). The held blocks go to `<raster>.held_blocks.<process id>`, and a run removes only the scratch
+directories of runs no longer alive; on an error every dataset is closed and the scratch directory removed, a failure
+there logged without hiding the error. One run writes an output at a time: `derive_attribute` holds an exclusive lock
+on `<raster>.lock` (flock, released by the system however the process ends; the empty file stays, since flock locks
+the file and not its name; not on Windows). The budget is 512 MiB
+(`FLOWDIVIDE_HELD_MEMORY_MB`, in MiB). `measure_fd3_memory.py` holds the region map against the capacity, block and
+grouping its directory is named for, as `flowdivide.py` does (a projected grid's `<N>blocks` meaning blocks of 5000
+pixels), follows links before it decides that the out directory lies outside the dataset root, and writes only into a
+new or empty directory. README and user guide list the eight tests that need no data.
+
 ## 0.7.4 (2026-10-06)
 
 The memory of FD3 follows the capacity. The output blocks that two regions share were held in memory until the

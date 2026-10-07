@@ -66,7 +66,7 @@ from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, ch
                            basin_rectangles, group_windows_in_pixels)
 import fd_tables
 
-FLOWDIVIDE_VERSION = "0.7.4"            # named in the metadata of every vector file (flowdivide.py’s VERSION says the same)
+FLOWDIVIDE_VERSION = "0.7.5"            # named in the metadata of every vector file (flowdivide.py’s VERSION says the same)
 
 CELL_MIN_LAND_PERCENT = 25              # a cell with less land than this stays water
 CELL_MIN_WINNER_PERCENT = 25            # a candidate basin holds at least this much of the cell's land
