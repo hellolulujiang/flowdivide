@@ -72,7 +72,7 @@ import fd_tables
 from fd1_partition import (DROW, DCOL, IS_LAND, IS_TERMINAL, MERIT_NODATA, FlowDivideError, Grid, RASTER_BLOCK, check_merit_flow_directions, earth_distance_m, log, publish,
                            raster_profile, read_block, read_table, timing, write_block, write_json, write_table, ensure_directory)
 
-PATH_FRAMES = 1 << 22         # pixels of the longest flow path a member can hold, the one walk that is a path
+PATH_FRAMES = 1 << 22         # the points lfp's path buffers start with (doubled for a longer path)
 SWEPT_ATTRIBUTES = ("shv", "ldn", "hck", "lup", "ord")   # every class but the longest flow path, which
                                                          # walks one path and not a whole member
 # the columns of the basin table the partition reads (fd_tables.read_basin_table_columns keeps only these)
@@ -469,7 +469,16 @@ class Partition:
             cols_min = max(cols_min, 0)
             cols_max = min(cols_max, self.grid.ncol)
         elif cols_max - cols_min > self.grid.ncol:
-            raise FlowDivideError("the window of region %d is wider than the grid; a periodic window may not hold a column twice" % region_id)
+            # a region all the way round the grid, or all but one column: its window with a column of margin on each side
+            # would hold a column twice.  Such a region is refused, not computed in a window that holds the free column
+            # once: the tables do not say which column is free (the box of a region may span every column although one
+            # is free, and the small basins' boxes are not kept), and with one copy of it the column of a child's outlet
+            # there, which decides the tie of the Hack order's main stem, would depend on where the window starts
+            # (Codex, review of 0.7.8)
+            raise FlowDivideError("region %d spans %d of the %d columns of the periodic grid: its window, with a column of "
+                                  "margin on each side, would hold a column twice, and a region all the way round the grid, "
+                                  "or all but one column, is not computed; build the partition at a smaller capacity"
+                                  % (region_id, int(region.bbox_col_max) - int(region.bbox_col_min), self.grid.ncol))
         return (max(rows_min, 0), min(rows_max, self.grid.nrow), cols_min, cols_max)
 
 
@@ -2056,8 +2065,14 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # the distance covers every basin, so its member table also lists the pieces of a basin below the tables' area
     # that is cut (a min_basin_area_km2 above the cut's); the path is drawn for the basins of the tables only
     # reads its members at the tables' area
-    members_ldn = members_ldn[np.isin(members_ldn["basin_id"].to_numpy(np.int64), np.fromiter(partition.basins, np.int64, len(partition.basins)))]
-    if set(members_ldn["member_id"].astype(int)) != set(partition.members):
+    # the basins of the tables' area only: a partition read for the distance or the upstream flow length
+    # (raster_min_basin_area_km2=0) also holds the cut basins below that area, which lfp leaves out as a partition
+    # read for it leaves them out (Codex, review of 0.7.8)
+    path_basins = np.asarray(sorted(basin_id for basin_id, basin in partition.basins.items()
+                                    if basin["area_km2"] >= partition.table_min_basin_area_km2), np.int64)
+    members_ldn = members_ldn[np.isin(members_ldn["basin_id"].to_numpy(np.int64), path_basins)]
+    path_members = set(member.member_id for basin_id in path_basins.tolist() for member in partition.basins[basin_id]["members"])
+    if set(members_ldn["member_id"].astype(int)) != path_members:
         raise FlowDivideError("the distance table %s does not list exactly the members of this partition; run ldn again on it" % ldn_member_table)
     # every distance a finite number, not negative: an infinity would pass the length check below (inf > inf is
     # false) and be written as the basin's longest flow path
@@ -2067,8 +2082,42 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # the head of every basin, and the entry pixel of every member on the chain from the head down
     entry = {}
     heads = {}
+    # the farthest of the members' heads, and on a tie the smaller row and then the column further west in the basin.  A
+    # member's head_col is a column of its own region's window, unrolled; on a periodic grid two regions' windows are
+    # unrolled from different columns (whole turns apart), and the basin table's box need not say where the basin starts
+    # (FD1 may give a basin a box over every column).  So every member is placed beside the member it flows into: its
+    # outlet and its parent's inlet are neighbours, so the member's columns are shifted by the whole turns that bring the
+    # two within a column of each other, from the outlet member down the tree.  That lays the basin out as one connected
+    # run, the order a single window holding the whole basin gives its columns; inside one member the distance's sweep
+    # already broke the tie in its window, which holds the member as such a run too (Codex, review of 0.7.8)
+    turn_of_member = {}
+    if grid.periodic:
+        window_start = {}
+
+        def window_column(region_id, column):
+            # a grid column as the region's window holds it (region_rectangle's first column, unrolled), as head_col is
+            if region_id not in window_start:
+                window_start[region_id] = partition.region_rectangle(region_id)[2]
+            first = window_start[region_id]
+            return first + (column - first) % grid.ncol
+
+        for basin_id in path_basins.tolist():
+            basin_members = partition.basins[basin_id]["members"]
+            if len(basin_members) < 2:
+                continue
+            for member in sorted(basin_members, key=lambda m: (m.downstream_depth, m.member_id)):
+                if not member.parent_member_id:
+                    turn_of_member[member.member_id] = 0
+                    continue
+                parent = partition.members[member.parent_member_id]
+                inlet = window_column(parent.region_id, member.parent_inlet_col) + turn_of_member[parent.member_id]
+                outlet = window_column(member.region_id, member.outlet_col)
+                turn_of_member[member.member_id] = grid.ncol * int(round((inlet - outlet) / grid.ncol))
     for basin_id, group in members_ldn.groupby("basin_id"):
-        best = group.sort_values(["farthest_metres", "head_row", "head_col"], ascending=[False, True, True]).iloc[0]
+        column_in_the_basin = group["head_col"].to_numpy(np.int64) + np.asarray(
+            [turn_of_member.get(int(member_id), 0) for member_id in group["member_id"]], np.int64)
+        group = group.assign(column_in_the_basin=column_in_the_basin)
+        best = group.sort_values(["farthest_metres", "head_row", "column_in_the_basin"], ascending=[False, True, True]).iloc[0]
         member = partition.members[int(best["member_id"])]
         heads[int(basin_id)] = {"member_id": member.member_id, "head_row": int(best["head_row"]), "head_col": int(best["head_col"]), "length_m": float(best["farthest_metres"])}
         entry[member.member_id] = (int(best["head_row"]), int(best["head_col"]))
@@ -2082,13 +2131,16 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     profile = raster_profile(grid, "uint32", 0)
     with rasterio.open(temporary, "w", **profile) as created:
         pass
-    longest_member = max([m.pixel_count for m in partition.members.values()] + [1])
-    path_rows = np.empty(max(PATH_FRAMES, longest_member + 1), np.int64)        # a path is never longer than its member
-    path_cols = np.empty(path_rows.size, np.int64)
+    # 4 million points to start with (64 MB for the two), doubled for a longer path; a path is never longer than its
+    # member, so a buffer past the member's pixel count that is still too short means the flow does not reach the outlet
+    path_rows = np.empty(PATH_FRAMES, np.int64)
+    path_cols = np.empty(PATH_FRAMES, np.int64)
     segments = {}
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "r+") as out_dataset:
         for visit, region_id in enumerate(order):
-            members = [m for m in partition.members_by_region[region_id] if m.member_id in entry]
+            # .get: a partition read for the distance or the upstream flow length (raster_min_basin_area_km2=0) also
+            # lists regions of small basins only, which hold no member and no path
+            members = [m for m in partition.members_by_region.get(region_id, []) if m.member_id in entry]
             if not members:
                 continue
             rectangle = partition.region_rectangle(region_id)
@@ -2096,7 +2148,13 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
             for member in members:
                 start_row, start_col = window.local(grid, *entry[member.member_id])
                 end_row, end_col = window.local(grid, member.outlet_row, member.outlet_col)
-                status, count, length = paint_path_downstream(window.dir, window.out, window.lengths, start_row, start_col, end_row, end_col, np.uint32(member.basin_id), path_rows, path_cols)
+                while True:
+                    status, count, length = paint_path_downstream(window.dir, window.out, window.lengths, start_row, start_col, end_row, end_col, np.uint32(member.basin_id), path_rows, path_cols)
+                    if status != 1 or path_rows.size > member.pixel_count:
+                        break
+                    # the buffer is full: twice as long, and the path painted again (the same pixels, the same value)
+                    path_rows = np.empty(path_rows.size * 2, np.int64)
+                    path_cols = np.empty(path_rows.size, np.int64)
                 if status != 0:
                     raise FlowDivideError("lfp: the path segment of member %d (basin %d) ended with status %d" % (member.member_id, member.basin_id, status))
                 lon = grid.transform.c + (((path_cols[:count] + window.col0) % grid.ncol) + 0.5) * grid.pixel_width
@@ -2259,9 +2317,9 @@ def _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dat
 def derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path=None,
                           area_path=None, tag=None, gdal_cache_mb=None):
     """the driver for a registered rule: the same visit as derive_attribute_by_sweep, the kernel the user's, over the whole
-    window (the order, the downstream pixel and the member of every pixel of it, as in 0.7.6); GDAL's block cache bounded as
-    in derive_attribute"""
-    with rasterio.Env(GDAL_CACHEMAX=gdal_cache_bytes(gdal_cache_mb)):
+    window (the order, the downstream pixel and the member of every pixel of it, as in 0.7.6); GDAL's block cache bounded and
+    the output locked against a second run as in derive_attribute"""
+    with rasterio.Env(GDAL_CACHEMAX=gdal_cache_bytes(gdal_cache_mb)), _the_only_run_writing(out_path):
         return _derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path, area_path, tag)
 
 
@@ -2284,7 +2342,11 @@ def _derive_user_attribute(code, partition, dir_path, out_path, table_path, chan
         # pixel for pixel)
         _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dataset, area_dataset)
         for visit, region_id in enumerate(regions_in_order):
-            members = list(partition.members_by_region[region_id])
+            # a region of small basins only (a partition read with raster_min_basin_area_km2=0) holds no member: a
+            # registered rule covers the members, so there is nothing to compute there
+            members = list(partition.members_by_region.get(region_id, []))
+            if not members:
+                continue
             rectangle = partition.region_rectangle(region_id)
             # the same int32 bound the swept classes are held to: the visiting order indexes the window
             # with int32, and a window past that would wrap round silently

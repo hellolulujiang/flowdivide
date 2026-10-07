@@ -2,6 +2,52 @@
 
 Renumbered on 2026-10-06: the versions first named 1.0.0 to 1.0.4 are 0.7.0 to 0.7.4, so that 1.0.0 names the version the paper describes. The version published on GitHub on 2026-09-28 as 1.0.0 is 0.7.0.
 
+## 0.7.8 (2026-10-07)
+
+After the final review of 0.7.7 (Codex gpt-6-astra and agy, round 3) and the reviews of the fixes (rounds 4 and 5).
+On the two HydroSHEDS grids nothing the six attributes give changes. On a periodic grid only the longest flow path of
+a cut basin can change, when its members lie in regions whose windows are unrolled whole turns apart and two members'
+heads are exactly equally far in the same row (the lfp tie below; the basin need not cross the antimeridian). On the
+MERIT partitions on disk no region that holds a piece of a cut basin is unrolled (700deg2: 16 such regions, 350deg2:
+45, all within columns 18,219 to 385,836 of 432,000; 1400deg2 cuts no basin), so their lfp does not change.
+
+- A periodic region whose window, with a column of margin on each side, would hold a column twice (a region all the
+  way round the grid, or all but one column) is refused, as in 0.7.7, with a message that says why and what to do. The
+  first 0.7.8 computed a region of all but one column in a window that held the free column once; round 4 showed why
+  that cannot be right: the tables do not say which column is free (FD1 may give such a region a box over every
+  column, and the small basins' boxes are not kept), and with one copy of the free column the column of a child's
+  outlet there, which decides a tie of the Hack order's main stem, depends on where the window starts. The user guide
+  states the limit. On MERIT the widest region spans 62.3 degrees (1400deg2), so the paper's runs never meet it.
+- A partition read with `raster_min_basin_area_km2=0` (as for the distance and the upstream flow length) and used for
+  the longest flow path or a registered rule: a region of small basins only is in `region_order()` but holds no member
+  (KeyError). Both now pass over such a region. The longest flow path also draws only the basins of the tables' area:
+  such a partition keeps the cut basins below that area for the distance's raster, and lfp drew them as well, which a
+  partition read for lfp does not. `flowdivide.py` and `measure_fd3_memory.py` read a partition for each attribute, so
+  they never met either.
+- `derive_user_attribute` takes the output lock (`_the_only_run_writing`), as the six attributes do.
+- lfp, the tie between the heads of a cut basin's members (equally far from the outlet, in the same row): the column
+  of each head was taken in its own region's window, and on a periodic grid two regions' windows are unrolled from
+  different columns, so the head picked depended on the partition (Codex, round 5: on a 10-column grid one region
+  picked column 9, three pieces column 1). Each member is now placed beside the member it flows into -- its outlet and
+  its parent's inlet are neighbours, so its columns are shifted by the whole turns that bring the two within a column
+  -- from the outlet member down the tree, which lays the basin out as one connected run, the order one window holding
+  the whole basin gives its columns; inside one member the distance's sweep already breaks the tie in that order. The
+  basin table's box is not used: FD1 may give a basin a box over every column (Codex, round 6, against a first fix that
+  used it). On a grid that is not periodic nothing changes. `flowdivide.py` gives lfp's step its own rules version
+  (`LFP_RULES_VERSION` 2, in lfp's signature only), so that an lfp made before reruns and the other five attributes keep
+  their markers (checked: with an older lfp marker only lfp runs again).
+- lfp's two path buffers start at 4 million points and double for a longer path, instead of being reserved at the
+  largest member's pixel count. The user guide gives the memory a region's members take (some 50 bytes each) and
+  the North America measurements at 2^31 (22.3 GB), 2^30 (14.2 GB) and 2^29 (8.8 GB), made with 0.7.7.
+- `test_fd3_seam_and_reuse.py` (new, no data): a basin across the seam of a periodic grid of 10 columns whose box spans
+  8 of them (its window with the margins all 10), all six attributes and their tables equal to the same basin on a
+  flat grid; regions over 9 and 10 of the columns refused; on a partition read for the distance that holds a region of
+  small basins only and a cut basin below the tables' area, lfp equal to lfp on a partition read for it, and a
+  registered rule run; the lock of a registered rule; two heads equally far across the seam, the basin as one region
+  and as three pieces in three regions: the same path, also with a basin box over every column and a region unrolled a
+  whole turn away. The test grid spans the globe (10 columns of 36 degrees), so
+  that a step across the seam is measured as one column. 0.7.7 fails it (KeyError twice; the tie: column 9 against 1).
+
 ## 0.7.7 (2026-10-07)
 
 FD3 holds the region's own pixels, not its whole window, and bounds GDAL's block cache; the rasters and tables do not

@@ -69,15 +69,25 @@ FD3 holds one region at a time. What it holds, and what sets each part:
 
 The first two rows are those of the five swept attributes (shv, ldn, hck, lup, ord). The longest flow path (lfp) is painted
 along one path a basin, not swept: it reads a region's flow directions and its output window whole (5 bytes a
-window pixel, the output in UInt32), runs the distance first when no distance table is given, and keeps the points
-of every path until the lines are written.
+window pixel, the output in UInt32), runs the distance first when no distance table is given, keeps the points of
+every path until the lines are written, and walks a path with two buffers of 4 million points (64 MB), doubled for a
+longer path.
 
 For the distance and the upstream flow length, the largest of the swept attributes, a region takes about
 5 bytes for every pixel of its window and 12 for every pixel of its own, or 20 for every pixel of its own when that
-is more. On North America at 2^29 the largest windows hold 0.42 to 0.43 billion pixels, and one region alone took
-4.3 to 4.9 GB with this version where 0.7.6 took 11.1 to 12.5 GB (measured on regions 86301 and 78207). The upstream
-flow length over the whole of North America at 2^29, one process (`measure_fd3_memory.py`), peaked at 8.77 GB in
-2,544 s with this version, and at 16.0 GB in 2,627 s with 0.7.6.
+is more, and some 50 bytes for every member and small basin of the region (its outlet, its counts, the farthest pixel
+of the distance; 13 MB for the 255,719 small basins of North America's region 72102 at 2^29). On North America at
+2^29 the largest windows hold 0.42 to 0.43 billion pixels, and one region alone took 4.3 to 4.9 GB with 0.7.7 where
+0.7.6 took 11.1 to 12.5 GB (measured on regions 86301 and 78207).
+
+The upstream flow length over the whole of North America, one process (`measure_fd3_memory.py`, nothing else running
+on the machine), measured with 0.7.7, whose FD3 this version keeps:
+
+| Capacity | Peak | Seconds | 0.7.6 |
+|---|---|---|---|
+| 2^31 (160 deg²) | 22.3 GB | 2,765 | not measured; the code of the paper's runs (0.6) was stopped for memory on a 64 GB machine |
+| 2^30 (80 deg²) | 14.2 GB | 2,404 | 23.3 GB, 2,699 s |
+| 2^29 (40 deg²) | 8.8 GB | 2,544 | 16.0 GB, 2,627 s |
 
 GDAL keeps the blocks it has read in a cache. Without a bound it takes up to 5 % of the machine's memory: 3.2 GB on a
 64 GB machine, 0.8 GB on a 16 GB one. FD3 reads every window once and never comes back for it, so a larger cache
@@ -89,6 +99,11 @@ the process held 3.21 GB with GDAL's own bound and 0.71 GB with 512 MiB. To set 
 
 FD3 sets the cache itself and gives it back when the attribute is done, so `GDAL_CACHEMAX` does not reach it. The
 summary of a run prints both bounds, and every region line of the log gives the peak memory so far.
+
+On a periodic grid (MERIT, 360 degrees of longitude) a region's window takes a column of margin on each side of the
+region. A region all the way round the grid, or all but one column, would need a window that holds a column twice, and
+FD3 refuses it with a message; build the partition at a smaller capacity (on MERIT the widest region spans 62 degrees
+at 1,400 deg²).
 
 The HydroSHEDS ACC mosaic of a built-in grid can be replaced by a count made from the flow directions
 (`--acc`); the upstream area stays the provider's.
@@ -328,11 +343,12 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_native_cache_provenance.py        # the native inputs in the step markers
     python test_fd3_memory.py                     # the held blocks, the chunked basin table, the Hack donor
     python test_fd3_compact.py                    # the region's own pixels numbered (0.7.7) against the window order
+    python test_fd3_seam_and_reuse.py             # a basin across the seam of a periodic grid; a partition reused
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first nine need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first ten need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their

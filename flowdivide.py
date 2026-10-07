@@ -75,7 +75,7 @@ import fd2_views as fd2
 import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
-VERSION = "0.7.7"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
+VERSION = "0.7.8"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
 RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
                            # and a run into an old tree makes everything again instead of reading closed tables.
                            # The rules that make the results; a step's marker is tied to this, not to the
@@ -94,6 +94,9 @@ CHANNEL_RULES_VERSION = 2  # the test of a channel pixel in fd1.1: the threshold
                            # against the float32 area, as in FD3 (a double threshold decides otherwise at
                            # 1.00000001 km2).  In fd1.1's arguments, so that a mask of another test is made again,
                            # and asked of fd1.1's marker when fd3 runs alone
+LFP_RULES_VERSION = 2      # the longest flow path's own rules, in its step's signature only (the other five attributes
+                           # keep their markers): 2 (0.7.8): on a periodic grid the tie between the heads of a cut basin's
+                           # members is broken with the members laid out by their links, not in their regions' windows
 FD3_RULES_VERSION = 6      # 6: the channel and area grids must agree over the whole raster within 0.01 pixel
                            # the rules of stage 3 alone: the distance and the upstream flow length cover every basin
                            # however small, their tables still list the basins of min_basin_area_km2 and more; the
@@ -1450,7 +1453,8 @@ class Chain:
                 # stage 3 (the tie between two donors of equal area, the distance raster's nodata) must
                 # not let the new run skip the step.  It is named here and not in RULES_VERSION so that
                 # stages 1 and 2, which such a change does not touch, keep their markers
-                steps.append(Step("fd3_%s_%s" % (code, label), "capacity=%s grouping=%s min_area=%r fd3_rules=%d" % (self.capacity_name, grouping, float(self.min_basin_area_km2), FD3_RULES_VERSION), self.step_fd3, (code, blocks),
+                steps.append(Step("fd3_%s_%s" % (code, label), "capacity=%s grouping=%s min_area=%r fd3_rules=%d%s" % (self.capacity_name, grouping, float(self.min_basin_area_km2), FD3_RULES_VERSION,
+                                                                                                                     " lfp_rules=%d" % LFP_RULES_VERSION if code == "lfp" else ""), self.step_fd3, (code, blocks),
                                   outputs=outputs, products=products, inputs=needed, depends_on=depends, kind="fd3_%s" % code))
         if self.only is not None:
             # Recode was planned separately; a later selected step must not be

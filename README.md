@@ -59,7 +59,7 @@ flow directions of its window. GDAL's block cache is bounded at 512 MiB while th
 
     python test_region_numbering.py
 
-Nine tests need no data; the rest run on a basin cut from a finished run
+Ten tests need no data; the rest run on a basin cut from a finished run
 (see the [user guide](docs/user-guide.md#tests)).
 
 ## Acknowledgements
