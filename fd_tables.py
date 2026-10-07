@@ -47,7 +47,7 @@ import time
 import numpy as np
 import pandas as pd
 
-VERSION = "0.7.6"
+VERSION = "0.7.7"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1

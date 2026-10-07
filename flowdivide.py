@@ -75,7 +75,7 @@ import fd2_views as fd2
 import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
-VERSION = "0.7.6"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
+VERSION = "0.7.7"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
 RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
                            # and a run into an old tree makes everything again instead of reading closed tables.
                            # The rules that make the results; a step's marker is tied to this, not to the
@@ -642,6 +642,7 @@ class Chain:
         self.only = None                                # --only: the labels of the steps allowed to execute (None: every planned step)
         self.held_back = []                              # the planned steps --only held back, reported once
         self.timing = True                              # --timing on|off: the split of every step's time recorded, or only its total
+        self.gdal_cache_mb = None                       # --gdal-cache-mb: GDAL's block cache in fd3, MiB (None: FLOWDIVIDE_GDAL_CACHE_MB or 512)
         self.done = set()
         self.grid = None
         self.capacity_name = capacity_name
@@ -1089,6 +1090,8 @@ class Chain:
         add("  vector files         %s; at least %d colour numbers" % (" and ".join("GeoParquet" if f == "geoparquet" else "GeoPackage" for f in self.vector_formats), self.colours))
         if "fd3" in self.steps:
             add("  attributes           %s on %s" % (", ".join(self.attributes), self.capacity_name))
+            add("  memory of fd3        GDAL's block cache %d MiB (--gdal-cache-mb), the shared output blocks %d MiB in memory "
+                "(FLOWDIVIDE_HELD_MEMORY_MB)" % (fd3.gdal_cache_bytes(self.gdal_cache_mb) // 2 ** 20, fd3.held_memory_bytes() // 2 ** 20))
         add("")
         add("outputs   under %s/" % layout.root)
         root = layout.root + "/"
@@ -1704,7 +1707,7 @@ class Chain:
         ldn_members = layout.attribute_member_table("ldn", blocks, grouping)
         return fd3.derive_attribute(code, partition, layout.raster("dir"), layout.attribute(code, blocks, grouping), layout.attribute_table(code, blocks, grouping),
                                     layout.attribute_member_table(code, blocks, grouping), channel_path=layout.raster("str"), area_path=layout.raster("aca"),
-                                    ldn_member_table=ldn_members if os.path.exists(ldn_members) else None)
+                                    ldn_member_table=ldn_members if os.path.exists(ldn_members) else None, gdal_cache_mb=self.gdal_cache_mb)
 
 
 # =============================================================================
@@ -1762,6 +1765,7 @@ def parse_arguments(argv):
     how.add_argument("--in-process", action="store_true", help="run every step in this process instead of a child process each (the peak memory is then that of the whole run)")
     how.add_argument("--only", default=None, help="run only the steps named here, comma-separated labels as the plan prints them (e.g. fd1.5_regions_1400deg2,fd2_region_views_1400deg2); every other step is left as it stands, and the log lists the planned steps held back.  A step still refuses to run when a file it reads is missing")
     how.add_argument("--summary-only", action="store_true", help="print and save the run summary (what would be read, decided and written) and the plan, and run nothing")
+    how.add_argument("--gdal-cache-mb", type=int, default=None, help="GDAL's block cache while fd3 runs, in MiB (default 512, or FLOWDIVIDE_GDAL_CACHE_MB).  Unbounded, GDAL would keep 5 %% of the machine's memory (3.2 GB on 64 GB); fd3 reads each window once, so a larger cache only takes memory.  GDAL_CACHEMAX does not reach fd3")
     how.add_argument("--timing", default="on", choices=["on", "off"], help="on (the default): every step's time is recorded split into input, compute and output, in its marker and in _logs/timings_<dataset>.csv; off: the total only")
     commands.add_parser("list", help="list the built-in datasets")
     global_ids = commands.add_parser("global-ids", help="fd1.7: the global basin id over several runs of the 30 m grid",
@@ -1887,6 +1891,9 @@ def main(argv=None):
     chain = Chain(dataset, arguments.out_root, steps, attributes, capacity_name, drop, arguments.tile, arguments.min_basin_area_km2, channel_threshold_km2, not arguments.no_open,
                   grouping=grouping, levels=levels, vector_formats=vector_formats, colours=arguments.colours, separate_processes=not arguments.in_process)
     chain.timing = arguments.timing == "on"
+    if arguments.gdal_cache_mb is not None:
+        chain.gdal_cache_mb = arguments.gdal_cache_mb
+        fd3.gdal_cache_bytes(arguments.gdal_cache_mb)       # refused here, before anything runs, when it is not a size
     if arguments.only is not None:
         chain.only = set(label.strip() for label in arguments.only.split(",") if label.strip())
         if not chain.only:

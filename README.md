@@ -45,6 +45,11 @@ upstream flow length, longest flow path and Strahler order. You can add your own
 
 Every step checks its own output, and a stopped run resumes where it stopped.
 
+The capacity sets the memory: the attributes hold one region at a time, and only the region's own pixels beyond the
+flow directions of its window. GDAL's block cache is bounded at 512 MiB while they run (`--gdal-cache-mb`, or
+`FLOWDIVIDE_GDAL_CACHE_MB`); without a bound GDAL would keep 5 % of the machine's memory. See
+[the memory of FD3](docs/user-guide.md#the-memory-of-fd3).
+
 ## Documentation
 
 - [User guide](docs/user-guide.md): all options, the output files, the checks, adding an attribute
@@ -54,7 +59,7 @@ Every step checks its own output, and a stopped run resumes where it stopped.
 
     python test_region_numbering.py
 
-Eight tests need no data; the rest run on a basin cut from a finished run
+Nine tests need no data; the rest run on a basin cut from a finished run
 (see the [user guide](docs/user-guide.md#tests)).
 
 ## Acknowledgements

@@ -55,11 +55,40 @@ two 30 m grids, the figures. The attributes are a separate step on one capacity:
 
     python flowdivide.py run south-america --out-root /data/flowdivide --steps fd3 --attributes shv,ldn,hck,lup,lfp,ord --capacity 2^31
 
-FD3 holds one region's window at a time. The output blocks that two regions share wait for the second region in
-memory up to 512 MiB (`FLOWDIVIDE_HELD_MEMORY_MB` sets another budget, in MiB) and on disk beyond it, beside the
-output raster (`<raster>.held_blocks.<process id>/`, removed when the step ends; on North America at 2^30 up to
-about 12 GB). Every region line
-of the log gives the peak memory so far.
+### The memory of FD3
+
+FD3 holds one region at a time. What it holds, and what sets each part:
+
+| What | How much | Set by |
+|---|---|---|
+| The region's window: the rectangle its pixels cover, sea and the land of other regions included | 1 byte a pixel for the flow directions, 1 more for the channel mask (shv, hck, ord), 4 more while the region's own pixels are numbered; hck also 4 for the upstream area | the capacity |
+| The region's own pixels | about 12 bytes a pixel to number them, and the values: 8 bytes for the distance and the upstream flow length (double precision), 4 for the Shreve magnitude, 1 for the Hack and Strahler orders | the capacity |
+| The output blocks two regions share, until the second has written its pixels | up to 512 MiB in memory, the rest on disk beside the output raster (`<raster>.held_blocks.<process id>/`, removed when the step ends) | `FLOWDIVIDE_HELD_MEMORY_MB` (MiB) |
+| GDAL's block cache | 512 MiB | `--gdal-cache-mb`, or `FLOWDIVIDE_GDAL_CACHE_MB` (MiB) |
+| The partition's tables | North America (30 million basins): 1.9 GB held; reading them peaks at about 8 GB | the grid |
+
+The first two rows are those of the five swept attributes (shv, ldn, hck, lup, ord). The longest flow path (lfp) is painted
+along one path a basin, not swept: it reads a region's flow directions and its output window whole (5 bytes a
+window pixel, the output in UInt32), runs the distance first when no distance table is given, and keeps the points
+of every path until the lines are written.
+
+For the distance and the upstream flow length, the largest of the swept attributes, a region takes about
+5 bytes for every pixel of its window and 12 for every pixel of its own, or 20 for every pixel of its own when that
+is more. On North America at 2^29 the largest windows hold 0.42 to 0.43 billion pixels, and one region alone took
+4.3 to 4.9 GB with this version where 0.7.6 took 11.1 to 12.5 GB (measured on regions 86301 and 78207). The upstream
+flow length over the whole of North America at 2^29, one process (`measure_fd3_memory.py`), peaked at 8.77 GB in
+2,544 s with this version, and at 16.0 GB in 2,627 s with 0.7.6.
+
+GDAL keeps the blocks it has read in a cache. Without a bound it takes up to 5 % of the machine's memory: 3.2 GB on a
+64 GB machine, 0.8 GB on a 16 GB one. FD3 reads every window once and never comes back for it, so a larger cache
+only takes memory; FD3 bounds it at 512 MiB, as the C programs do. Reading 3 GB of North America's flow directions,
+the process held 3.21 GB with GDAL's own bound and 0.71 GB with 512 MiB. To set another bound:
+
+    python flowdivide.py run north-america --steps fd3 --capacity 2^29 --gdal-cache-mb 256
+    FLOWDIVIDE_GDAL_CACHE_MB=256 python flowdivide.py run north-america --steps fd3 --capacity 2^29
+
+FD3 sets the cache itself and gives it back when the attribute is done, so `GDAL_CACHEMAX` does not reach it. The
+summary of a run prints both bounds, and every region line of the log gives the peak memory so far.
 
 The HydroSHEDS ACC mosaic of a built-in grid can be replaced by a count made from the flow directions
 (`--acc`); the upstream area stays the provider's.
@@ -298,11 +327,12 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_grid_and_step_selection.py        # the grid check of FD3 and the --only selection
     python test_native_cache_provenance.py        # the native inputs in the step markers
     python test_fd3_memory.py                     # the held blocks, the chunked basin table, the Hack donor
+    python test_fd3_compact.py                    # the region's own pixels numbered (0.7.7) against the window order
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first eight need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first nine need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their
@@ -334,4 +364,7 @@ The driver reads each region as one window, works out the visiting order, the pi
 member of every pixel (the child pieces in other regions not entered), calls the kernel once per region, and
 writes the window back; the kernel writes into `out_window` and counts the pixels it gives a value, member by
 member, into `visited_of_member`, which goes into the table.  The regions are visited in the order the rule
-needs (`downstream_first=True` for a value handed up from the outlet).
+needs (`downstream_first=True` for a value handed up from the outlet).  A registered rule is given the whole window,
+so it holds the window's arrays (12 bytes a window pixel for the order, the downstream pixel and the member,
+besides the output window), where the six provided attributes hold only the region's own pixels
+([the memory of FD3](#the-memory-of-fd3)); GDAL's block cache is bounded the same way (`gdal_cache_mb`).

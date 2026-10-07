@@ -12,15 +12,21 @@ is computed once per region, exactly, with one value crossing each cut:
     an accumulation, a maximum and the Strahler order (the pieces above hand their values down);
 
     a region is read as one window, the rectangle its members cover plus one pixel; the flow
-    directions are the mask, since an upstream walk from a basin's outlet cannot leave the basin;
+    directions are the mask, since an upstream walk from a basin's outlet cannot leave the basin.
+    Since 0.7.7 the window holds the flow directions (and the channel mask) only, and everything else
+    is held for the region's own pixels (section [2c]), as in the C programs;
 
     every member (a whole basin, or a piece of a cut basin) is walked from its outlet upstream, depth
     first, with an explicit stack; the walk never enters a child piece (its outlet pixel is blocked),
     but reads the child's outlet as one more donor, and the value that crosses the cut is the value
     written at that pixel by the region visited before;
 
-    the output window is read before the walk and written back after it, so that the pixels of other
-    regions inside the same rectangle go back as they came.
+    the swept attributes put only the region's own pixels into the output blocks, and the longest flow
+    path and a registered rule read the output window before and write it back after, so that the
+    pixels of other regions inside the same rectangle stay as they were.
+
+GDAL's block cache is held to 512 MiB while an attribute is computed (GDAL_CACHE_BYTES_DEFAULT; --gdal-cache-mb
+of flowdivide.py or FLOWDIVIDE_GDAL_CACHE_MB set another bound).
 
 Six attributes are provided, and a user adds one by writing its rule as a Numba kernel of the same
 shape as the six below (see the end of this file).
@@ -75,6 +81,11 @@ PARTITION_BASIN_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_lon",
 # the output blocks two regions share are held in memory up to this many bytes, the rest on disk (HeldBlocks);
 # FLOWDIVIDE_HELD_MEMORY_MB sets another budget, in MiB
 HELD_MEMORY_BYTES_DEFAULT = 512 * 2 ** 20
+# GDAL's block cache while FD3 runs, 512 MiB, the bound the C programs set (GDALSetCacheMax64).  Unbounded, GDAL keeps
+# up to 5 % of the machine's memory of the blocks it has read (3.2 GB on a 64 GB machine, 0.8 GB on a 16 GB one), and
+# FD3 fills it, every window being read through it, though it reads each window once and never comes back for it.
+# --gdal-cache-mb of flowdivide.py, or FLOWDIVIDE_GDAL_CACHE_MB, sets another bound, in MiB
+GDAL_CACHE_BYTES_DEFAULT = 512 * 2 ** 20
 
 
 def peak_memory_gb():
@@ -114,6 +125,21 @@ def held_memory_bytes():
     if not text.isdigit():
         raise FlowDivideError("FLOWDIVIDE_HELD_MEMORY_MB is a whole number of MiB, got '%s'" % text)
     return int(text) * 2 ** 20
+
+
+def gdal_cache_bytes(megabytes=None):
+    """the bound of GDAL's block cache in FD3, in bytes: `megabytes` (MiB) when given, else FLOWDIVIDE_GDAL_CACHE_MB (MiB),
+    else 512 MiB.  It changes no value, only what the process holds and how often a block is decoded again"""
+    if megabytes is None:
+        text = os.environ.get("FLOWDIVIDE_GDAL_CACHE_MB")
+        if text is None:
+            return GDAL_CACHE_BYTES_DEFAULT
+        if not text.isdigit():
+            raise FlowDivideError("FLOWDIVIDE_GDAL_CACHE_MB is a whole number of MiB, got '%s'" % text)
+        megabytes = int(text)
+    if int(megabytes) < 1:
+        raise FlowDivideError("the GDAL block cache is at least 1 MiB, got %s" % megabytes)
+    return int(megabytes) * 2 ** 20
 
 
 class HeldBlocks:
@@ -547,11 +573,14 @@ def paint_path_downstream(dir_window, out_window, lengths, start_row, start_col,
 #  a pop and eight neighbour tests, and the traversal jumps about the window.  The sweeps here do the same
 #  arithmetic over an order built once for the whole window in three linear passes; the loops then read
 #  two arrays and nothing else.  Measured on basin 4 (903 million land pixels, one process): the walk
-#  costs 236 ns a pixel for the accumulation, the tile kernels, which sweep an order, 118; the method is
-#  chosen for speed, not for the least memory.  The order costs 13 bytes for every pixel of the window, which
-#  the capacity keeps well inside the memory the partition was made for.
+#  costs 236 ns a pixel for the accumulation, the tile kernels, which sweep an order, 118.
 #
-#  Three arrays describe the window once, and all four classes then share them:
+#  Since 0.7.7 the six provided attributes number the region's own pixels instead (section [2c]); the order over
+#  the whole window below is what a registered rule (derive_user_attribute) is still given, and what the tests
+#  compare section [2c] with.  It costs 13 bytes for every pixel of the window, and with the member of every pixel
+#  and the output window the provided attributes held 23 to 25 bytes a window pixel up to 0.7.6.
+#
+#  Three arrays describe the window once:
 #      downstream  int32, the pixel each land pixel flows into inside the window; -1 when the flow leaves
 #                  the window, when the pixel is a terminal, or when the code is not a land code
 #      order       int32, every land pixel of the window, each one after every pixel that flows into it
@@ -643,7 +672,7 @@ def window_flow_structure(dir_window, mask, use_mask):
 
 
 @njit(cache=True)
-def channel_mask_break_of_ours(dir_window, channel_window, is_outlet, blocked_sorted, ncol):
+def channel_mask_break_of_ours(dir_window, channel_window, outlets_sorted, blocked_sorted, ncol):
     """The first pixel of the channel mask that breaks along the flow AND drains to a member of this
     region, or -1 when there is none.
 
@@ -654,7 +683,7 @@ def channel_mask_break_of_ours(dir_window, channel_window, is_outlet, blocked_so
     the outlet of one of its members, and to somebody else when it leaves the window, reaches a
     terminal, or reaches the outlet of a child piece that another region works (which is where this
     region's business ends).  The walk is only ever made when a break was found, which the upstream
-    area forbids on a mask made from it."""
+    area forbids on a mask made from it.  outlets_sorted: the window pixels of the members' outlets, sorted."""
     nrow, ncol_local = dir_window.shape
     pixel_count = nrow * ncol_local
     for row in range(nrow):
@@ -681,7 +710,7 @@ def channel_mask_break_of_ours(dir_window, channel_window, is_outlet, blocked_so
             walking_column = col
             for _ in range(pixel_count):
                 pixel = walking_row * ncol_local + walking_column
-                if is_outlet[pixel] != 0:
+                if _is_blocked(outlets_sorted, pixel):
                     return row * ncol_local + col                  # it drains to a member of ours
                 if _is_blocked(blocked_sorted, pixel):
                     break                                          # another region's piece starts here
@@ -720,22 +749,6 @@ def window_member_of_pixel(order, downstream, outlet_pixels, blocked_sorted, pix
 
 
 @njit(cache=True)
-def check_owned_edges(order, downstream, member, dir_window, ncol, is_outlet):
-    """Every pixel of this region either flows into a pixel inside the window, or is a terminal, or is the
-    outlet of one of its members, where the flow leaves for the region below.  Anything else means the
-    window does not hold what the tables say it holds.  Returns the pixel at fault, or -1."""
-    for position in range(order.size):
-        pixel = order[position]
-        if member[pixel] < 0 or downstream[pixel] >= 0 or is_outlet[pixel] != 0:
-            continue
-        row = pixel // ncol
-        code = dir_window[row, pixel - row * ncol]
-        if IS_TERMINAL[code] == 0:
-            return pixel
-    return -1
-
-
-@njit(cache=True)
 def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, visited_of_member,
                           value_at_outlet_of_member, outlet_pixels):
     """The accumulation class: every pixel of ours starts with its own area and hands its total to the
@@ -756,97 +769,358 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
     return 0
 
 
-@njit(cache=True)
-def sweep_distance_to_outlet(order, downstream, member, lengths, value, ncol,
-                             visited_of_member, farthest_of_member, head_pixel_of_member):
-    """The labelling class: a pixel's distance is the distance of the pixel it flows into plus the step
-    between them.  The order is swept downstream first, so the value a pixel needs is already there; an
-    outlet of ours whose parent is in another region was given its value before the sweep."""
-    for position in range(order.size - 1, -1, -1):
-        pixel = order[position]
-        mine = member[pixel]
-        if mine < 0:
-            continue
-        downstream_pixel = downstream[pixel]
-        row = pixel // ncol
-        if downstream_pixel >= 0 and member[downstream_pixel] >= 0:
-            downstream_row = downstream_pixel // ncol
-            step = _step_length(lengths, row, downstream_row - row,
-                                (downstream_pixel - downstream_row * ncol) - (pixel - row * ncol))
-            value[pixel] = value[downstream_pixel] + step
-        visited_of_member[mine] += 1
-        # the farthest pixel of the member, and on a tie the smaller row and then the smaller column,
-        # which is the smaller index in this window: the rule compares the pixel's place in the rectangle
-        # it read, and on a periodic grid that rectangle is unrolled, so folding the column back onto
-        # the grid would pick the other pixel at the seam.  A member
-        # of one pixel takes that pixel as its head
-        if value[pixel] > farthest_of_member[mine] or head_pixel_of_member[mine] < 0:
-            farthest_of_member[mine] = value[pixel]
-            head_pixel_of_member[mine] = pixel
-        elif value[pixel] == farthest_of_member[mine] and pixel < head_pixel_of_member[mine]:
-            head_pixel_of_member[mine] = pixel
-    return 0
+# =============================================================================
+#  [2c] The region's own pixels, numbered in a visiting order (0.7.7)
+# =============================================================================
+#
+#  The six provided attributes no longer build the order over the whole window.  The window holds the
+#  flow directions (one byte a pixel), the channel mask when the class lives on the network (one byte),
+#  and, while the structure is built, the number of every pixel of this region (int32): four arrays
+#  over the window shrank to one, as in the C programs (CCode fd3.*, compact_the_pixels_of_the_region).
+#  Everything else is held for the pixels of the region only, in the order they are numbered:
+#      pixel_of_compact       int32, the window pixel
+#      member_of_compact      int32, the member (its index among the region's outlets)
+#      downstream_of_compact  int32, the number of the pixel it flows into, -1 when that pixel is not one
+#                             of this region's or the flow leaves the order
+#  and the values of the class.  A pixel is numbered after the pixel it flows into, so the numbers
+#  themselves are the order: swept upwards the values are handed up from the outlet (distance, Hack
+#  order), swept downwards they are handed down from the divides (upstream length, Shreve, Strahler).
+#  The values do not depend on which such order is taken -- a sum of integers, a maximum, a value read
+#  from the pixel below, and the two ties (the farthest pixel of the distance, the main-stem donor of
+#  the Hack order) go to the smaller window index, not to the earlier one in the order -- so the rasters
+#  and the tables are those of 0.7.6 bit for bit.
+#
+#  The pixels are found as in 0.7.6: a pixel is this region's when the flow from it reaches the outlet
+#  of one of the region's members through pixels of the order, without passing the outlet of a child
+#  piece that another region works.  Every pixel of the order is followed down once, in rows: the walk
+#  stops at the first pixel already decided, and the pixels it passed are numbered from there upwards, or
+#  marked as another region's (the outlet of such a child and the pixels above it are another region's,
+#  but the walk goes on through it).  A walk that comes back to a pixel it passed is a cycle, which is the
+#  check of 0.7.6 on the same pixels; nothing of the walk is kept but its length.
+
+# the state of a window pixel while the structure is built: its number + 1 once numbered, or one of these
+COMPACT_UNDECIDED = 0       # not reached yet (the array starts as zeros, which the system hands over without a fill)
+COMPACT_NOT_OURS = -2       # flows out of the window, into another region, or past a child's outlet
+COMPACT_BLOCKED = -3        # the outlet of a child piece another region works, not walked yet: never ours, and so
+                            # is every pixel above it, but the walk goes on through it, so that a cycle through it
+                            # is found as 0.7.6 found it
+COMPACT_OUTLET_WAITING = -4  # the outlet of a member of this region, not numbered yet
 
 
 @njit(cache=True)
-def sweep_maximum_length(order, downstream, member, lengths, value, ncol, visited_of_member,
-                         value_at_outlet_of_member, outlet_pixels):
-    """The maximum class: a pixel hands its own value plus the step to the pixel it flows into, which keeps
-    the largest of what arrives.  Swept upstream first; a divide keeps the zero it starts with."""
-    for position in range(order.size):
-        pixel = order[position]
-        mine = member[pixel]
-        if mine < 0:
-            continue
-        visited_of_member[mine] += 1
-        downstream_pixel = downstream[pixel]
-        if downstream_pixel < 0 or member[downstream_pixel] < 0:
-            continue
-        row = pixel // ncol
-        downstream_row = downstream_pixel // ncol
-        step = _step_length(lengths, row, downstream_row - row,
-                            (downstream_pixel - downstream_row * ncol) - (pixel - row * ncol))
-        candidate = value[pixel] + step
-        if candidate > value[downstream_pixel]:
-            value[downstream_pixel] = candidate
+def _flows_into(dir_window, mask, use_mask, nrow, ncol, pixel):
+    """the window pixel `pixel` flows into, by the rule of window_flow_structure, or -1: the pixel is not of the
+    order (not land, or not of the mask), it is a terminal, or it flows out of the window, onto a pixel that is not
+    land, or (use_mask) onto a pixel outside the mask"""
+    row = pixel // ncol
+    column = pixel - row * ncol
+    code = dir_window[row, column]
+    if IS_LAND[code] == 0:
+        return -1
+    if use_mask and mask[row, column] == 0:
+        return -1
+    row_offset = DROW[code]
+    column_offset = DCOL[code]
+    if row_offset == 0 and column_offset == 0:
+        return -1
+    downstream_row = row + row_offset
+    downstream_column = column + column_offset
+    if downstream_row < 0 or downstream_row >= nrow or downstream_column < 0 or downstream_column >= ncol:
+        return -1
+    if IS_LAND[dir_window[downstream_row, downstream_column]] == 0:
+        return -1
+    if use_mask and mask[downstream_row, downstream_column] == 0:
+        return -1
+    return downstream_row * ncol + downstream_column
+
+
+@njit(cache=True, inline="always")
+def _walk_down_and_number(start_row, start_column, state, dir_window, mask, use_mask, nrow, ncol, pixel_of_compact,
+                          member_of_compact, downstream_of_compact, count, capacity):
+    """Follow the flow down from (start_row, start_column), a pixel of the order not decided yet, to the first pixel
+    decided, then go down the same way again and decide the pixels passed: those from the start to the last outlet of
+    a child of another region on the way are another region's, and so are all of them when the walk ended on no pixel
+    of this region; the others take the member of the pixel the walk ended on and are numbered from it upwards (the
+    numbers are known before the second pass, so nothing of the walk is kept).  Returns (status, the number of the
+    start or -1, the count): status 0, 1 when the numbers would pass `capacity`, 2 when the flow comes back to a pixel
+    it passed (a cycle, found as Brent finds one: the walk keeps the pixel it reached at the last power of two of its
+    length and stops on meeting it again), 4 when it reaches the outlet of a member not numbered yet (a member flowing
+    into a member numbered after it, or a cycle through that outlet).  The row and the column are carried along, so
+    that no pixel index is divided."""
+    length = 0
+    last_blocked = -1
+    row = start_row
+    column = start_column
+    end = -1
+    saved = -1
+    power = 1
+    since = 0
+    while True:
+        pixel = row * ncol + column
+        here = state[pixel]
+        if here > 0:
+            end = here - 1
+            break
+        if here == COMPACT_NOT_OURS:
+            break
+        if here == COMPACT_OUTLET_WAITING:
+            return 4, -1, count
+        if pixel == saved:
+            return 2, -1, count
+        if since == power:
+            saved = pixel
+            power *= 2
+            since = 0
+        since += 1
+        if here == COMPACT_BLOCKED:
+            last_blocked = length
+        length += 1
+        # the pixel it flows into, by the rule of _flows_into: this pixel is of the order (the start by the caller's
+        # test, every later one by the test made on the way to it)
+        code = dir_window[row, column]
+        row_offset = DROW[code]
+        column_offset = DCOL[code]
+        if row_offset == 0 and column_offset == 0:
+            break
+        row += row_offset
+        column += column_offset
+        if row < 0 or row >= nrow or column < 0 or column >= ncol:
+            break
+        if IS_LAND[dir_window[row, column]] == 0:
+            break
+        if use_mask and mask[row, column] == 0:
+            break
+    first_numbered = last_blocked + 1 if end >= 0 else length
+    numbered = length - first_numbered
+    if count + numbered > capacity:
+        return 1, -1, count
+    member = member_of_compact[end] if end >= 0 else -1
+    row = start_row
+    column = start_column
+    for position in range(length):
+        pixel = row * ncol + column
+        if position < first_numbered:
+            state[pixel] = COMPACT_NOT_OURS
+        else:
+            number = count + (length - 1 - position)
+            state[pixel] = number + 1
+            pixel_of_compact[number] = pixel
+            member_of_compact[number] = member
+            downstream_of_compact[number] = number - 1 if position < length - 1 else end
+        code = dir_window[row, column]
+        row += DROW[code]
+        column += DCOL[code]
+    if length == 0:
+        return 0, end, count                       # the start itself was decided: its number, or -1
+    start_number = count + length - 1 if (first_numbered == 0 and numbered > 0) else -1
+    return 0, start_number, count + numbered
+
+
+@njit(cache=True)
+def compact_the_pixels_of_the_region(dir_window, mask, use_mask, outlet_pixels, outlet_order, blocked_sorted, capacity):
+    """The pixels of this region numbered so that every pixel comes after the pixel it flows into (section [2c]).
+
+    outlet_pixels: the window pixel of every member's outlet (the members, then the small basins); outlet_order: the
+    order the outlets are numbered in, every member after the member its outlet flows into (ascending downstream
+    depth); blocked_sorted: the outlets of the child pieces another region works.  Returns (status, the count, how
+    many of them are of the order, the state of every window pixel -- its number + 1, or 0 or a negative mark --, then
+    pixel_of_compact, member_of_compact, downstream_of_compact and compact_of_outlet).  status 0; 1 more pixels
+    than `capacity`; 2 a cycle; 3 two members share an outlet; 4 a member's outlet flows into a member numbered
+    after it.  An outlet that is not of the order (not land, or outside the mask) is a pixel of the region all the
+    same, as in 0.7.6, and is numbered last: nothing flows into it, it flows nowhere, and a sweep runs over the
+    pixels of the order only (the first `count_in_order`)."""
+    nrow, ncol = dir_window.shape
+    state = np.zeros(nrow * ncol, np.int32)
+    for index in range(blocked_sorted.size):
+        state[blocked_sorted[index]] = COMPACT_BLOCKED
+    pixel_of_compact = np.empty(capacity, np.int32)
+    member_of_compact = np.empty(capacity, np.int32)
+    downstream_of_compact = np.empty(capacity, np.int32)
+    compact_of_outlet = np.full(outlet_pixels.size, -1, np.int64)
     for index in range(outlet_pixels.size):
-        value_at_outlet_of_member[index] = value[outlet_pixels[index]]
+        if state[outlet_pixels[index]] == COMPACT_OUTLET_WAITING:
+            return 3, 0, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+        state[outlet_pixels[index]] = COMPACT_OUTLET_WAITING
+    count = 0
+    left_out = np.empty(outlet_order.size, np.int64)
+    left_out_count = 0
+    # the outlets, every member after the member it flows into: an outlet's own number comes after the pixel below it
+    for position in range(outlet_order.size):
+        index = outlet_order[position]
+        outlet = outlet_pixels[index]
+        row = outlet // ncol
+        code = dir_window[row, outlet - row * ncol]
+        if IS_LAND[code] == 0 or (use_mask and mask[row, outlet - row * ncol] == 0):
+            left_out[left_out_count] = index
+            left_out_count += 1
+            continue
+        below = -1
+        downstream = _flows_into(dir_window, mask, use_mask, nrow, ncol, outlet)
+        if downstream >= 0:
+            status, below, count = _walk_down_and_number(downstream // ncol, downstream % ncol, state, dir_window, mask,
+                                                         use_mask, nrow, ncol, pixel_of_compact, member_of_compact,
+                                                         downstream_of_compact, count, capacity)
+            if status != 0:
+                return status, count, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+        if count >= capacity:
+            return 1, count, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+        state[outlet] = count + 1
+        pixel_of_compact[count] = outlet
+        member_of_compact[count] = index
+        downstream_of_compact[count] = below
+        compact_of_outlet[index] = count
+        count += 1
+    # every other pixel of the order, in rows, the outlets of the children of other regions too (a cycle through one
+    # is found).  Most of them flow into a pixel decided already (a walk is 1.7 pixels on North America's largest
+    # window), and those are decided here at once; the others are walked
+    for row in range(nrow):
+        for column in range(ncol):
+            pixel = row * ncol + column
+            here = state[pixel]
+            if here != COMPACT_UNDECIDED and here != COMPACT_BLOCKED:
+                continue
+            code = dir_window[row, column]
+            if IS_LAND[code] == 0 or (use_mask and mask[row, column] == 0):
+                continue
+            row_offset = DROW[code]
+            column_offset = DCOL[code]
+            downstream_row = row + row_offset
+            downstream_column = column + column_offset
+            if ((row_offset == 0 and column_offset == 0) or downstream_row < 0 or downstream_row >= nrow
+                    or downstream_column < 0 or downstream_column >= ncol
+                    or IS_LAND[dir_window[downstream_row, downstream_column]] == 0
+                    or (use_mask and mask[downstream_row, downstream_column] == 0)):
+                state[pixel] = COMPACT_NOT_OURS            # it flows nowhere in the order
+                continue
+            below = state[downstream_row * ncol + downstream_column]
+            if below > 0 and here == COMPACT_BLOCKED:
+                state[pixel] = COMPACT_NOT_OURS            # a child's outlet: never ours, whatever is below it
+                continue
+            if below > 0:
+                if count >= capacity:
+                    return 1, count, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+                state[pixel] = count + 1
+                pixel_of_compact[count] = pixel
+                member_of_compact[count] = member_of_compact[below - 1]
+                downstream_of_compact[count] = below - 1
+                count += 1
+                continue
+            if below == COMPACT_NOT_OURS:
+                state[pixel] = COMPACT_NOT_OURS
+                continue
+            status, _, count = _walk_down_and_number(row, column, state, dir_window, mask, use_mask, nrow, ncol,
+                                                     pixel_of_compact, member_of_compact, downstream_of_compact,
+                                                     count, capacity)
+            if status != 0:
+                return status, count, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+    count_in_order = count
+    for position in range(left_out_count):
+        index = left_out[position]
+        if count >= capacity:
+            return 1, count, 0, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+        state[outlet_pixels[index]] = count + 1
+        pixel_of_compact[count] = outlet_pixels[index]
+        member_of_compact[count] = index
+        downstream_of_compact[count] = -1
+        compact_of_outlet[index] = count
+        count += 1
+    return 0, count, count_in_order, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
+
+
+@njit(cache=True)
+def channel_mask_breaks(dir_window, mask):
+    """whether a pixel of the mask flows into a land pixel of the window that is not of the mask: the `broken` of
+    window_flow_structure, as a yes or no"""
+    nrow, ncol = dir_window.shape
+    for row in range(nrow):
+        for column in range(ncol):
+            if mask[row, column] == 0:
+                continue
+            code = dir_window[row, column]
+            if IS_LAND[code] == 0:
+                continue
+            row_offset = DROW[code]
+            column_offset = DCOL[code]
+            if row_offset == 0 and column_offset == 0:
+                continue
+            downstream_row = row + row_offset
+            downstream_column = column + column_offset
+            if downstream_row < 0 or downstream_row >= nrow or downstream_column < 0 or downstream_column >= ncol:
+                continue
+            if IS_LAND[dir_window[downstream_row, downstream_column]] != 0 and mask[downstream_row, downstream_column] == 0:
+                return True
+    return False
+
+
+@njit(cache=True)
+def _step_between(lengths, ncol, pixel, downstream_pixel):
+    """the length of the step from a window pixel to the window pixel it flows into, measured in the row it starts in"""
+    row = pixel // ncol
+    downstream_row = downstream_pixel // ncol
+    return _step_length(lengths, row, downstream_row - row, (downstream_pixel - downstream_row * ncol) - (pixel - row * ncol))
+
+
+@njit(cache=True)
+def sweep_distance_to_outlet(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact, lengths, value,
+                             ncol, visited_of_member, farthest_of_member, head_pixel_of_member):
+    """The labelling class: a pixel's distance is the distance of the pixel it flows into plus the step between
+    them.  Swept upwards (a pixel after the pixel below it), so the value a pixel needs is already there; an outlet
+    whose parent is in another region was given its value before the sweep."""
+    for compact in range(count_in_order):
+        mine = member_of_compact[compact]
+        pixel = pixel_of_compact[compact]
+        below = downstream_of_compact[compact]
+        if below >= 0:
+            value[compact] = value[below] + _step_between(lengths, ncol, pixel, pixel_of_compact[below])
+        visited_of_member[mine] += 1
+        # the farthest pixel of the member, and on a tie the smaller row and then the smaller column, which is the
+        # smaller index in this window: the rule compares the pixel's place in the rectangle it read, and on a
+        # periodic grid that rectangle is unrolled, so folding the column back onto the grid would pick the other
+        # pixel at the seam.  A member of one pixel takes that pixel as its head
+        if value[compact] > farthest_of_member[mine] or head_pixel_of_member[mine] < 0:
+            farthest_of_member[mine] = value[compact]
+            head_pixel_of_member[mine] = pixel
+        elif value[compact] == farthest_of_member[mine] and pixel < head_pixel_of_member[mine]:
+            head_pixel_of_member[mine] = pixel
     return 0
 
 
 @njit(cache=True)
-def sweep_shreve_magnitude(order, downstream, member, channel_window, value, ncol, is_outlet,
-                           visited_of_member, sources_of_member, value_at_outlet_of_member, outlet_pixels):
-    """The accumulation class on the channel network: a channel head counts 1 and every other channel
-    pixel counts what arrives at it.  Swept upstream first, so what arrives at a pixel is complete when
-    the pixel is reached; `value` carries the arriving sum until the pixel is finished and its own
-    magnitude afterwards."""
-    for position in range(order.size):
-        pixel = order[position]
-        mine = member[pixel]
-        if mine < 0:
+def sweep_maximum_length(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact, lengths, value, ncol,
+                         visited_of_member):
+    """The maximum class: a pixel hands its own value plus the step to the pixel it flows into, which keeps the
+    largest of what arrives.  Swept downwards (the pixels above a pixel first); a divide keeps the zero it starts
+    with."""
+    for compact in range(count_in_order - 1, -1, -1):
+        visited_of_member[member_of_compact[compact]] += 1
+        below = downstream_of_compact[compact]
+        if below < 0:
             continue
-        row = pixel // ncol
-        column = pixel - row * ncol
-        if channel_window[row, column] == 0:
-            continue
-        if value[pixel] == 0:
-            value[pixel] = 1                                # a channel head
+        candidate = value[compact] + _step_between(lengths, ncol, pixel_of_compact[compact], pixel_of_compact[below])
+        if candidate > value[below]:
+            value[below] = candidate
+    return 0
+
+
+@njit(cache=True)
+def sweep_shreve_magnitude(count_in_order, member_of_compact, downstream_of_compact, value, visited_of_member,
+                           sources_of_member):
+    """The accumulation class on the channel network: a channel head counts 1 and every other channel pixel counts
+    what arrives at it.  Swept downwards, so what arrives at a pixel is complete when the pixel is reached; `value`
+    carries the arriving sum until the pixel is finished and its own magnitude afterwards.  Every pixel of the order
+    is a channel pixel, and so is the one it flows into (the mask is the order)."""
+    for compact in range(count_in_order - 1, -1, -1):
+        mine = member_of_compact[compact]
+        if value[compact] == 0:
+            value[compact] = 1                               # a channel head
             sources_of_member[mine] += 1
         visited_of_member[mine] += 1
-        downstream_pixel = downstream[pixel]
-        if downstream_pixel < 0 or member[downstream_pixel] < 0:
+        below = downstream_of_compact[compact]
+        if below < 0:
             continue
-        downstream_row = downstream_pixel // ncol
-        if channel_window[downstream_row, downstream_pixel - downstream_row * ncol] == 0:
-            if is_outlet[pixel] == 0:
-                return 3                                    # the channel mask breaks along the flow
-            continue
-        if value[downstream_pixel] > 4294967295 - value[pixel]:
+        if value[below] > 4294967295 - value[compact]:
             return 1
-        value[downstream_pixel] += value[pixel]
-    for index in range(outlet_pixels.size):
-        value_at_outlet_of_member[index] = value[outlet_pixels[index]]
+        value[below] += value[compact]
     return 0
 
 
@@ -865,119 +1139,82 @@ def _first_channel_pixel_without_area(channel_window, area_window):
 
 
 @njit(cache=True)
-def sweep_main_stem_donor(order, downstream, member, channel_window, area_window, ncol, best_donor):
-    """Which channel pixel that flows into a channel pixel carries the most upstream area, and so keeps
-    the Hack order of the pixel below.  A tie goes to the smaller index in this window, which is the
-    the rule (it compares the donor's place in the rectangle it read; for two neighbours of one pixel
-    the row decides, and the rectangle is at least three columns wide).  One sweep upstream first;
-    nothing depends on the order here, but the sweep is the cheapest way over the member's pixels.
-    best_donor is int32 (the window holds at most 2^31 - 1 pixels), and the best donor's area is read from
-    the window where it lies, the same Float32 value an array of the best areas would hold: 8 bytes a pixel
-    fewer than an int64 donor and a Float32 area beside it."""
-    for position in range(order.size):
-        pixel = order[position]
-        if member[pixel] < 0:
+def sweep_main_stem_donor(count_in_order, pixel_of_compact, downstream_of_compact, area_flat, best_donor):
+    """Which channel pixel that flows into a channel pixel carries the most upstream area, and so keeps the Hack
+    order of the pixel below.  A tie goes to the smaller index in this window (it compares the donor's place in the
+    rectangle it read; for two neighbours of one pixel the row decides, and the rectangle is at least three columns
+    wide).  best_donor (int32, one per pixel of the region) holds the donor's window pixel, which may be the outlet
+    of a child piece another region works; the best donor's area is read from the window where it lies."""
+    for compact in range(count_in_order):
+        below = downstream_of_compact[compact]
+        if below < 0:
             continue
-        row = pixel // ncol
-        column = pixel - row * ncol
-        if channel_window[row, column] == 0:
-            continue
-        downstream_pixel = downstream[pixel]
-        if downstream_pixel < 0 or member[downstream_pixel] < 0:
-            continue
-        downstream_row = downstream_pixel // ncol
-        if channel_window[downstream_row, downstream_pixel - downstream_row * ncol] == 0:
-            continue
-        area_here = area_window[row, column]
-        best = best_donor[downstream_pixel]
+        pixel = pixel_of_compact[compact]
+        area_here = area_flat[pixel]
+        best = best_donor[below]
         if best < 0:
-            best_donor[downstream_pixel] = pixel
+            best_donor[below] = pixel
             continue
-        best_row = best // ncol
-        best_area = area_window[best_row, best - best_row * ncol]
+        best_area = area_flat[best]
         if area_here > best_area:
-            best_donor[downstream_pixel] = pixel
+            best_donor[below] = pixel
         elif area_here == best_area and pixel < best:
-            best_donor[downstream_pixel] = pixel
+            best_donor[below] = pixel
     return 0
 
 
 @njit(cache=True)
-def sweep_hack_order(order, downstream, member, channel_window, value, ncol, best_donor, visited_of_member,
-                     largest_of_member):
-    """The labelling class on the channel network: the pixel that keeps the most upstream area keeps the
-    order of the pixel below it, every other channel pixel takes one more.  Swept downstream first, so the
-    order a pixel reads is already final; a member's outlet was given its order before the sweep."""
-    for position in range(order.size - 1, -1, -1):
-        pixel = order[position]
-        mine = member[pixel]
-        if mine < 0:
-            continue
-        row = pixel // ncol
-        column = pixel - row * ncol
-        if channel_window[row, column] == 0:
-            continue
-        downstream_pixel = downstream[pixel]
-        if downstream_pixel >= 0 and member[downstream_pixel] >= 0:
-            downstream_row = downstream_pixel // ncol
-            if channel_window[downstream_row, downstream_pixel - downstream_row * ncol] != 0:
-                if best_donor[downstream_pixel] == pixel:
-                    value[pixel] = value[downstream_pixel]
-                elif value[downstream_pixel] >= 255:
-                    return 1                                # an order the raster cannot carry
-                else:
-                    value[pixel] = value[downstream_pixel] + 1
-        if value[pixel] == 0:
+def sweep_hack_order(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact, value, best_donor,
+                     visited_of_member, largest_of_member):
+    """The labelling class on the channel network: the pixel that keeps the most upstream area keeps the order of
+    the pixel below it, every other channel pixel takes one more.  Swept upwards, so the order a pixel reads is
+    already final; a member's outlet was given its order before the sweep."""
+    for compact in range(count_in_order):
+        mine = member_of_compact[compact]
+        below = downstream_of_compact[compact]
+        if below >= 0:
+            if best_donor[below] == pixel_of_compact[compact]:
+                value[compact] = value[below]
+            elif value[below] >= 255:
+                return 1                                    # an order the raster cannot carry
+            else:
+                value[compact] = value[below] + 1
+        if value[compact] == 0:
             return 2                                        # nothing gave this channel pixel an order
         visited_of_member[mine] += 1
-        if value[pixel] > largest_of_member[mine]:
-            largest_of_member[mine] = value[pixel]
+        if value[compact] > largest_of_member[mine]:
+            largest_of_member[mine] = value[compact]
     return 0
 
 
 @njit(cache=True)
-def sweep_strahler_order(order, downstream, member, channel_window, value, ncol, is_outlet,
-                         arriving_largest, arriving_second, visited_of_member, sources_of_member,
-                         value_at_outlet_of_member, outlet_pixels):
-    """The stream-order class, on the channel pixels only: a pixel's order is the largest order that
-    arrives, plus one when that largest arrives at least twice; a channel head is 1.  Swept upstream
-    first, so every order that arrives at a pixel is final when the pixel is reached."""
-    for position in range(order.size):
-        pixel = order[position]
-        mine = member[pixel]
-        if mine < 0:
-            continue
-        row = pixel // ncol
-        column = pixel - row * ncol
-        if channel_window[row, column] == 0:
-            continue
-        largest = arriving_largest[pixel]
+def sweep_strahler_order(count_in_order, member_of_compact, downstream_of_compact, value, arriving_largest,
+                         arriving_second, visited_of_member, sources_of_member):
+    """The stream-order class, on the channel pixels: a pixel's order is the largest order that arrives, plus one
+    when that largest arrives at least twice; a channel head is 1.  Swept downwards, so every order that arrives at
+    a pixel is final when the pixel is reached."""
+    for compact in range(count_in_order - 1, -1, -1):
+        mine = member_of_compact[compact]
+        largest = arriving_largest[compact]
         if largest == 0:
             here = 1                                        # a channel head
             sources_of_member[mine] += 1
-        elif largest == arriving_second[pixel]:
+        elif largest == arriving_second[compact]:
             here = largest + 1
             if here > 255:
                 return 1                                    # an order the raster cannot carry
         else:
             here = largest
-        value[pixel] = here
+        value[compact] = here
         visited_of_member[mine] += 1
-        downstream_pixel = downstream[pixel]
-        if downstream_pixel < 0 or member[downstream_pixel] < 0:
+        below = downstream_of_compact[compact]
+        if below < 0:
             continue
-        downstream_row = downstream_pixel // ncol
-        if channel_window[downstream_row, downstream_pixel - downstream_row * ncol] == 0:
-            if is_outlet[pixel] == 0:
-                return 3                                    # the channel mask breaks along the flow
-            continue
-        if here > arriving_largest[downstream_pixel]:
-            arriving_second[downstream_pixel] = arriving_largest[downstream_pixel]
-            arriving_largest[downstream_pixel] = here
-        elif here > arriving_second[downstream_pixel]:
-            arriving_second[downstream_pixel] = here
-    for index in range(outlet_pixels.size):
-        value_at_outlet_of_member[index] = value[outlet_pixels[index]]
+        if here > arriving_largest[below]:
+            arriving_second[below] = arriving_largest[below]
+            arriving_largest[below] = here
+        elif here > arriving_second[below]:
+            arriving_second[below] = here
     return 0
 
 
@@ -1046,42 +1283,30 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
         for visit, region_id in enumerate(regions_in_order):
             members = list(partition.members_by_region.get(region_id, []))
             rectangle = partition.region_rectangle(region_id)
-            work_dtype = "float64" if spec["dtype"] == "float32" else spec["dtype"]
-            # the pixels an earlier region may have written in this window, and nothing else is read back
-            # from the output raster.  Which pixels they are depends on the direction the class travels:
-            # a class handed down from the divides (shv, ord) finds the value at the outlet of a child piece
-            # that lies in another region; a class handed up from the outlet (hck) finds it at the outlet of
-            # one of this region's own members, written there by the region of its parent.  ldn, lup and the
-            # accumulation carry their state in memory and read nothing.
             in_this_region = {member.member_id for member in members}
-            # the structure indexes the window with int32; a window past that would wrap
-            # round silently, and the test comes before the rectangle is read so that nothing large is
-            # allocated first
+            # the numbers index the window with int32; a window past that would wrap round silently, and the
+            # test comes before the rectangle is read so that nothing large is allocated first
             if (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2]) > 2147483647:
                 raise FlowDivideError("%s: the window of region %d holds %d pixels, more than the int32 the "
                                       "visiting order is indexed with; build the partition at a smaller capacity"
                                       % (attribute, region_id,
                                          (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2])))
-            clock = time.time()
-            window = RegionWindow(grid, rectangle, dir_dataset, out_dataset, work_dtype, spec["nodata"],
-                                  channel_dataset, area_dataset)
-            seconds_reading = time.time() - clock
-            clock = time.time()
             on_the_channel = attribute in ("shv", "hck", "ord")
-            downstream, order, taken, broken = window_flow_structure(
-                window.dir, window.channel if on_the_channel else np.zeros((1, 1), np.uint8), on_the_channel)
-            seconds_building = time.time() - clock
-            if taken < 0:
-                raise FlowDivideError("%s: the flow directions of region %d hold a cycle" % (attribute, region_id))
-            mask_breaks_somewhere = broken >= 0
+            clock = time.time()
+            # the window holds the flow directions and, on the network, the channel mask (section [2c]); nothing is
+            # read back from the output, the states across the cuts are in memory.  The upstream area of hck is
+            # read once the numbers of the window are gone
+            window = RegionWindow(grid, rectangle, dir_dataset, out_dataset, spec["dtype"], spec["nodata"],
+                                  channel_dataset, None, with_output=False)
+            seconds_reading = time.time() - clock
             pixel_count = window.nrow * window.ncol
-            outlet_pixels = np.empty(len(members), np.int32)
+            outlet_pixels = np.empty(len(members), np.int64)
             for index, member in enumerate(members):
                 row, col = window.local(grid, member.outlet_row, member.outlet_col)
                 outlet_pixels[index] = row * window.ncol + col
-            # the distance and the upstream flow length cover the basins below the table's
-            # area too.  Each is one whole member of this region, kept as arrays; their outlets follow the members' in
-            # the same array, so the labelling and the sweep take them as members, and nothing crosses a cut from them
+            # the distance and the upstream flow length cover the basins below the table's area too.  Each is one
+            # whole member of this region, kept as arrays; their outlets follow the members' in the same array, so the
+            # numbering and the sweep take them as members, and nothing crosses a cut from them
             small_start, small_stop = (0, 0)
             if attribute in ("ldn", "lup"):
                 small_start, small_stop = partition.small_by_region.get(region_id, (0, 0))
@@ -1097,7 +1322,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                     raise FlowDivideError("%s: the outlet of basin %d lies outside the window of its region %d"
                                           % (attribute, int(partition.small_basin_id[small_start + first]), region_id))
                 outlet_pixels = np.concatenate([outlet_pixels,
-                                                (small_local_row * window.ncol + small_local_col).astype(np.int32)])
+                                                (small_local_row * window.ncol + small_local_col).astype(np.int64)])
                 del small_local_row, small_local_col, outside
             # the outlets of children that lie in another region: their pixels are not ours, and the
             # value they leave is read as a state (a child in this region needs nothing, it is in the order)
@@ -1110,19 +1335,11 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                     inlet_row, inlet_col = window.local(grid, child.parent_inlet_row, child.parent_inlet_col)
                     arriving.append((child, outlet_row * window.ncol + outlet_col, inlet_row * window.ncol + inlet_col))
             blocked_sorted = np.asarray(sorted(pixel for _, pixel, _ in arriving), np.int64)
-            clock = time.time()
-            member_of_pixel = window_member_of_pixel(order, downstream, outlet_pixels, blocked_sorted, pixel_count)
-            seconds_labelling = time.time() - clock
-            clock = time.time()
-            value = window.out.reshape(pixel_count)
-            visited_of_member = np.zeros(len(outlet_pixels), np.int64)     # the members, then the small basins
-            ours = member_of_pixel >= 0
-            is_outlet = np.zeros(pixel_count, np.uint8)
-            is_outlet[outlet_pixels] = 1
-            # a break in the channel mask is answered for when it drains to one of this region's
-            # members; the walk that decides it is only made when the structure met a break at all
-            if mask_breaks_somewhere:
-                broken_of_ours = channel_mask_break_of_ours(window.dir, window.channel, is_outlet,
+            mask = window.channel if on_the_channel else np.zeros((1, 1), np.uint8)
+            # a break in the channel mask is answered for when it drains to one of this region's members; the walk
+            # that decides it is only made when the mask breaks somewhere in the window
+            if on_the_channel and channel_mask_breaks(window.dir, window.channel):
+                broken_of_ours = channel_mask_break_of_ours(window.dir, window.channel, np.sort(outlet_pixels),
                                                             blocked_sorted, window.ncol)
                 if broken_of_ours >= 0:
                     raise FlowDivideError("%s: the channel mask breaks along the flow at row %d column %d of region "
@@ -1130,14 +1347,63 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                                           "everything above it would be left out"
                                           % (attribute, broken_of_ours // window.ncol + window.row0,
                                              broken_of_ours % window.ncol + window.col0, region_id))
-            at_fault = check_owned_edges(order, downstream, member_of_pixel, window.dir, window.ncol, is_outlet)
-            if at_fault >= 0:
-                raise FlowDivideError("%s: the pixel at row %d column %d of region %d flows out of its "
-                                      "window and is neither a terminal nor the outlet of a member"
-                                      % (attribute, at_fault // window.ncol + window.row0,
-                                         at_fault % window.ncol + window.col0, region_id))
+            # the outlets are numbered every member after the member it flows into (a child piece lies deeper than
+            # its parent), the small basins after the members; and the numbers are bounded by what the tables give:
+            # the members' pixels and the small basins' for the two classes that cover every pixel, and for the
+            # network no more than the channel pixels of the window besides the outlets
+            outlet_order = np.asarray(sorted(range(len(members)), key=lambda i: (members[i].downstream_depth, i))
+                                      + list(range(len(members), len(outlet_pixels))), np.int64)
+            pixels_of_the_tables = sum(member.pixel_count for member in members)
+            if small_count:
+                pixels_of_the_tables += int(partition.small_pixel_count[small_start:small_stop].sum())
+            capacity = pixels_of_the_tables
+            if on_the_channel:
+                capacity = min(pixels_of_the_tables, int(np.count_nonzero(window.channel))) + len(outlet_pixels)
+            clock = time.time()
+            (status, count, count_in_order, compact_of_pixel, pixel_of_compact, member_of_compact,
+             downstream_of_compact, compact_of_outlet) = compact_the_pixels_of_the_region(
+                window.dir, mask, on_the_channel, outlet_pixels, outlet_order, blocked_sorted, capacity)
+            seconds_building = time.time() - clock
+            if status == 2:
+                raise FlowDivideError("%s: the flow directions of region %d hold a cycle" % (attribute, region_id))
+            if status == 1:
+                raise FlowDivideError("%s: the members of region %d take more pixels of the window than the %d the "
+                                      "tables give them" % (attribute, region_id, capacity))
+            if status == 3:
+                raise FlowDivideError("%s: two members of region %d share an outlet pixel" % (attribute, region_id))
+            if status != 0:
+                raise FlowDivideError("%s: in region %d the outlet of a member flows into a member that does not lie "
+                                      "below it in the piece table, or the flow directions hold a cycle through that "
+                                      "outlet" % (attribute, region_id))
+            pixel_of_compact = pixel_of_compact[:count]
+            member_of_compact = member_of_compact[:count]
+            downstream_of_compact = downstream_of_compact[:count]
+            # what the window says of the few pixels the sweeps read across a cut, before the window goes: the number
+            # of the pixel a child of another region flows into, and whether the child's outlet and that pixel are on
+            # the network
+            channel_flat = window.channel.reshape(pixel_count) if on_the_channel else None
+            crossing = []            # (the child, its outlet pixel, the number of the pixel it flows into, the
+            for child, outlet_pixel, inlet_pixel in arriving:   # two on the network)
+                crossing.append((child, outlet_pixel, int(compact_of_pixel[inlet_pixel]) - 1 if compact_of_pixel[inlet_pixel] > 0 else -1,
+                                 bool(channel_flat[outlet_pixel]) if on_the_channel else True,
+                                 bool(channel_flat[inlet_pixel]) if on_the_channel else True))
+            outlet_on_the_channel = ([bool(channel_flat[pixel]) for pixel in outlet_pixels[:len(members)]]
+                                     if on_the_channel else None)
+            del compact_of_pixel, channel_flat, mask
+            window.dir = None
+
+            def number_of_the_inlet(child, inlet_compact):
+                """the pixel a child of another region flows into is a pixel of this region"""
+                if inlet_compact < 0:
+                    raise FlowDivideError("%s: piece %d flows into a pixel that is not one of region %d's"
+                                          % (attribute, child.member_id, region_id))
+                return inlet_compact
+
+            clock = time.time()
+            visited_of_member = np.zeros(len(outlet_pixels), np.int64)     # the members, then the small basins
             if attribute == "ldn":
-                value[ours] = 0.0
+                window.channel = None
+                value = np.zeros(count, np.float64)
                 for index, member in enumerate(members):
                     if member.parent_member_id and member.parent_member_id not in in_this_region:
                         if member.member_id not in states:
@@ -1148,34 +1414,38 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                         inlet_row, inlet_col = window.local(grid, member.parent_inlet_row, member.parent_inlet_col)
                         step = _step_length(window.lengths, row, inlet_row - row,
                                             inlet_col - (pixel - row * window.ncol))
-                        value[pixel] = states[member.member_id] + step
+                        value[compact_of_outlet[index]] = states[member.member_id] + step
                 farthest_of_member = np.zeros(len(outlet_pixels), np.float64)
                 head_pixel_of_member = np.full(len(outlet_pixels), -1, np.int64)
-                sweep_distance_to_outlet(order, downstream, member_of_pixel, window.lengths, value,
-                                         window.ncol,
-                                         visited_of_member, farthest_of_member, head_pixel_of_member)
+                sweep_distance_to_outlet(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact,
+                                         window.lengths, value, window.ncol, visited_of_member, farthest_of_member,
+                                         head_pixel_of_member)
             elif attribute == "lup":
-                value[ours] = 0.0
-                for child, outlet_pixel, inlet_pixel in arriving:
+                window.channel = None
+                value = np.zeros(count, np.float64)
+                for child, outlet_pixel, inlet_compact, _, _ in crossing:
                     if child.member_id not in states:
                         raise FlowDivideError("%s: the state of member %d was not left by an earlier region"
                                               % (attribute, child.member_id))
+                    inlet_compact = number_of_the_inlet(child, inlet_compact)
+                    inlet_pixel = int(pixel_of_compact[inlet_compact])
                     outlet_row = outlet_pixel // window.ncol
                     inlet_row = inlet_pixel // window.ncol
                     step = _step_length(window.lengths, outlet_row, inlet_row - outlet_row,
                                         (inlet_pixel - inlet_row * window.ncol) - (outlet_pixel - outlet_row * window.ncol))
                     candidate = states[child.member_id] + step
-                    if candidate > value[inlet_pixel]:
-                        value[inlet_pixel] = candidate
-                value_at_outlet_of_member = np.zeros(len(outlet_pixels), np.float64)
-                sweep_maximum_length(order, downstream, member_of_pixel, window.lengths, value, window.ncol,
-                                     visited_of_member, value_at_outlet_of_member, outlet_pixels)
+                    if candidate > value[inlet_compact]:
+                        value[inlet_compact] = candidate
+                sweep_maximum_length(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact,
+                                     window.lengths, value, window.ncol, visited_of_member)
+                value_at_outlet_of_member = value[compact_of_outlet]
             elif attribute == "ord":
-                channel = window.channel.reshape(pixel_count)
-                arriving_largest = np.zeros(pixel_count, np.uint8)
-                arriving_second = np.zeros(pixel_count, np.uint8)
-                for child, outlet_pixel, inlet_pixel in arriving:
-                    if channel[outlet_pixel] == 0:
+                window.channel = None
+                value = np.zeros(count, np.uint8)
+                arriving_largest = np.zeros(count, np.uint8)
+                arriving_second = np.zeros(count, np.uint8)
+                for child, outlet_pixel, inlet_compact, outlet_on_network, _ in crossing:
+                    if not outlet_on_network:
                         continue
                     if child.member_id not in states:
                         raise FlowDivideError("ord: the order of member %d was not left by an earlier "
@@ -1183,98 +1453,95 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                     came = np.uint8(states[child.member_id])    # what the earlier region left at the cut
                     if came == 0:
                         raise FlowDivideError("%s: the order at a cut of region %d is zero" % (attribute, region_id))
-                    if came > arriving_largest[inlet_pixel]:
-                        arriving_second[inlet_pixel] = arriving_largest[inlet_pixel]
-                        arriving_largest[inlet_pixel] = came
-                    elif came > arriving_second[inlet_pixel]:
-                        arriving_second[inlet_pixel] = came
+                    inlet_compact = number_of_the_inlet(child, inlet_compact)
+                    if came > arriving_largest[inlet_compact]:
+                        arriving_second[inlet_compact] = arriving_largest[inlet_compact]
+                        arriving_largest[inlet_compact] = came
+                    elif came > arriving_second[inlet_compact]:
+                        arriving_second[inlet_compact] = came
                 sources_of_member = np.zeros(len(members), np.int64)
-                value_at_outlet_of_member = np.zeros(len(members), np.int64)
-                status = sweep_strahler_order(order, downstream, member_of_pixel, window.channel, value,
-                                              window.ncol, is_outlet, arriving_largest, arriving_second,
-                                              visited_of_member, sources_of_member,
-                                              value_at_outlet_of_member, outlet_pixels)
-                if status == 3:
-                    raise FlowDivideError("ord: a channel pixel of region %d flows into a pixel of the same "
-                                          "region that carries no channel" % region_id)
+                status = sweep_strahler_order(count_in_order, member_of_compact, downstream_of_compact, value,
+                                              arriving_largest, arriving_second, visited_of_member, sources_of_member)
                 if status != 0:
                     raise FlowDivideError("ord: an order of region %d does not fit the raster" % region_id)
+                value_at_outlet_of_member = value[compact_of_outlet].astype(np.int64)
+                del arriving_largest, arriving_second
             elif attribute == "shv":
-                channel = window.channel.reshape(pixel_count)
-                for child, outlet_pixel, inlet_pixel in arriving:  # what an earlier region left at a cut
-                    if channel[outlet_pixel] == 0:
+                window.channel = None
+                value = np.zeros(count, np.uint32)
+                for child, outlet_pixel, inlet_compact, outlet_on_network, _ in crossing:   # what an earlier region
+                    if not outlet_on_network:                                           # left at a cut
                         continue
                     if child.member_id not in states:
                         raise FlowDivideError("shv: the magnitude of member %d was not left by an earlier "
                                               "region" % child.member_id)
-                    value[inlet_pixel] += states[child.member_id]
+                    inlet_compact = number_of_the_inlet(child, inlet_compact)
+                    value[inlet_compact] += states[child.member_id]
                 sources_of_member = np.zeros(len(members), np.int64)
-                value_at_outlet_of_member = np.zeros(len(members), np.int64)
-                status = sweep_shreve_magnitude(order, downstream, member_of_pixel, window.channel, value,
-                                                window.ncol, is_outlet, visited_of_member, sources_of_member,
-                                                value_at_outlet_of_member, outlet_pixels)
-                if status == 3:
-                    raise FlowDivideError("shv: a channel pixel of region %d flows into a pixel of the same "
-                                          "region that carries no channel" % region_id)
+                status = sweep_shreve_magnitude(count_in_order, member_of_compact, downstream_of_compact, value,
+                                                visited_of_member, sources_of_member)
                 if status != 0:
                     raise FlowDivideError("shv: the sweep of region %d ended with status %d" % (region_id, status))
+                value_at_outlet_of_member = value[compact_of_outlet].astype(np.int64)
             elif attribute == "hck":
-                channel = window.channel.reshape(pixel_count)
-                bad_pixel = int(_first_channel_pixel_without_area(window.channel, window.area))
+                # the upstream area is read now, the window's numbers and directions gone, and every channel pixel of
+                # the window is checked as before
+                area_window = window._read(area_dataset, 0, "float32")
+                bad_pixel = int(_first_channel_pixel_without_area(window.channel, area_window))
+                window.channel = None
                 if bad_pixel >= 0:
                     raise FlowDivideError("%s: region %d: a channel pixel has an upstream area that is not a finite "
                                           "positive number" % (tag, region_id))
-                area = window.area.reshape(pixel_count)
-                best_donor = np.full(pixel_count, -1, np.int32)
-                sweep_main_stem_donor(order, downstream, member_of_pixel, window.channel, window.area,
-                                      window.ncol, best_donor)
+                area_flat = area_window.reshape(pixel_count)
+                value = np.zeros(count, np.uint8)
+                best_donor = np.full(count, -1, np.int32)
+                sweep_main_stem_donor(count_in_order, pixel_of_compact, downstream_of_compact, area_flat, best_donor)
                 # a child's outlet is a donor of the pixel it flows into, and may well be its main stem
-                for _, outlet_pixel, inlet_pixel in arriving:
-                    if channel[outlet_pixel] == 0 or channel[inlet_pixel] == 0:
+                for child, outlet_pixel, inlet_compact, outlet_on_network, inlet_on_network in crossing:
+                    if not (outlet_on_network and inlet_on_network):
                         continue
-                    area_there = area[outlet_pixel]
-                    best = int(best_donor[inlet_pixel])
-                    if best < 0 or area_there > area[best]:
-                        best_donor[inlet_pixel] = outlet_pixel
-                    elif area_there == area[best] and outlet_pixel < best:
+                    inlet_compact = number_of_the_inlet(child, inlet_compact)
+                    area_there = area_flat[outlet_pixel]
+                    best = int(best_donor[inlet_compact])
+                    if best < 0 or area_there > area_flat[best]:
+                        best_donor[inlet_compact] = outlet_pixel
+                    elif area_there == area_flat[best] and outlet_pixel < best:
                         # the same tie as the sweep above: the smaller index in this window
-                        best_donor[inlet_pixel] = outlet_pixel
+                        best_donor[inlet_compact] = outlet_pixel
+                del area_window, area_flat
                 for index, member in enumerate(members):           # the order a member's outlet starts from
-                    pixel = int(outlet_pixels[index])
-                    if channel[pixel] == 0:
+                    if not outlet_on_the_channel[index]:
                         continue
                     if member.parent_member_id == 0:
-                        value[pixel] = 1                           # the outlet of a whole basin
+                        value[compact_of_outlet[index]] = 1        # the outlet of a whole basin
                     elif member.parent_member_id not in in_this_region:
                         if member.member_id not in states:
                             raise FlowDivideError("hck: the order of member %d was not left by the region "
                                                   "of its parent" % member.member_id)
-                        value[pixel] = states[member.member_id]
+                        value[compact_of_outlet[index]] = states[member.member_id]
                 largest_of_member = np.zeros(len(members), np.int64)
-                status = sweep_hack_order(order, downstream, member_of_pixel, window.channel, value,
-                                          window.ncol, best_donor, visited_of_member, largest_of_member)
+                status = sweep_hack_order(count_in_order, pixel_of_compact, member_of_compact, downstream_of_compact,
+                                          value, best_donor, visited_of_member, largest_of_member)
                 if status == 1:
                     raise FlowDivideError("hck: an order of region %d does not fit the raster" % region_id)
                 if status != 0:
                     raise FlowDivideError("hck: a channel pixel of region %d was given no order" % region_id)
-                for child, outlet_pixel, inlet_pixel in arriving:   # the order the child's region reads
-                    if channel[outlet_pixel] == 0 or channel[inlet_pixel] == 0:
+                for child, outlet_pixel, inlet_compact, outlet_on_network, inlet_on_network in crossing:
+                    if not (outlet_on_network and inlet_on_network):   # the order the child's region reads
                         continue
-                    states[child.member_id] = int(value[inlet_pixel] if best_donor[inlet_pixel] == outlet_pixel
-                                                  else value[inlet_pixel] + 1)
+                    states[child.member_id] = int(value[inlet_compact] if best_donor[inlet_compact] == outlet_pixel
+                                                  else value[inlet_compact] + 1)
+                del best_donor
             else:
                 raise FlowDivideError("the ordered sweep does not carry the attribute '%s'" % attribute)
             seconds_sweeping = time.time() - clock
             clock = time.time()
             # the states this region leaves for the regions below it, and the rows of its members
+            if attribute == "ldn":
+                for child, _, inlet_compact, _, _ in crossing:
+                    states[child.member_id] = float(value[number_of_the_inlet(child, inlet_compact)])
             for index, member in enumerate(members):
-                if attribute == "ldn":
-                    for child in member.children:
-                        if child.member_id in in_this_region:
-                            continue
-                        inlet_row, inlet_col = window.local(grid, child.parent_inlet_row, child.parent_inlet_col)
-                        states[child.member_id] = float(value[inlet_row * window.ncol + inlet_col])
-                elif attribute == "lup":
+                if attribute == "lup":
                     states[member.member_id] = float(value_at_outlet_of_member[index])
                 elif attribute in ("shv", "ord"):
                     states[member.member_id] = int(value_at_outlet_of_member[index])
@@ -1315,31 +1582,36 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                                              int(visited_of_member[len(members) + first]),
                                              int(partition.small_pixel_count[small_start + first])))
             if attribute in ("ldn", "lup") and partition.raster_covers_every_basin:
-                taken_in_region = int(ours.sum())
-                if taken_in_region != int(partition.regions[region_id].region_grid_count):
+                if count != int(partition.regions[region_id].region_grid_count):
                     raise FlowDivideError("%s: region %d: its members and basins took %d pixels, the region table gives it %d"
-                                          % (attribute, region_id, taken_in_region, int(partition.regions[region_id].region_grid_count)))
-            # only the block rows this region has a pixel in are touched, and each of them keeps what an
-            # earlier region wrote in it.  The Hack order also writes the outlet of a child piece in another
-            # region, which is not one of ours, so those pixels join the mask
-            mine = ours.reshape(window.nrow, window.ncol)
-            written, holding = window.write_back(grid, out_dataset, spec["dtype"], mine, last_writer,
-                                                 visit, held)
+                                          % (attribute, region_id, count, int(partition.regions[region_id].region_grid_count)))
+            # the values go back into the window in the raster's own type, each rounded once as the write rounded it
+            # before; the numbering arrays go first.  Only the block rows this region has a pixel in are touched, and
+            # each of them keeps what an earlier region wrote in it
+            del member_of_compact, downstream_of_compact
+            if value.dtype != np.dtype(spec["dtype"]):
+                value = value.astype(spec["dtype"])
+            out = np.full(pixel_count, spec["nodata"], dtype=spec["dtype"])
+            out[pixel_of_compact] = value
+            mine = np.zeros(pixel_count, bool)
+            mine[pixel_of_compact] = True
+            del value, pixel_of_compact
+            window.out = out.reshape(window.nrow, window.ncol)
+            written, holding = window.write_back(grid, out_dataset, spec["dtype"], mine.reshape(window.nrow, window.ncol),
+                                                 last_writer, visit, held)
             seconds_writing = time.time() - clock
             clock = time.time()
-            # every array of the window goes before the next region reads its own.  `value` is a view of the
-            # window's output, `channel` of its mask, and with `ours`, `mine` and `is_outlet` they would keep the
-            # last window's arrays beside the next one
-            del window, downstream, order, member_of_pixel, value, ours, mine, is_outlet
-            channel = area = best_donor = arriving_largest = arriving_second = None
+            # every array of the window goes before the next region reads its own (`out` and `mine` are viewed by the
+            # window and by the reshaped mask)
+            del window, out, mine
             release_free_memory()
             seconds_freeing = time.time() - clock
-            log(tag, "region %d (%d of %d): %d members and %d small basins, %d x %d window, %d blocks written, %d held "
-                     "(%d in memory, %d on disk); read %.1f s, order %.1f s, members %.1f s, swept %.1f s, wrote %.1f s, "
-                     "freed %.1f s; peak memory so far %.1f GB"
+            log(tag, "region %d (%d of %d): %d members and %d small basins, %d x %d window, %d of its pixels, %d blocks "
+                     "written, %d held (%d in memory, %d on disk); read %.1f s, numbered %.1f s, swept %.1f s, "
+                     "wrote %.1f s, freed %.1f s; peak memory so far %.1f GB"
                 % (region_id, visit + 1, len(regions_in_order), len(members), small_count,
-                   rectangle[1] - rectangle[0], rectangle[3] - rectangle[2], written, holding, len(held.memory),
-                   len(held.on_disk), seconds_reading, seconds_building, seconds_labelling, seconds_sweeping,
+                   rectangle[1] - rectangle[0], rectangle[3] - rectangle[2], count, written, holding, len(held.memory),
+                   len(held.on_disk), seconds_reading, seconds_building, seconds_sweeping,
                    seconds_writing, seconds_freeing, peak_memory_gb()))
         # the rows in the order the members are worked in, which is the order the tables have always had
         depth_of_member = {member.member_id: member.downstream_depth for member in partition.members.values()}
@@ -1454,12 +1726,13 @@ class RegionWindow:
     back in strips of rows, converted strip by strip."""
 
     def __init__(self, grid, rectangle, dir_dataset, out_dataset, out_dtype, out_nodata,
-                 channel_dataset=None, area_dataset=None, read_out_at=None, read_out_whole=False):
+                 channel_dataset=None, area_dataset=None, read_out_at=None, read_out_whole=False, with_output=True):
         """read_out_at: the pixels of the output raster an earlier region may have written, as local pixel
         indices (the outlets of the child pieces that lie in another region).  Only those are read; the
         rest of the output window starts at its nodata, and only the blocks this region writes go back.
         Reading the whole output window again cost 7 GB of traffic a region on a continent and gave back
-        nothing but those few pixels (measured)."""
+        nothing but those few pixels (measured).  with_output False: no output window is made here (the swept
+        classes hold their values for the region's own pixels and set `out` just before the write)."""
         self.rectangle = rectangle
         self.row0 = rectangle[0]
         self.col0 = rectangle[2]
@@ -1472,7 +1745,9 @@ class RegionWindow:
             raise FlowDivideError("the flow directions are %s, not uint8" % dir_dataset.dtypes[0])
         self.dir = self._read(dir_dataset, MERIT_NODATA, "uint8")
         check_merit_flow_directions(self.dir, "the window %s" % (rectangle,))
-        if read_out_whole:
+        if not with_output:
+            self.out = None
+        elif read_out_whole:
             self.out = self._read(out_dataset, out_nodata, out_dtype)   # a driver that writes the whole
         else:                                                           # window back needs what is there
             self.out = np.full((self.nrow, self.ncol), out_nodata, dtype=out_dtype)
@@ -1642,13 +1917,16 @@ def _blocked_pixels(grid, window, member):
     return np.asarray([pair[0] for pair in pairs], np.int64), [pair[1] for pair in pairs]
 
 
-def derive_attribute(attribute, partition, dir_path, out_path, table_path, member_table_path, channel_path=None, area_path=None, tag=None, ldn_member_table=None, lines_path=None):
+def derive_attribute(attribute, partition, dir_path, out_path, table_path, member_table_path, channel_path=None, area_path=None, tag=None, ldn_member_table=None, lines_path=None,
+                     gdal_cache_mb=None):
     """One attribute over the whole partition: the raster <out_path> on the grid of DIR, the table
     <table_path> with one row per basin (the columns of the <name>_basin table) and the table
     <member_table_path> with one row per member.  channel_path is needed for shv, hck and ord,
     area_path (the upstream area) for hck.  For lfp, the per-member heads of a ldn run (ldn_member_table)
     are used when given, otherwise the distance walk is run first without writing its raster; the
-    paths as lines go to lines_path."""
+    paths as lines go to lines_path.  gdal_cache_mb: the bound of GDAL's block cache for the run, in MiB
+    (gdal_cache_bytes: FLOWDIVIDE_GDAL_CACHE_MB, or 512); GDAL_CACHEMAX does not reach FD3, which sets the cache
+    itself and gives it back as it was when the attribute is done."""
     if attribute not in ATTRIBUTES:
         raise FlowDivideError("unknown attribute '%s'" % attribute)
     spec = ATTRIBUTES[attribute]
@@ -1665,12 +1943,16 @@ def derive_attribute(attribute, partition, dir_path, out_path, table_path, membe
     if not partition.basins and not covers_small_basins:
         raise FlowDivideError("no basin reaches the area the attributes are computed for; nothing to compute")
     release_free_memory()                          # whatever the caller freed since the partition was read
-    with _the_only_run_writing(out_path):
+    cache_bytes = gdal_cache_bytes(gdal_cache_mb)
+    log(tag, "GDAL's block cache held to %d MiB for this attribute (--gdal-cache-mb or FLOWDIVIDE_GDAL_CACHE_MB)"
+        % (cache_bytes // 2 ** 20))
+    with rasterio.Env(GDAL_CACHEMAX=cache_bytes), _the_only_run_writing(out_path):
         if attribute in SWEPT_ATTRIBUTES:
             return derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_path,
                                              member_table_path, channel_path, area_path, tag, started)
         if attribute == "lfp":
-            return _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started)
+            return _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started,
+                                             cache_bytes // 2 ** 20)
     raise FlowDivideError("the attribute '%s' has no traversal: every class but the longest flow path is swept in order (section [2b])" % attribute)
 
 @contextlib.contextmanager
@@ -1753,7 +2035,8 @@ def _basin_table_from_members(attribute, partition, member_table):
     return pd.DataFrame(rows, columns=BASIN_TABLE_COLUMNS[attribute])
 
 
-def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started):
+def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started,
+                              gdal_cache_mb=None):
     """the longest flow path of every kept basin: the head is the pixel with the largest distance to the
     outlet (from the ldn member table, or from a distance walk run here without a raster), and the
     path is painted from the head down through the chain of members that hold it, one region at a
@@ -1764,7 +2047,8 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
         log(tag, "no distance table given: the distance walk runs first, without a raster")
         scratch = out_path + ".ldn_scratch.tif"
         ldn_member_table = table_path + ".ldn_scratch_members.csv"
-        derive_attribute("ldn", partition, dir_path, scratch, table_path + ".ldn_scratch.csv", ldn_member_table, tag=tag + ".ldn")
+        derive_attribute("ldn", partition, dir_path, scratch, table_path + ".ldn_scratch.csv", ldn_member_table, tag=tag + ".ldn",
+                         gdal_cache_mb=gdal_cache_mb)
         for path in (scratch, scratch + ".report.json", table_path + ".ldn_scratch.csv"):
             if os.path.exists(path):
                 os.remove(path)
@@ -1973,8 +2257,15 @@ def _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dat
 
 
 def derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path=None,
-                          area_path=None, tag=None):
-    """the driver for a registered rule: the same visit as derive_attribute_by_sweep, the kernel the user's"""
+                          area_path=None, tag=None, gdal_cache_mb=None):
+    """the driver for a registered rule: the same visit as derive_attribute_by_sweep, the kernel the user's, over the whole
+    window (the order, the downstream pixel and the member of every pixel of it, as in 0.7.6); GDAL's block cache bounded as
+    in derive_attribute"""
+    with rasterio.Env(GDAL_CACHEMAX=gdal_cache_bytes(gdal_cache_mb)):
+        return _derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path, area_path, tag)
+
+
+def _derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path, area_path, tag):
     spec = ATTRIBUTES[code]
     if "kernel" not in spec:
         raise FlowDivideError("'%s' is one of the six provided attributes; use derive_attribute" % code)

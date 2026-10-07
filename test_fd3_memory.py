@@ -7,8 +7,9 @@
 2. fd_tables.read_basin_table_columns: on a made-up table read in chunks of a few rows, the columns equal those of
    read_basin_table, and every damaged table is refused with the very message read_basin_table gives, the damage
    placed across a chunk boundary.
-3. sweep_main_stem_donor (int32 donor, the donor's area read from the window): the same donors as the 0.7.3 rule (an
-   int64 donor and a Float32 array of the best areas) on random windows full of tied areas.
+3. sweep_main_stem_donor (int32 donor, the donor's area read from the window; since 0.7.7 one per pixel of the region):
+   the same donors as the 0.7.3 rule (an int64 donor and a Float32 array of the best areas) on random windows without
+   a cycle, full of tied areas.
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
 """
@@ -288,27 +289,42 @@ def donor_as_in_1_0_3(order, downstream, member, channel_window, area_window, nc
 
 
 def test_main_stem_donor():
+    """the main-stem donors of 0.7.7 (int32, one per pixel of the region, swept over its numbered pixels) against the
+    0.7.3 rule (an int64 donor and a Float32 array of the best areas over the whole window), on random windows without a
+    cycle and full of tied areas.  Until 0.7.6 the directions here were drawn at random, which nearly always holds a
+    cycle, so every window was drawn again and the comparison was never reached"""
+    import test_fd3_compact
     rng = np.random.default_rng(3)
-    codes = np.array([1, 2, 4, 8, 16, 32, 64, 128], np.uint8)
+    compared = 0
     for trial in range(40):
         nrow, ncol = int(rng.integers(3, 60)), int(rng.integers(3, 60))
-        directions = codes[rng.integers(0, 8, (nrow, ncol))]
-        directions[rng.random((nrow, ncol)) < 0.02] = 0          # a few mouths
-        directions[0, :] = 0
+        directions = test_fd3_compact.random_window(rng, nrow, ncol)
         downstream, order, taken, _ = fd3.window_flow_structure(directions, np.zeros((1, 1), np.uint8), False)
-        if taken < 0:
-            continue                                            # the random directions hold a cycle: drawn again
         pixel_count = nrow * ncol
-        member = np.where(rng.random(pixel_count) < 0.9, 0, -1).astype(np.int32)
-        channel = (rng.random((nrow, ncol)) < 0.7).astype(np.uint8)
+        channel = ((rng.random((nrow, ncol)) < 0.7) & (fd3.IS_LAND[directions] != 0)).astype(np.uint8)
+        # every channel pixel is a member's: the outlets are the channel pixels that flow into no channel pixel
+        outlets = np.asarray([pixel for pixel in np.nonzero(channel.reshape(-1))[0]
+                              if test_fd3_compact.flows_into(directions, channel, True, int(pixel)) < 0], np.int64)
+        if taken < 0 or outlets.size == 0:
+            check("random window %d: drawn without a cycle and with a network" % trial, False)
+            continue
+        member = np.where(channel.reshape(-1) != 0, 0, -1).astype(np.int32)
         area = rng.choice(np.array([1.5, 2.25, 7.0, 7.0, 11.125], np.float32), (nrow, ncol))   # ties on purpose
         old_donor = np.full(pixel_count, -1, np.int64)
         old_area = np.zeros(pixel_count, np.float32)
         donor_as_in_1_0_3(order, downstream, member, channel, area, ncol, old_donor, old_area)
-        new_donor = np.full(pixel_count, -1, np.int32)
-        fd3.sweep_main_stem_donor(order, downstream, member, channel, area, ncol, new_donor)
-        check("random window %d (%d x %d): the same main-stem donors as 0.7.3" % (trial, nrow, ncol),
-              np.array_equal(old_donor, new_donor.astype(np.int64)))
+        status, count, count_in_order, _, pixel_of_compact, _, downstream_of_compact, _ = fd3.compact_the_pixels_of_the_region(
+            directions, channel, True, outlets, np.arange(outlets.size, dtype=np.int64), np.zeros(0, np.int64), pixel_count)
+        new_donor = np.full(count, -1, np.int32)
+        fd3.sweep_main_stem_donor(count_in_order, pixel_of_compact, downstream_of_compact, area.reshape(-1), new_donor)
+        on_the_network = np.zeros(pixel_count, bool)
+        on_the_network[pixel_of_compact[:count]] = True
+        check("random window %d (%d x %d, %d channel pixels): the same main-stem donors as 0.7.3" % (trial, nrow, ncol, count),
+              status == 0 and count == int(channel.sum())
+              and np.array_equal(old_donor[pixel_of_compact[:count]], new_donor.astype(np.int64))
+              and bool(np.all(old_donor[~on_the_network] == -1)))
+        compared += 1
+    check("the donors compared on %d random windows" % compared, compared == 40)
 
 
 def test_the_lock():

@@ -43,6 +43,8 @@ def main(argv):
     parser.add_argument("--area", default=None)
     parser.add_argument("--min-basin-area-km2", type=float, default=1.0)
     parser.add_argument("--ldn-members", default=None, help="for lfp: the member table of a distance (ldn) run")
+    parser.add_argument("--gdal-cache-mb", type=int, default=None,
+                        help="GDAL's block cache in MiB (default FLOWDIVIDE_GDAL_CACHE_MB, or 512, as flowdivide.py)")
     arguments = parser.parse_args(argv)
     started = time.time()
     tables = glob.glob(os.path.join(arguments.root, "global", "table", "basin_table_fine_*.csv"))
@@ -95,10 +97,12 @@ def main(argv):
                                   os.path.join(out, "%s_basin_%s.csv" % (code, run)),
                                   os.path.join(out, "%s_member_%s.csv" % (code, run)),
                                   channel_path=arguments.channel, area_path=arguments.area,
-                                  ldn_member_table=arguments.ldn_members, lines_path=None)
+                                  ldn_member_table=arguments.ldn_members, lines_path=None,
+                                  gdal_cache_mb=arguments.gdal_cache_mb)
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if platform.system() == "Darwin" else 1024)
     lines = ["attribute %s" % code, "run %s" % run, "capacity_directory %s" % arguments.capacity_directory,
              "flowdivide %s" % fd_tables.VERSION, "held_memory_budget_bytes %d" % fd3.held_memory_bytes(),
+             "gdal_cache_bytes %d" % fd3.gdal_cache_bytes(arguments.gdal_cache_mb),
              "regions %d" % report["regions_visited"], "seconds_tables %.1f" % seconds_tables,
              "peak_gb_after_tables %.2f" % peak_tables, "seconds %.1f" % (time.time() - started),
              "peak_bytes %d" % peak, "peak_gb %.2f" % (peak / 1e9)]

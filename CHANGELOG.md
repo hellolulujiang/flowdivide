@@ -2,6 +2,46 @@
 
 Renumbered on 2026-10-06: the versions first named 1.0.0 to 1.0.4 are 0.7.0 to 0.7.4, so that 1.0.0 names the version the paper describes. The version published on GitHub on 2026-09-28 as 1.0.0 is 0.7.0.
 
+## 0.7.7 (2026-10-07)
+
+FD3 holds the region's own pixels, not its whole window, and bounds GDAL's block cache; the rasters and tables do not
+change. Measured on North America, lup at 2^29, one process (`measure_fd3_memory.py`): 8.77 GB and 2,544 s with 0.7.7,
+16.0 GB and 2,627 s with 0.7.6; the peak is the windows' (the tables read, 7.8 GB, came first). Of the 16.0 GB of 0.7.6, about 10 GB the arrays of the largest
+windows (23 to 25 bytes for every pixel of a window, though a region takes 43 % of its window at the median and at
+most 68 % on North America at 2^29), 3.2 GB GDAL's
+block cache (unbounded, GDAL keeps up to 5 % of the machine's memory), 1.9 GB the partition's tables and 0.5 GB the
+held output blocks.
+
+- The six provided attributes number the region's own pixels so that each comes after the pixel it flows into
+  (`fd3_attributes` section [2c], `compact_the_pixels_of_the_region`), as the C programs do. The window holds the
+  flow directions (and the channel mask) and, while the pixels are numbered, the number of each (int32); the
+  downstream link, the member and the values are held for the region's own pixels; the numbers are the order the
+  sweeps run in, so neither the order nor the member of every window pixel is kept. Every pixel of the order is
+  followed down once, row by row, to the first pixel decided, and the pixels passed are numbered on a second pass
+  down the same way (nothing of the walk is kept but its length); the outlet of a child of another region and the
+  pixels above it are another region's, but the walk goes on through it, so that a cycle through it is found too; a
+  cycle is found on the walk (Brent), as 0.7.6 found it over the same pixels. The two ties (the farthest pixel of the distance, the main-stem donor of the Hack order) go
+  to the smaller window index as before. The output window is no longer made before the sweep: the values go into
+  one, in the raster's type, just before the write. `check_owned_edges` is gone: a pixel took its member from the
+  pixel it flows into, so the case it looked for could not arise. On North America at 2^29, one region alone, the
+  same steps with the package's functions (read, structure, lup sweep, values back): region 86301 (window 0.43
+  billion pixels, 0.14 billion of its own) 11.1 GB and 4.5 s with 0.7.6, 4.3 GB and 4.5 s now; region 78207 (0.42
+  billion, 0.20 billion of its own) 12.5 GB and 10.5 s, 4.9 GB and 8.5 s.
+- GDAL's block cache is bounded at 512 MiB while an attribute is computed (`fd3_attributes.gdal_cache_bytes`; the
+  C programs set the same with GDALSetCacheMax64): `--gdal-cache-mb` of `flowdivide.py` and of
+  `measure_fd3_memory.py`, or `FLOWDIVIDE_GDAL_CACHE_MB`, set another bound in MiB. Reading 3 GB of North America's
+  flow directions, the process held 3.21 GB under GDAL's own bound and 0.71 GB under 512 MiB. FD3 sets the bound
+  with `rasterio.Env`, which gives the cache back when the attribute is done, so `GDAL_CACHEMAX` does not reach FD3.
+  The run summary and the log print the bound.
+- A registered rule (`derive_user_attribute`) keeps the window order of 0.7.6, which its kernel is written for.
+- Tests: `test_fd3_compact.py` (new; 1,059 checks) compares the numbering and the six sweeps with the 0.7.6 window
+  order and kernels on 300 random windows, and checks the refusals (a cycle through a child's outlet of another
+  region among them). `test_fd3_memory.py`'s main-stem donor test drew
+  its directions at random, which nearly always holds a cycle, so it never reached its comparison; it now draws
+  windows without a cycle and compares on all 40. The Sri Lanka chain (20deg2 three levels, 6deg2 four levels, and
+  held blocks 0 MiB with a GDAL cache of 1 MiB) gives the 18 FD3 products of 0.7.6 bit for bit; `test_fd3_sweeps.py`
+  on basins 141 and 175 of South America: all identical.
+
 ## 0.7.6 (2026-10-06)
 
 The memory a parse leaves behind goes back to the system. Measured with 0.7.5 on North America (the upstream flow
