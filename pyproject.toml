@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flowdivide"
-version = "0.7.5"
+version = "0.7.6"
 description = "A partition of a flow-direction grid that fits a memory capacity, and the hydrographic attributes computed on it region by region"
 readme = "README.md"
 requires-python = ">=3.10"

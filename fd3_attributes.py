@@ -41,6 +41,8 @@ cut basins; every other pixel keeps the nodata value.
 """
 import collections
 import contextlib
+import ctypes
+import ctypes.util
 import glob
 import math
 import os
@@ -78,6 +80,30 @@ HELD_MEMORY_BYTES_DEFAULT = 512 * 2 ** 20
 def peak_memory_gb():
     """the largest resident set of this process so far, in GB (ru_maxrss is in bytes on macOS, in KiB on Linux)"""
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if platform.system() == "Darwin" else 1024) / 1e9
+
+
+_LIBC = None
+
+
+def release_free_memory():
+    """Hand back to the system the memory the allocator keeps after it is freed.  Parsing North America's basin table
+    and basin map leaves the process at 6.6 GB resident with 1.9 GB of it in use: the rest is freed but kept by the
+    allocator, and the windows' large arrays cannot use it, so it adds to every region's peak.  macOS:
+    malloc_zone_pressure_relief(NULL, 0) on every zone; Linux with glibc: malloc_trim(0); elsewhere nothing.  It
+    changes no value, only what the process holds."""
+    global _LIBC
+    try:
+        if _LIBC is None:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c"))
+        if hasattr(_LIBC, "malloc_zone_pressure_relief"):
+            _LIBC.malloc_zone_pressure_relief.restype = ctypes.c_size_t
+            _LIBC.malloc_zone_pressure_relief.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            _LIBC.malloc_zone_pressure_relief(None, 0)
+        elif hasattr(_LIBC, "malloc_trim"):
+            _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+            _LIBC.malloc_trim(0)
+    except (OSError, AttributeError, TypeError):
+        pass                                      # no C library to ask: the memory stays where it is
 
 
 def held_memory_bytes():
@@ -360,6 +386,9 @@ class Partition:
                 parent_region = self.members[member.parent_member_id].region_id
                 if parent_region != member.region_id:
                     self.depends_on.setdefault(member.region_id, set()).add(parent_region)
+        # the tables are parsed: they go first, then what the parse left with the allocator goes back to the system
+        del basins, kept, regions, pieces, region_of_basin, piece_ids
+        release_free_memory()
 
     def region_order(self, downstream_first):
         """every region with members, in an order in which every region a region needs comes first;
@@ -1303,6 +1332,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
             # last window's arrays beside the next one
             del window, downstream, order, member_of_pixel, value, ours, mine, is_outlet
             channel = area = best_donor = arriving_largest = arriving_second = None
+            release_free_memory()
             seconds_freeing = time.time() - clock
             log(tag, "region %d (%d of %d): %d members and %d small basins, %d x %d window, %d blocks written, %d held "
                      "(%d in memory, %d on disk); read %.1f s, order %.1f s, members %.1f s, swept %.1f s, wrote %.1f s, "
@@ -1634,6 +1664,7 @@ def derive_attribute(attribute, partition, dir_path, out_path, table_path, membe
     covers_small_basins = attribute in ("ldn", "lup") and partition.small_basin_id.size > 0
     if not partition.basins and not covers_small_basins:
         raise FlowDivideError("no basin reaches the area the attributes are computed for; nothing to compute")
+    release_free_memory()                          # whatever the caller freed since the partition was read
     with _the_only_run_writing(out_path):
         if attribute in SWEPT_ATTRIBUTES:
             return derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_path,
@@ -1789,6 +1820,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                 segments[member.member_id] = (np.column_stack([lon, lat]), int(count), float(length))
             window.write_back(grid, out_dataset, "uint32")
             del window
+            release_free_memory()
             log(tag, "region %d (%d of %d): %d path segments; peak memory so far %.1f GB"
                 % (region_id, visit + 1, len(order), len(members), peak_memory_gb()))
     # the segments joined from the head down, one line per basin, and the length checked

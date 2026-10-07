@@ -2,6 +2,16 @@
 
 Renumbered on 2026-10-06: the versions first named 1.0.0 to 1.0.4 are 0.7.0 to 0.7.4, so that 1.0.0 names the version the paper describes. The version published on GitHub on 2026-09-28 as 1.0.0 is 0.7.0.
 
+## 0.7.6 (2026-10-06)
+
+The memory a parse leaves behind goes back to the system. Measured with 0.7.5 on North America (the upstream flow
+length, one process): 26.4 GB at 2^30 and 20.6 GB at 2^29, where the windows take at most 0.95e9 and 0.38e9 pixels;
+after the basin table (11 columns, 2.65 GB) and the basin map of thirty million basins were parsed, the process held
+6.6 GB with 1.9 GB of it in use, the rest freed but kept by the allocator, which the windows' large arrays cannot use.
+`fd3_attributes.release_free_memory` asks the C library to hand such memory back (macOS:
+`malloc_zone_pressure_relief`; Linux with glibc: `malloc_trim`; elsewhere nothing): after the partition is read and
+its tables are deleted, when an attribute starts, and after every region. On North America it took the process from 6.6 to 1.9 GB. No value changes.
+
 ## 0.7.5 (2026-10-06)
 
 After the review of 0.7.4 by GitHub Copilot (gpt-6.1-sol) and agy; the rasters and tables do not change.

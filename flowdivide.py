@@ -75,7 +75,7 @@ import fd2_views as fd2
 import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
-VERSION = "0.7.5"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
+VERSION = "0.7.6"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
 RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
                            # and a run into an old tree makes everything again instead of reading closed tables.
                            # The rules that make the results; a step's marker is tied to this, not to the

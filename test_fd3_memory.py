@@ -339,7 +339,54 @@ def test_the_lock():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_release_free_memory():
+    """which call release_free_memory makes, with a stand-in C library: the drop itself was measured on North America
+    (the process after the partition, 6.61 GB, then 1.88 GB), which made-up objects do not reproduce (the allocator hands
+    back a block of them at once)"""
+    calls = []
+
+    def function(name):
+        def call(*arguments):
+            calls.append((name, arguments))
+            return 0
+        return call
+
+    class MacLibrary:
+        malloc_zone_pressure_relief = staticmethod(function("malloc_zone_pressure_relief"))
+
+    class GlibcLibrary:
+        malloc_trim = staticmethod(function("malloc_trim"))
+
+    class OtherLibrary:
+        pass
+
+    saved = fd3._LIBC
+    try:
+        for library, wanted in ((MacLibrary(), [("malloc_zone_pressure_relief", (None, 0))]),
+                                (GlibcLibrary(), [("malloc_trim", (0,))]), (OtherLibrary(), [])):
+            calls.clear()
+            fd3._LIBC = library
+            fd3.release_free_memory()
+            check("release_free_memory with a %s: %s" % (type(library).__name__, wanted or "no call, no error"),
+                  calls == wanted)
+        fd3._LIBC = None
+        cdll = fd3.ctypes.CDLL
+        def refuse(*arguments, **keywords):
+            raise OSError("no C library")
+        fd3.ctypes.CDLL = refuse
+        try:
+            fd3.release_free_memory()
+            check("release_free_memory without a C library: no error", True)
+        finally:
+            fd3.ctypes.CDLL = cdll
+    finally:
+        fd3._LIBC = saved
+    fd3.release_free_memory()
+    check("release_free_memory with this system's C library: no error", True)
+
+
 if __name__ == "__main__":
+    test_release_free_memory()
     test_the_lock()
     test_held_blocks()
     test_read_basin_table_columns()
