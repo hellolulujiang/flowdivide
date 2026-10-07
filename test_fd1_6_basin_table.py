@@ -65,13 +65,16 @@ def made_up_run(work):
     pieces["basin_id"] = [1, 1]
     pieces["parent_piece_id"] = [0, 6]
     pieces["region_id"] = [61102, 61103]
+    pieces["row_min"], pieces["row_max"], pieces["col_min"], pieces["col_max"] = 0, 20, 0, 30       # left closed, right open
+    pieces["bbox_grid_count"] = 20 * 30
     piece_path = os.path.join(partition, "piece_fine_%s.csv" % run)
     fd_tables.write_piece_table(pieces, piece_path, "test")
     regions = pd.DataFrame([{name: 0 for name in fd_tables.REGION_TABLE_COLUMNS} for _ in range(5)])
     regions["region_id"] = [61101, 61102, 61103, 61201, 206001]
     regions["level3_members"] = ""
-    regions["nrow"] = regions["row_max"] - regions["row_min"] + 1
-    regions["ncol"] = regions["col_max"] - regions["col_min"] + 1
+    regions["row_max"], regions["col_max"] = 3600, 7200                     # a window of 1 x 2 blocks, left closed, right open
+    regions["nrow"] = regions["row_max"] - regions["row_min"]
+    regions["ncol"] = regions["col_max"] - regions["col_min"]
     region_path = os.path.join(partition, "region_fine_%s.csv" % run)
     fd_tables.write_region_table(regions, region_path, "test")
     return basin_table, map_path, region_path, piece_path, key

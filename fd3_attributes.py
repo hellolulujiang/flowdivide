@@ -39,8 +39,12 @@ default 1 km2 on the HydroSHEDS grids and 10 km2 on MERIT).  The attributes
 are computed for the basins of at least min_basin_area_km2 (1 km2 by default) and the pieces of the
 cut basins; every other pixel keeps the nodata value.
 """
+import collections
 import math
 import os
+import platform
+import resource
+import shutil
 import time
 
 import numpy as np
@@ -56,6 +60,104 @@ from fd1_partition import (DROW, DCOL, IS_LAND, IS_TERMINAL, MERIT_NODATA, FlowD
 PATH_FRAMES = 1 << 22         # pixels of the longest flow path a member can hold, the one walk that is a path
 SWEPT_ATTRIBUTES = ("shv", "ldn", "hck", "lup", "ord")   # every class but the longest flow path, which
                                                          # walks one path and not a whole member
+# the columns of the basin table the partition reads (fd_tables.read_basin_table_columns keeps only these)
+PARTITION_BASIN_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_lon", "outlet_lat", "basin_grid_count", "basin_area_km2",
+                           "basin_row_min", "basin_row_max", "basin_col_min", "basin_col_max")
+# the output blocks two regions share are held in memory up to this many bytes, the rest on disk (HeldBlocks);
+# FLOWDIVIDE_HELD_MEMORY_MB sets another budget
+HELD_MEMORY_BYTES_DEFAULT = 512 * 2 ** 20
+
+
+def peak_memory_gb():
+    """the largest resident set of this process so far, in GB (ru_maxrss is in bytes on macOS, in KiB on Linux)"""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if platform.system() == "Darwin" else 1024) / 1e9
+
+
+def held_memory_bytes():
+    """the memory budget of the held output blocks: FLOWDIVIDE_HELD_MEMORY_MB, or 512 MB"""
+    text = os.environ.get("FLOWDIVIDE_HELD_MEMORY_MB")
+    if text is None:
+        return HELD_MEMORY_BYTES_DEFAULT
+    if not text.isdigit():
+        raise FlowDivideError("FLOWDIVIDE_HELD_MEMORY_MB is a whole number of megabytes, got '%s'" % text)
+    return int(text) * 2 ** 20
+
+
+class HeldBlocks:
+    """The output blocks two regions share, held until the last region that writes in them has put its pixels in.
+
+    A block is kept whole in the raster's own type.  The most recently held blocks stay in memory up to a budget of
+    bytes; the older ones go to a scratch directory as raw .npy files and come back from there when a region needs
+    them (np.save and np.load keep the dtype and every bit, so a block comes back as it went).  Without the budget the
+    held blocks grew with the continent and not with the capacity: up to 12,024 blocks, 12.6 GB, for the upstream flow
+    length on North America at 2^30.  Used as a dictionary by RegionWindow.write_back: `in`, pop, item assignment, len."""
+
+    def __init__(self, directory, budget_bytes):
+        self.directory = directory
+        self.budget_bytes = int(budget_bytes)
+        self.memory = collections.OrderedDict()        # block index -> values, the oldest first
+        self.memory_bytes = 0
+        self.on_disk = set()
+        self.largest_memory_bytes = 0
+        self.largest_count = 0
+        self.written_to_disk = 0
+        self.remove_directory()                        # what a run that stopped left there
+
+    def _path(self, index):
+        return os.path.join(self.directory, "block_%d_%d.npy" % index)
+
+    def __len__(self):
+        return len(self.memory) + len(self.on_disk)
+
+    def __contains__(self, index):
+        return index in self.memory or index in self.on_disk
+
+    def __setitem__(self, index, values):
+        if index in self:
+            raise FlowDivideError("the output block %s is held twice" % (index,))
+        self.memory[index] = values
+        self.memory_bytes += values.nbytes
+        while self.memory_bytes > self.budget_bytes and self.memory:
+            oldest, block = self.memory.popitem(last=False)
+            self.memory_bytes -= block.nbytes
+            os.makedirs(self.directory, exist_ok=True)
+            np.save(self._path(oldest), block, allow_pickle=False)
+            self.on_disk.add(oldest)
+            self.written_to_disk += 1
+        self.largest_memory_bytes = max(self.largest_memory_bytes, self.memory_bytes)
+        self.largest_count = max(self.largest_count, len(self))
+
+    def pop(self, index, *default):
+        if index in self.memory:
+            values = self.memory.pop(index)
+            self.memory_bytes -= values.nbytes
+            return values
+        if index in self.on_disk:
+            path = self._path(index)
+            values = np.load(path, allow_pickle=False)
+            os.remove(path)
+            self.on_disk.discard(index)
+            return values
+        if default:
+            return default[0]
+        raise KeyError(index)
+
+    def items(self):
+        """every held block, those on disk read back one at a time"""
+        for index in list(self.memory):
+            yield index, self.memory[index]
+        for index in sorted(self.on_disk):
+            yield index, np.load(self._path(index), allow_pickle=False)
+
+    def clear(self):
+        self.memory.clear()
+        self.memory_bytes = 0
+        self.on_disk.clear()
+        self.remove_directory()
+
+    def remove_directory(self):
+        if os.path.isdir(self.directory):
+            shutil.rmtree(self.directory)
 
 
 # =============================================================================
@@ -98,7 +200,8 @@ class Partition:
         when its window exceeds the capacity), so it is one whole member in one region: such basins are kept as arrays
         gathered by region (small_*), not as Member objects, because North America holds some thirty million of them."""
         self.grid = grid
-        basins = fd_tables.read_basin_table(basin_table_path)
+        # every check of the basin table, but only the columns read here kept in memory
+        basins = fd_tables.read_basin_table_columns(basin_table_path, PARTITION_BASIN_COLUMNS)
         regions = fd_tables.read_region_table(region_table_path)
         pieces = fd_tables.read_piece_table(piece_table_path)
         if expect is None:
@@ -256,7 +359,8 @@ class Partition:
         """the rectangle the region's pixels lie in (the bounding box of the region table, unrolled on a
         periodic grid), with one pixel of margin, clipped to the rows of the grid.  The members' own
         rectangles lie inside it; on a periodic grid they may be given in the grid's frame, so the
-        table's box, made in the region's frame, is what the window is read from."""
+        table's box, made in the region's frame, is what the window is read from.  Left closed and
+        right open, like every rectangle: rows_max and cols_max are one past the last pixel read."""
         region = self.regions[region_id]
         rows_min = int(region.bbox_row_min) - 1
         rows_max = int(region.bbox_row_max) + 1
@@ -270,10 +374,10 @@ class Partition:
                 cols_max = max(cols_max, member.rectangle[3] + 1)
         if not self.grid.periodic:
             cols_min = max(cols_min, 0)
-            cols_max = min(cols_max, self.grid.ncol - 1)
-        elif cols_max - cols_min + 1 > self.grid.ncol:
+            cols_max = min(cols_max, self.grid.ncol)
+        elif cols_max - cols_min > self.grid.ncol:
             raise FlowDivideError("the window of region %d is wider than the grid; a periodic window may not hold a column twice" % region_id)
-        return (max(rows_min, 0), min(rows_max, self.grid.nrow - 1), cols_min, cols_max)
+        return (max(rows_min, 0), min(rows_max, self.grid.nrow), cols_min, cols_max)
 
 
 
@@ -694,13 +798,15 @@ def _first_channel_pixel_without_area(channel_window, area_window):
 
 
 @njit(cache=True)
-def sweep_main_stem_donor(order, downstream, member, channel_window, area_window, ncol,
-                          best_donor, best_area):
+def sweep_main_stem_donor(order, downstream, member, channel_window, area_window, ncol, best_donor):
     """Which channel pixel that flows into a channel pixel carries the most upstream area, and so keeps
     the Hack order of the pixel below.  A tie goes to the smaller index in this window, which is the
     the rule (it compares the donor's place in the rectangle it read; for two neighbours of one pixel
     the row decides, and the rectangle is at least three columns wide).  One sweep upstream first;
-    nothing depends on the order here, but the sweep is the cheapest way over the member's pixels."""
+    nothing depends on the order here, but the sweep is the cheapest way over the member's pixels.
+    best_donor is int32 (the window holds at most 2^31 - 1 pixels), and the best donor's area is read from
+    the window where it lies, the same Float32 value an array of the best areas would hold: 8 bytes a pixel
+    fewer than an int64 donor and a Float32 area beside it."""
     for position in range(order.size):
         pixel = order[position]
         if member[pixel] < 0:
@@ -716,10 +822,15 @@ def sweep_main_stem_donor(order, downstream, member, channel_window, area_window
         if channel_window[downstream_row, downstream_pixel - downstream_row * ncol] == 0:
             continue
         area_here = area_window[row, column]
-        if best_donor[downstream_pixel] < 0 or area_here > best_area[downstream_pixel]:
-            best_area[downstream_pixel] = area_here
+        best = best_donor[downstream_pixel]
+        if best < 0:
             best_donor[downstream_pixel] = pixel
-        elif area_here == best_area[downstream_pixel] and pixel < best_donor[downstream_pixel]:
+            continue
+        best_row = best // ncol
+        best_area = area_window[best_row, best - best_row * ncol]
+        if area_here > best_area:
+            best_donor[downstream_pixel] = pixel
+        elif area_here == best_area and pixel < best:
             best_donor[downstream_pixel] = pixel
     return 0
 
@@ -825,18 +936,21 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
         rectangle = partition.region_rectangle(region_id)
         # the same walk write_back does, so that the block a region is charged with is the block it
         # writes: the columns cut at the seam, the blocks taken inside the grid
-        remaining = rectangle[3] - rectangle[2] + 1
+        remaining = rectangle[3] - rectangle[2]
         column = rectangle[2]
         while remaining > 0:
             grid_column = (column % grid.ncol) if grid.periodic else column
             length = min(remaining, grid.ncol - grid_column)
             for block_col in range(grid_column // RASTER_BLOCK,
                                    (grid_column + length - 1) // RASTER_BLOCK + 1):
-                for block_row in range(rectangle[0] // RASTER_BLOCK, rectangle[1] // RASTER_BLOCK + 1):
+                for block_row in range(rectangle[0] // RASTER_BLOCK, (rectangle[1] - 1) // RASTER_BLOCK + 1):
                     last_writer[block_row, block_col] = visit
             column += length
             remaining -= length
-    held = {}                        # the blocks two regions share, until the last of them has written
+    # the blocks two regions share, until the last of them has written: in memory up to the budget, the rest on disk
+    held = HeldBlocks(out_path + ".held_blocks", held_memory_bytes())
+    log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB; held blocks kept in memory up to %d MB"
+        % (len(regions_in_order), peak_memory_gb(), held.budget_bytes // 2 ** 20))
     # every dataset opened is closed on any error too, not on the normal path only, and
     # the channel mask and the upstream area are checked to lie on the grid of the flow directions before they are
     # read by row and column
@@ -856,6 +970,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     except BaseException:
         for dataset in opened:
             dataset.close()
+        held.clear()
         raise
     try:
         for visit, region_id in enumerate(regions_in_order):
@@ -872,11 +987,11 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
             # the structure indexes the window with int32; a window past that would wrap
             # round silently, and the test comes before the rectangle is read so that nothing large is
             # allocated first
-            if (rectangle[1] - rectangle[0] + 1) * (rectangle[3] - rectangle[2] + 1) > 2147483647:
+            if (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2]) > 2147483647:
                 raise FlowDivideError("%s: the window of region %d holds %d pixels, more than the int32 the "
                                       "visiting order is indexed with; build the partition at a smaller capacity"
                                       % (attribute, region_id,
-                                         (rectangle[1] - rectangle[0] + 1) * (rectangle[3] - rectangle[2] + 1)))
+                                         (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2])))
             clock = time.time()
             window = RegionWindow(grid, rectangle, dir_dataset, out_dataset, work_dtype, spec["nodata"],
                                   channel_dataset, area_dataset)
@@ -1040,19 +1155,18 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                     raise FlowDivideError("%s: region %d: a channel pixel has an upstream area that is not a finite "
                                           "positive number" % (tag, region_id))
                 area = window.area.reshape(pixel_count)
-                best_donor = np.full(pixel_count, -1, np.int64)
-                best_area = np.zeros(pixel_count, np.float32)
+                best_donor = np.full(pixel_count, -1, np.int32)
                 sweep_main_stem_donor(order, downstream, member_of_pixel, window.channel, window.area,
-                                      window.ncol, best_donor, best_area)
+                                      window.ncol, best_donor)
                 # a child's outlet is a donor of the pixel it flows into, and may well be its main stem
                 for _, outlet_pixel, inlet_pixel in arriving:
                     if channel[outlet_pixel] == 0 or channel[inlet_pixel] == 0:
                         continue
                     area_there = area[outlet_pixel]
-                    if best_donor[inlet_pixel] < 0 or area_there > best_area[inlet_pixel]:
-                        best_area[inlet_pixel] = area_there
+                    best = int(best_donor[inlet_pixel])
+                    if best < 0 or area_there > area[best]:
                         best_donor[inlet_pixel] = outlet_pixel
-                    elif area_there == best_area[inlet_pixel] and outlet_pixel < best_donor[inlet_pixel]:
+                    elif area_there == area[best] and outlet_pixel < best:
                         # the same tie as the sweep above: the smaller index in this window
                         best_donor[inlet_pixel] = outlet_pixel
                 for index, member in enumerate(members):           # the order a member's outlet starts from
@@ -1147,14 +1261,15 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
             # window's output, `channel` of its mask, and with `ours`, `mine` and `is_outlet` they would keep the
             # last window's arrays beside the next one
             del window, downstream, order, member_of_pixel, value, ours, mine, is_outlet
-            channel = area = best_donor = best_area = arriving_largest = arriving_second = None
+            channel = area = best_donor = arriving_largest = arriving_second = None
             seconds_freeing = time.time() - clock
             log(tag, "region %d (%d of %d): %d members and %d small basins, %d x %d window, %d blocks written, %d held "
-                     "(%d in memory); read %.1f s, order %.1f s, members %.1f s, swept %.1f s, wrote %.1f s, freed %.1f s"
+                     "(%d in memory, %d on disk); read %.1f s, order %.1f s, members %.1f s, swept %.1f s, wrote %.1f s, "
+                     "freed %.1f s; peak memory so far %.1f GB"
                 % (region_id, visit + 1, len(regions_in_order), len(members), small_count,
-                   rectangle[1] - rectangle[0] + 1, rectangle[3] - rectangle[2] + 1, written, holding, len(held),
-                   seconds_reading, seconds_building, seconds_labelling, seconds_sweeping, seconds_writing,
-                   seconds_freeing))
+                   rectangle[1] - rectangle[0], rectangle[3] - rectangle[2], written, holding, len(held.memory),
+                   len(held.on_disk), seconds_reading, seconds_building, seconds_labelling, seconds_sweeping,
+                   seconds_writing, seconds_freeing, peak_memory_gb()))
         # the rows in the order the members are worked in, which is the order the tables have always had
         depth_of_member = {member.member_id: member.downstream_depth for member in partition.members.values()}
         member_rows.sort(key=lambda row: ((depth_of_member[row["member_id"]] if ATTRIBUTES[attribute]["downstream_first"]
@@ -1167,12 +1282,16 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                 values = block_values.astype(spec["dtype"]) if str(block_values.dtype) != spec["dtype"] else block_values
                 write_block(out_dataset, values, block_row * RASTER_BLOCK, block_col * RASTER_BLOCK, grid.periodic)
             log(tag, "%d blocks held to the end were written there" % len(held))
-            held.clear()
+        held.clear()
     except BaseException:
         for dataset in opened:
             dataset.close()
+        held.clear()
         raise
-    log(tag, "the regions are done %.1f s into the run" % (time.time() - started))
+    log(tag, "the regions are done %.1f s into the run; held blocks: at most %d at once, at most %.0f MB of them in "
+             "memory, %d written to disk; peak memory %.1f GB"
+        % (time.time() - started, held.largest_count, held.largest_memory_bytes / 2 ** 20, held.written_to_disk,
+           peak_memory_gb()))
     clock = time.time()
     dir_dataset.close()
     seconds_closing_inputs = time.time() - clock
@@ -1270,8 +1389,8 @@ class RegionWindow:
         self.rectangle = rectangle
         self.row0 = rectangle[0]
         self.col0 = rectangle[2]
-        self.nrow = rectangle[1] - rectangle[0] + 1
-        self.ncol = rectangle[3] - rectangle[2] + 1
+        self.nrow = rectangle[1] - rectangle[0]
+        self.ncol = rectangle[3] - rectangle[2]
         self.grid = grid
         # the type on the file, before it is read into bytes: a Float32 1.4 read into uint8 would come out as
         # the direction 1 and pass the check of the codes
@@ -1572,6 +1691,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
             entry[parent.member_id] = (member.parent_inlet_row, member.parent_inlet_col)
             member = parent
     order = partition.region_order(True)
+    log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB" % (len(order), peak_memory_gb()))
     temporary = out_path + ".partial.tif"
     profile = raster_profile(grid, "uint32", 0)
     with rasterio.open(temporary, "w", **profile) as created:
@@ -1598,7 +1718,8 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                 segments[member.member_id] = (np.column_stack([lon, lat]), int(count), float(length))
             window.write_back(grid, out_dataset, "uint32")
             del window
-            log(tag, "region %d (%d of %d): %d path segments" % (region_id, visit + 1, len(order), len(members)))
+            log(tag, "region %d (%d of %d): %d path segments; peak memory so far %.1f GB"
+                % (region_id, visit + 1, len(order), len(members), peak_memory_gb()))
     # the segments joined from the head down, one line per basin, and the length checked
     rows = []
     geometries = []
@@ -1640,6 +1761,8 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                      "head_lon": head_lon, "head_lat": head_lat})
         geometries.append(np.concatenate(points))
     table = pd.DataFrame(rows, columns=BASIN_TABLE_COLUMNS["lfp"])
+    log(tag, "the paths of %d basins are joined (%d points), peak memory so far %.1f GB"
+        % (len(table), sum(len(points) for points in geometries), peak_memory_gb()))
     if lines_path is not None:
         _write_lines(lines_path, table, geometries, grid)     # the lines at the fine grid, only when asked for
     # the raster and the table carry .done markers; the table's marker carries the number of basins
@@ -1728,10 +1851,21 @@ def _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dat
     """the channel mask and the upstream area on the grid of the flow directions: the same size, CRS and transform
     (one function for the provided attributes and the registered rules)"""
     for name, dataset in (("the channel mask", channel_dataset), ("the upstream area", area_dataset)):
-        if dataset is not None and ((dataset.width, dataset.height) != (dir_dataset.width, dir_dataset.height)
-                                    or dataset.crs != dir_dataset.crs
-                                    or any(abs(a - b) > 1e-9 * max(1.0, abs(b))
-                                           for a, b in zip(tuple(dataset.transform)[:6], tuple(dir_dataset.transform)[:6]))):
+        if dataset is None:
+            continue
+        reference = tuple(dir_dataset.transform)[:6]
+        candidate = tuple(dataset.transform)[:6]
+        # A small difference in pixel size or rotation adds up across the raster. Bound
+        # the displacement over the whole grid, including its origin, to 0.01 pixel.
+        finite = all(math.isfinite(value) for value in reference + candidate)
+        delta = [abs(a - b) for a, b in zip(candidate, reference)]
+        east_west = delta[2] + dir_dataset.width * delta[0] + dir_dataset.height * delta[1]
+        north_south = delta[5] + dir_dataset.width * delta[3] + dir_dataset.height * delta[4]
+        if ((dataset.width, dataset.height) != (dir_dataset.width, dir_dataset.height)
+                or dataset.crs != dir_dataset.crs or not finite
+                or abs(reference[0]) == 0.0 or abs(reference[4]) == 0.0
+                or east_west > 0.01 * abs(reference[0])
+                or north_south > 0.01 * abs(reference[4])):
             raise FlowDivideError("%s is not on the grid of the flow directions %s" % (name, dir_path))
 
 
@@ -1760,11 +1894,11 @@ def derive_user_attribute(code, partition, dir_path, out_path, table_path, chann
             rectangle = partition.region_rectangle(region_id)
             # the same int32 bound the swept classes are held to: the visiting order indexes the window
             # with int32, and a window past that would wrap round silently
-            if (rectangle[1] - rectangle[0] + 1) * (rectangle[3] - rectangle[2] + 1) > 2147483647:
+            if (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2]) > 2147483647:
                 raise FlowDivideError("%s: the window of region %d holds %d pixels, more than the int32 the "
                                       "visiting order is indexed with; build the partition at a smaller capacity"
                                       % (code, region_id,
-                                         (rectangle[1] - rectangle[0] + 1) * (rectangle[3] - rectangle[2] + 1)))
+                                         (rectangle[1] - rectangle[0]) * (rectangle[3] - rectangle[2])))
             window = RegionWindow(grid, rectangle, dir_dataset, out_dataset, spec["dtype"], spec["nodata"],
                                   channel_dataset, area_dataset, read_out_whole=True)
             downstream, order, taken, _ = window_flow_structure(window.dir, np.zeros((1, 1), np.uint8), False)
@@ -1799,7 +1933,7 @@ def derive_user_attribute(code, partition, dir_path, out_path, table_path, chann
             del window, downstream, order, member_of_pixel, channel, area      # the views keep the window
             log(tag, "region %d (%d of %d): %d members, %d x %d window, swept in order"
                 % (region_id, visit + 1, len(regions_in_order), len(members),
-                   rectangle[1] - rectangle[0] + 1, rectangle[3] - rectangle[2] + 1))
+                   rectangle[1] - rectangle[0], rectangle[3] - rectangle[2]))
     member_table = pd.DataFrame(rows, columns=MEMBER_BASE)
     publish(temporary, out_path)
     write_table(member_table, table_path)

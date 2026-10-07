@@ -60,7 +60,7 @@ def prepare_case(products_root, continent, basin_id, capacity, case_directory):
     row = row.iloc[0]
     row_min, row_max = int(row.basin_row_min), int(row.basin_row_max)
     col_min, col_max = int(row.basin_col_min), int(row.basin_col_max)
-    nrow, ncol = row_max - row_min + 1, col_max - col_min + 1
+    nrow, ncol = row_max - row_min, col_max - col_min
     table_land_pixels = int(row.basin_grid_count)
     log("basin %d of %s: rows %d..%d, cols %d..%d, %d x %d = %d pixels, %d of them land" % (basin_id, continent, row_min, row_max, col_min, col_max, nrow, ncol, nrow * ncol, table_land_pixels))
     os.makedirs(case_directory, exist_ok=True)

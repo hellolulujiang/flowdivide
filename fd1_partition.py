@@ -23,9 +23,10 @@ Conventions used throughout the three stage files:
     flow directions   the eight ESRI D8 codes 1, 2, 4, ..., 128 (east, south-east, south, ...),
                       0 = river mouth, 255 = inland sink, 247 = nodata  (the MERIT Hydro convention)
     pixel index       row * ncol + col of the continental grid, as int64
-    rectangles        row_min, row_max, col_min, col_max, both ends inside; on a grid that is periodic
+    rectangles        row_min, row_max, col_min, col_max, left closed and right open (row_max and col_max
+                      are one past the last pixel, nrow = row_max - row_min); on a grid that is periodic
                       in longitude (MERIT Hydro, the whole globe) a rectangle across the antimeridian is
-                      "unrolled": col_max may be larger than ncol - 1, and a column c >= ncol means the
+                      "unrolled": col_max may be larger than ncol, and a column c >= ncol means the
                       column c - ncol
     windows           a rectangle rounded out to whole blocks of block_pixels x block_pixels pixels
                       (one degree: 3600 pixels at 1 arc-second, 1200 at 3 arc-seconds); the capacity
@@ -446,20 +447,20 @@ class Grid:
     def window_of_rectangle(self, row_min, row_max, col_min, col_max):
         """the rectangle rounded out to whole blocks: (row_min, row_max, col_min, col_max) of the window"""
         block = self.block_pixels
-        return (row_min // block * block, (row_max // block + 1) * block - 1,
-                col_min // block * block, (col_max // block + 1) * block - 1)
+        return (row_min // block * block, ((row_max - 1) // block + 1) * block,
+                col_min // block * block, ((col_max - 1) // block + 1) * block)
 
     def window_pixels(self, row_min, row_max, col_min, col_max):
         """how many pixels the window that holds this rectangle has"""
         window = self.window_of_rectangle(row_min, row_max, col_min, col_max)
-        return (window[1] - window[0] + 1) * (window[3] - window[2] + 1)
+        return (window[1] - window[0]) * (window[3] - window[2])
 
     def pixel_boxes_lon_lat(self, row_min, row_max, col_min, col_max):
         """pixel_box_lon_lat for arrays of rectangles at once"""
         x_left = self.transform.c + np.asarray(col_min, np.float64) * self.pixel_width
-        x_right = self.transform.c + (np.asarray(col_max, np.float64) + 1) * self.pixel_width
+        x_right = self.transform.c + np.asarray(col_max, np.float64) * self.pixel_width
         y_top = self.transform.f + np.asarray(row_min, np.float64) * self.pixel_height
-        y_bottom = self.transform.f + (np.asarray(row_max, np.float64) + 1) * self.pixel_height
+        y_bottom = self.transform.f + np.asarray(row_max, np.float64) * self.pixel_height
         # a rectangle unrolled past the last column keeps its longitudes past 180 degrees (182.6 for a basin across the
         # antimeridian), so that the tables are the same bytes on every run (a fold back by 360 degrees would give the west edge of such a basin as -184)
         if self.geographic:
@@ -720,16 +721,16 @@ def tiles_of_grid(grid, tile, row_min=0, row_max=None, col_min=0, col_max=None):
     """the work tiles that cover the rectangle (default: the whole grid), as (row0, nrow, col0, ncol);
     the tiles start at multiples of `tile` from the rectangle's origin, and the last ones are cut short"""
     if row_max is None:
-        row_max = grid.nrow - 1
+        row_max = grid.nrow
     if col_max is None:
-        col_max = grid.ncol - 1
+        col_max = grid.ncol
     tiles = []
     row0 = row_min
-    while row0 <= row_max:
-        nrow = min(tile, row_max - row0 + 1)
+    while row0 < row_max:
+        nrow = min(tile, row_max - row0)
         col0 = col_min
-        while col0 <= col_max:
-            ncol = min(tile, col_max - col0 + 1)
+        while col0 < col_max:
+            ncol = min(tile, col_max - col0)
             tiles.append((row0, nrow, col0, ncol))
             col0 += ncol
         row0 += nrow
@@ -1966,18 +1967,18 @@ def _collect_basin_statistics(label, nrow, ncol, tile_row0, tile_col0, grid_ncol
         count[value] += 1
         if grid_row < row_min[value]:
             row_min[value] = grid_row
-        if grid_row > row_max[value]:
-            row_max[value] = grid_row
+        if grid_row >= row_max[value]:
+            row_max[value] = grid_row + 1          # one past: left closed, right open
         if grid_col < col_min[value]:
             col_min[value] = grid_col
-        if grid_col > col_max[value]:
-            col_max[value] = grid_col
+        if grid_col >= col_max[value]:
+            col_max[value] = grid_col + 1
         if periodic:
             shifted = (grid_col + half) % grid_ncol
             if shifted < col_min_shift[value]:
                 col_min_shift[value] = shifted
-            if shifted > col_max_shift[value]:
-                col_max_shift[value] = shifted
+            if shifted >= col_max_shift[value]:
+                col_max_shift[value] = shifted + 1
 
 
 def unroll_rectangles(grid, col_min, col_max, col_min_shift, col_max_shift):
@@ -1987,7 +1988,7 @@ def unroll_rectangles(grid, col_min, col_max, col_min_shift, col_max_shift):
     if not grid.periodic:
         return col_min, col_max, np.zeros(col_min.shape, np.uint8)
     half = grid.ncol // 2
-    astride = (col_max - col_min + 1 > half) & (col_max >= col_min)
+    astride = (col_max - col_min > half) & (col_max > col_min)
     new_min = col_min.copy()
     new_max = col_max.copy()
     unrolled_min = col_min_shift.astype(np.int64) - half
@@ -2148,7 +2149,7 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
         raise FlowDivideError("%d basins have a pixel count that differs from the upstream count at their outlet (first: basin %d, %d labelled, %d expected)" % (differing.size, first_bad, count[first_bad], expected[first_bad]))
     col_min_unrolled, col_max_unrolled, astride = unroll_rectangles(grid, col_min.astype(np.int64), col_max.astype(np.int64), col_min_shift, col_max_shift)
     # the extended outlet table: the outlet table, the rectangle of every
-    # basin (unrolled past the last column for a basin across the antimeridian, so basin_col_max >= ncol
+    # basin (unrolled past the last column for a basin across the antimeridian, so basin_col_max > ncol
     # says which those are), the outlet and the rectangle in longitude and latitude
     basin_ids = outlets["basin_id"].to_numpy(np.int64)
     table = outlets.copy()
@@ -2161,10 +2162,10 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
         table[column] = fd_tables.UNSET_ID
     # the outlet lies in its own box: in the columns as they are, or one width east on a periodic grid
     outlet_col_values = table["outlet_col"].to_numpy(np.int64)
-    inside_rows = (table["outlet_row"] >= table["basin_row_min"]) & (table["outlet_row"] <= table["basin_row_max"])
-    inside_cols = (outlet_col_values >= table["basin_col_min"]) & (outlet_col_values <= table["basin_col_max"])
+    inside_rows = (table["outlet_row"] >= table["basin_row_min"]) & (table["outlet_row"] < table["basin_row_max"])
+    inside_cols = (outlet_col_values >= table["basin_col_min"]) & (outlet_col_values < table["basin_col_max"])
     if grid.periodic:
-        inside_cols |= (outlet_col_values + grid.ncol >= table["basin_col_min"]) & (outlet_col_values + grid.ncol <= table["basin_col_max"])
+        inside_cols |= (outlet_col_values + grid.ncol >= table["basin_col_min"]) & (outlet_col_values + grid.ncol < table["basin_col_max"])
     if not (inside_rows & inside_cols).all():
         raise FlowDivideError("the outlet of basin %d lies outside its own box" % int(table["basin_id"][~(inside_rows & inside_cols)].iloc[0]))
     table["outlet_lon"], table["outlet_lat"] = grid.pixel_centre_lon_lat(table["outlet_row"].to_numpy(np.int64), table["outlet_col"].to_numpy(np.int64))
@@ -2422,11 +2423,11 @@ def _vote_level3_strip(bsn_strip, l3_strip, slot_code, slot_count, overflow, pix
                 return np.int64(basin)
             pixels_seen[basin] += 1
             frame_col = col
-            if rectangle_of_basin[basin, 3] >= grid_ncol and col < rectangle_of_basin[basin, 2]:
+            if rectangle_of_basin[basin, 3] > grid_ncol and col < rectangle_of_basin[basin, 2]:
                 frame_col = col + grid_ncol          # a basin astride the seam, in its unrolled frame
             grid_row = row0 + row
-            if grid_row < rectangle_of_basin[basin, 0] or grid_row > rectangle_of_basin[basin, 1] or \
-                    frame_col < rectangle_of_basin[basin, 2] or frame_col > rectangle_of_basin[basin, 3]:
+            if grid_row < rectangle_of_basin[basin, 0] or grid_row >= rectangle_of_basin[basin, 1] or \
+                    frame_col < rectangle_of_basin[basin, 2] or frame_col >= rectangle_of_basin[basin, 3]:
                 outside_rectangle[0] += 1
             code = l3_strip[row, col]
             if code == 0:
@@ -2484,12 +2485,12 @@ def _union_window(grid, rectangles):
         # lies in the western half would give a group holding a basin across 0 degrees and one by 180 another
         # window (no MERIT Level-03 group is such a one)
         half = grid.ncol // 2
-        not_astride = rectangles[:, 3] < grid.ncol
-        in_the_west = not_astride & ((rectangles[:, 2] + rectangles[:, 3]) // 2 < half)
+        not_astride = rectangles[:, 3] <= grid.ncol
+        in_the_west = not_astride & ((rectangles[:, 2] + rectangles[:, 3] - 1) // 2 < half)
         in_the_east = not_astride & ~in_the_west
         if in_the_west.any() and in_the_east.any():
-            span_as_it_is = int(rectangles[not_astride, 3].max()) - int(rectangles[not_astride, 2].min()) + 1
-            span_across_the_seam = int(rectangles[in_the_west, 3].max()) + grid.ncol - int(rectangles[in_the_east, 2].min()) + 1
+            span_as_it_is = int(rectangles[not_astride, 3].max()) - int(rectangles[not_astride, 2].min())
+            span_across_the_seam = int(rectangles[in_the_west, 3].max()) + grid.ncol - int(rectangles[in_the_east, 2].min())
             if span_across_the_seam < span_as_it_is:
                 moved_min = np.where(in_the_west, rectangles[:, 2] + grid.ncol, rectangles[:, 2])
                 moved_max = np.where(in_the_west, rectangles[:, 3] + grid.ncol, rectangles[:, 3])
@@ -2712,18 +2713,18 @@ def group_windows_in_pixels(groups, grid, block=None):
     """the block windows of a group table as (row_min, row_max, col_min, col_max) in pixels, from the window_* columns
     (in blocks); col_max may run past the last column on a periodic grid"""
     block = block or fd_tables.group_block_pixels(groups)
-    return np.column_stack([groups["window_row_min"].to_numpy(np.int64) * block, (groups["window_row_max"].to_numpy(np.int64) + 1) * block - 1,
-                            groups["window_col_min"].to_numpy(np.int64) * block, (groups["window_col_max"].to_numpy(np.int64) + 1) * block - 1])
+    return np.column_stack([groups["window_row_min"].to_numpy(np.int64) * block, groups["window_row_max"].to_numpy(np.int64) * block,
+                            groups["window_col_min"].to_numpy(np.int64) * block, groups["window_col_max"].to_numpy(np.int64) * block])
 
 
 def _fill_group_window_columns(table, grid, block):
     """window_nrow .. window_maxlat of a group table whose window_* block columns are set
     fill_the_window_columns_of_a_group makes them"""
-    table["window_nrow"] = (table["window_row_max"] - table["window_row_min"] + 1) * block
-    table["window_ncol"] = (table["window_col_max"] - table["window_col_min"] + 1) * block
+    table["window_nrow"] = (table["window_row_max"] - table["window_row_min"]) * block
+    table["window_ncol"] = (table["window_col_max"] - table["window_col_min"]) * block
     table["window_grid_count"] = table["window_nrow"] * table["window_ncol"]
     table["fill_percent"] = np.where(table["window_grid_count"] > 0, 100.0 * table["land_grid_count"] / table["window_grid_count"], 0.0)
-    boxes = [grid.pixel_box_lon_lat(int(r0) * block, (int(r1) + 1) * block - 1, int(c0) * block, (int(c1) + 1) * block - 1)
+    boxes = [grid.pixel_box_lon_lat(int(r0) * block, int(r1) * block, int(c0) * block, int(c1) * block)
              for r0, r1, c0, c1 in zip(table["window_row_min"], table["window_row_max"], table["window_col_min"], table["window_col_max"])]
     table["window_minlon"] = [box[0] for box in boxes]
     table["window_minlat"] = [box[1] for box in boxes]
@@ -2741,9 +2742,9 @@ def group_table_rows(grid, windows, group_columns, level):
     table = pd.DataFrame(group_columns)
     table["group_level"] = level
     table["window_row_min"] = windows[:, 0] // block
-    table["window_row_max"] = windows[:, 1] // block
+    table["window_row_max"] = (windows[:, 1] - 1) // block + 1        # one past, in blocks
     table["window_col_min"] = windows[:, 2] // block
-    table["window_col_max"] = windows[:, 3] // block
+    table["window_col_max"] = (windows[:, 3] - 1) // block + 1
     return _fill_group_window_columns(table, grid, block)
 
 
@@ -2794,7 +2795,7 @@ def fold_level3_groups(level3_groups, level, grid):
                "window_row_min": int(members["window_row_min"].min()), "window_row_max": int(members["window_row_max"].max()),
                "window_col_min": int(members["window_col_min"].min()), "window_col_max": int(members["window_col_max"].max())}
         if periodic_width_blocks > 0:
-            shift = np.where(members["window_col_max"].to_numpy(np.int64) < periodic_width_blocks // 2, periodic_width_blocks, 0)
+            shift = np.where(members["window_col_max"].to_numpy(np.int64) <= periodic_width_blocks // 2, periodic_width_blocks, 0)
             moved_min = int((members["window_col_min"].to_numpy(np.int64) + shift).min())
             moved_max = int((members["window_col_max"].to_numpy(np.int64) + shift).max())
             if moved_max - moved_min < row["window_col_max"] - row["window_col_min"]:
@@ -2976,7 +2977,7 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
     rectangles = basin_rectangles(basins)
     land = basins["basin_grid_count"].to_numpy(np.int64)
     area = basins["basin_area_km2"].to_numpy(np.float64)
-    astride = (rectangles[:, 3] >= grid.ncol).astype(np.int64)      # across the antimeridian: an unrolled rectangle
+    astride = (rectangles[:, 3] > grid.ncol).astype(np.int64)       # across the antimeridian: an unrolled rectangle (col_max past the width)
     level3[astride == 1] = 0                     # a basin across the seam takes no code
     coded_by_vote = level3 > 0
     log(tag, "vote: %d of %d basins hold a Level-03 code, %d have none" % (int(coded_by_vote.sum()), basin_count, int((~coded_by_vote).sum())))
@@ -3060,8 +3061,8 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
         cells_across = -(-grid.ncol // block)
         # a basin is indexed by the block cell of the centre of its rectangle; the basins of a cell are
         # visited in the reverse order of their ids
-        cell_row = ((rectangles[:, 0] + rectangles[:, 1]) // 2 // block).astype(np.int64)
-        cell_col = ((rectangles[:, 2] + rectangles[:, 3]) // 2 // block).astype(np.int64)
+        cell_row = ((rectangles[:, 0] + rectangles[:, 1] - 1) // 2 // block).astype(np.int64)     # the centre pixel: row_max is one past
+        cell_col = ((rectangles[:, 2] + rectangles[:, 3] - 1) // 2 // block).astype(np.int64)
         if grid.periodic:
             cell_col %= cells_across
         by_cell = {}
@@ -3073,7 +3074,7 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
 
         def window_pixels(rect):
             window = grid.window_of_rectangle(*rect)
-            return (window[1] - window[0] + 1) * (window[3] - window[2] + 1)
+            return (window[1] - window[0]) * (window[3] - window[2])
 
         made = 0
         for seed in seeds:
@@ -3195,9 +3196,9 @@ def _hilbert_indices(curve_order, cell_row, cell_col):
 
 @njit(cache=True)
 def _window_blocks(rmin, rmax, cmin, cmax):
-    if rmax < rmin or cmax < cmin:
+    if rmax <= rmin or cmax <= cmin:
         return np.int64(0)
-    return np.int64(rmax - rmin + 1) * np.int64(cmax - cmin + 1)
+    return np.int64(rmax - rmin) * np.int64(cmax - cmin)
 
 
 @njit(cache=True)
@@ -3757,9 +3758,11 @@ def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid,
         raise FlowDivideError("%d x %d blocks is more than this step indexes; use a larger block" % (deg_nrow, deg_ncol))
     capacity_blocks = capacity_pixels // (block * block)
     rectangles = basin_rectangles(basins)
-    if grid.periodic and (rectangles[:, 3] >= grid.ncol).any():
-        raise FlowDivideError("the automatic grouping works on a flat grid of blocks; %d basins lie across the antimeridian" % int((rectangles[:, 3] >= grid.ncol).sum()))
+    if grid.periodic and (rectangles[:, 3] > grid.ncol).any():
+        raise FlowDivideError("the automatic grouping works on a flat grid of blocks; %d basins lie across the antimeridian" % int((rectangles[:, 3] > grid.ncol).sum()))
     rect = rectangles // block                                       # every rectangle in blocks
+    rect[:, 1] = (rectangles[:, 1] - 1) // block + 1                 # row_max, col_max are one past: the block past the last one
+    rect[:, 3] = (rectangles[:, 3] - 1) // block + 1
     outlet_row = basins["outlet_row"].to_numpy(np.int64)
     outlet_col = basins["outlet_col"].to_numpy(np.int64)
     # [0] where every basin's land is, from the coarse basin view
@@ -3818,7 +3821,7 @@ def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid,
         raise FlowDivideError("a basin lies in a block cell outside the %d x %d block cells of the grid" % (deg_nrow, deg_ncol))
     log(tag, "the land of %d basins reaches %d block cells in all; %d basins are below one coarse cell and keep the cell of their outlet" % (basin_count, entry_cell.size, int(too_small.sum())))
     # [A] the basins that stand alone
-    own_blocks = (rect[:, 1] - rect[:, 0] + 1) * (rect[:, 3] - rect[:, 2] + 1)
+    own_blocks = (rect[:, 1] - rect[:, 0]) * (rect[:, 3] - rect[:, 2])
     over_the_cap = own_blocks > capacity_blocks
     major_river = (area >= MAJOR_RIVER_MIN_AREA_KM2) & ~over_the_cap
     alone = np.nonzero(over_the_cap | major_river)[0]
@@ -3945,9 +3948,9 @@ def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid,
         made = (int(rect[members, 0].min()), int(rect[members, 1].max()), int(rect[members, 2].min()), int(rect[members, 3].max()))
         if made != tuple(int(v) for v in g_rect[g]):
             raise FlowDivideError("group %d holds rows %d..%d columns %d..%d of blocks, but its basins make %s" % (g + 1, g_rect[g, 0], g_rect[g, 1], g_rect[g, 2], g_rect[g, 3], made))
-        if (g_rect[g, 1] - g_rect[g, 0] + 1) * (g_rect[g, 3] - g_rect[g, 2] + 1) > capacity_blocks and g_over[g] == 0:
+        if (g_rect[g, 1] - g_rect[g, 0]) * (g_rect[g, 3] - g_rect[g, 2]) > capacity_blocks and g_over[g] == 0:
             raise FlowDivideError("group %d passes the capacity and holds no basin that does" % (g + 1))
-    windows = np.column_stack([g_rect[:group_count, 0] * block, (g_rect[:group_count, 1] + 1) * block - 1, g_rect[:group_count, 2] * block, (g_rect[:group_count, 3] + 1) * block - 1])
+    windows = np.column_stack([g_rect[:group_count, 0] * block, g_rect[:group_count, 1] * block, g_rect[:group_count, 2] * block, g_rect[:group_count, 3] * block])
     group_ids = np.arange(1, group_count + 1)
     group_columns = {"group_id": group_ids, "group_kind": g_kind[:group_count], "level_code": group_ids,
                      "level3_count": np.zeros(group_count, np.int64), "basin_count": g_count[:group_count],
@@ -4212,7 +4215,7 @@ class BasinToCut:
         # CHANNEL_BOUND_MARGIN makes the bound 1 % larger than that: the walk on the network
         # then gives the answer only where the walk over every pixel would give the same one, and otherwise
         # hands over to it, which costs time and never changes the cut
-        smallest_pixel_m2 = float(grid.row_pixel_areas_m2(rectangle[0], rectangle[1] - rectangle[0] + 1).min())
+        smallest_pixel_m2 = float(grid.row_pixel_areas_m2(rectangle[0], rectangle[1] - rectangle[0]).min())
         self.channel_pixels_max = int(math.ceil(CHANNEL_BOUND_MARGIN * channel_threshold_km2 * 1e6 / smallest_pixel_m2))
         # the room of one walk, allocated once for every walk of the basin
         self.mainstem = np.empty(min(network.row.size + 1, 1 << 22), np.int64)
@@ -4419,8 +4422,8 @@ def _label_basin_pieces(dir_path, bsn_path, grid, basin_id, rectangle, piece_out
     p_col_max = np.full(code_limit, -1, np.int32)
     p_col_min_shift = np.full(code_limit, np.iinfo(np.int32).max, np.int32)
     p_col_max_shift = np.full(code_limit, -1, np.int32)
-    window_nrow = row_max - row_min + 1
-    window_ncol = col_max - col_min + 1
+    window_nrow = row_max - row_min
+    window_ncol = col_max - col_min
     piece_transform = grid.transform * rasterio.Affine.translation(col_min, row_min)
     profile = {"driver": "GTiff", "dtype": "uint16", "count": 1, "width": window_ncol, "height": window_nrow, "crs": grid.crs,
                "transform": piece_transform, "nodata": 0, "tiled": True, "blockxsize": RASTER_BLOCK, "blockysize": RASTER_BLOCK,
@@ -4474,7 +4477,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
     rectangle = (int(basin_row["basin_row_min"]), int(basin_row["basin_row_max"]), int(basin_row["basin_col_min"]), int(basin_row["basin_col_max"]))
     window = grid.window_of_rectangle(*rectangle)
     log(tag, "basin %d: %d pixels, window %d x %d blocks, %.2f x the capacity; %s" % (
-        basin_id, int(basin_row["basin_grid_count"]), (window[1] - window[0] + 1) // grid.block_pixels, (window[3] - window[2] + 1) // grid.block_pixels,
+        basin_id, int(basin_row["basin_grid_count"]), (window[1] - window[0]) // grid.block_pixels, (window[3] - window[2]) // grid.block_pixels,
         grid.window_pixels(*rectangle) / capacity_pixels, "every piece cut to %d levels" % levels if levels else "the depth decided by the windows"))
     # [a] the channel network of the basin, from the work tiles of its window
     rows = []
@@ -4696,7 +4699,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
         else:
             flows_into = piece.next_down_at_creation
         piece_window = grid.window_of_rectangle(*piece.rectangle)
-        window_pixels = (piece_window[1] - piece_window[0] + 1) * (piece_window[3] - piece_window[2] + 1)
+        window_pixels = (piece_window[1] - piece_window[0]) * (piece_window[3] - piece_window[2])
         box = grid.pixel_box_lon_lat(*piece_window)
         records.append({"piece": piece.id, "level": piece.level, "sub_of": piece.parent.id if piece.parent is not None else 0,
                         "flows_into": flows_into.id if flows_into is not None else 0, "used": int(piece.used),
@@ -4788,9 +4791,9 @@ def _windows_touch(grid, first, second):
     block = grid.block_pixels
     a = [v // block for v in first]
     b = [v // block for v in second]
-    if a[0] > b[1] + 1 or b[0] > a[1] + 1:
+    if a[0] > b[1] or b[0] > a[1]:                 # the block past the last one is where a neighbour starts
         return False
-    if a[2] > b[3] + 1 or b[2] > a[3] + 1:
+    if a[2] > b[3] or b[2] > a[3]:
         return False
     return True
 
@@ -4823,8 +4826,8 @@ def _split_basins_along_block_lines(grid, basins_rect, basins_land, member_indic
     members = np.asarray(member_indices, np.int64)
     rect = basins_rect[members]
     land = basins_land[members]
-    centre_col = (rect[:, 2] + rect[:, 3]) // 2
-    centre_row = (rect[:, 0] + rect[:, 1]) // 2
+    centre_col = (rect[:, 2] + rect[:, 3] - 1) // 2            # the centre pixel: col_max, row_max are one past
+    centre_row = (rect[:, 0] + rect[:, 1] - 1) // 2
     if members.size < 1 or parts_available < 1:
         raise FlowDivideError("%s: %d basins and %d region numbers left" % (what, members.size, parts_available))
     part_of = np.zeros(members.size, np.int64)
@@ -4874,7 +4877,7 @@ def _split_basins_along_block_lines(grid, basins_rect, basins_land, member_indic
             prefix_land = np.cumsum(sorted_land)
             total_land = int(prefix_land[-1])
             first_block = (this_rect[2] if axis == 0 else this_rect[0]) // block
-            last_block = (this_rect[3] if axis == 0 else this_rect[1]) // block
+            last_block = ((this_rect[3] if axis == 0 else this_rect[1]) - 1) // block     # the last block inside
             for line in range(first_block + 1, last_block + 1):
                 boundary = line * block
                 split = int(np.searchsorted(sorted_centres, boundary, side="left"))    # members [0, split) lie before the line
@@ -5480,18 +5483,18 @@ def _mask_strip(bsn_strip, region_id_of_basin, region_index_of_basin, member_of_
             grid_row = row0 + row
             if grid_row < region_row_min[index]:
                 region_row_min[index] = grid_row
-            if grid_row > region_row_max[index]:
-                region_row_max[index] = grid_row
+            if grid_row >= region_row_max[index]:
+                region_row_max[index] = grid_row + 1        # one past
             if col < region_col_min[index]:
                 region_col_min[index] = col
-            if col > region_col_max[index]:
-                region_col_max[index] = col
+            if col >= region_col_max[index]:
+                region_col_max[index] = col + 1
             if periodic:
                 shifted = (col + half) % grid_ncol
                 if shifted < region_col_min_shift[index]:
                     region_col_min_shift[index] = shifted
-                if shifted > region_col_max_shift[index]:
-                    region_col_max_shift[index] = shifted
+                if shifted >= region_col_max_shift[index]:
+                    region_col_max_shift[index] = shifted + 1
 
 
 @njit(cache=True)
@@ -5528,18 +5531,18 @@ def _mask_strip_pieces(piece_strip, bsn_strip, cut_basin_id, region_id_of_code, 
             grid_row = row0 + row
             if grid_row < region_row_min[index]:
                 region_row_min[index] = grid_row
-            if grid_row > region_row_max[index]:
-                region_row_max[index] = grid_row
+            if grid_row >= region_row_max[index]:
+                region_row_max[index] = grid_row + 1        # one past
             if col < region_col_min[index]:
                 region_col_min[index] = col
-            if col > region_col_max[index]:
-                region_col_max[index] = col
+            if col >= region_col_max[index]:
+                region_col_max[index] = col + 1
             if periodic:
                 shifted = (col + half) % grid_ncol
                 if shifted < region_col_min_shift[index]:
                     region_col_min_shift[index] = shifted
-                if shifted > region_col_max_shift[index]:
-                    region_col_max_shift[index] = shifted
+                if shifted >= region_col_max_shift[index]:
+                    region_col_max_shift[index] = shifted + 1
     return 0
 
 
@@ -5618,15 +5621,15 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
             # gives a narrower span than the grid's own frame, they are moved, as in the group window of FD1.4
             # (an island or seam group keeps its rectangles as fd1.4 joined them).  The rule:
             # a rectangle already astride the seam or empty takes no part, a
-            # rectangle is western when its centre is (not only when all of it is), the spans count both ends, and a
+            # rectangle is western when its centre is (not only when all of it is), the spans are right open, and a
             # unit that holds a cut basin is refused rather than moved
             rows = basins_rect[member_indices]
-            taking_part = (rows[:, 3] >= rows[:, 2]) & (rows[:, 3] < grid.ncol)
-            western = taking_part & ((rows[:, 2] + rows[:, 3]) // 2 < grid.ncol // 2)
+            taking_part = (rows[:, 3] > rows[:, 2]) & (rows[:, 3] <= grid.ncol)
+            western = taking_part & ((rows[:, 2] + rows[:, 3] - 1) // 2 < grid.ncol // 2)
             eastern = taking_part & ~western
             if western.any() and eastern.any():
-                span_as_it_is = int(rows[taking_part, 3].max() - rows[taking_part, 2].min() + 1)
-                span_across_the_seam = int(rows[western, 3].max() + grid.ncol - rows[eastern, 2].min() + 1)
+                span_as_it_is = int(rows[taking_part, 3].max() - rows[taking_part, 2].min())
+                span_across_the_seam = int(rows[western, 3].max() + grid.ncol - rows[eastern, 2].min())
                 if span_across_the_seam < span_as_it_is:
                     if holds_a_cut_basin:
                         raise FlowDivideError("Level-03 unit %d lies across the antimeridian and holds a cut basin, whose "
@@ -5766,7 +5769,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
     pieces = pd.DataFrame(piece_rows) if piece_rows else pd.DataFrame({column: [] for column in PIECE_FINE_COLUMNS})
     region_of_piece = {}
     if len(pieces):
-        pieces["bbox_grid_count"] = (pieces["row_max"] - pieces["row_min"] + 1) * (pieces["col_max"] - pieces["col_min"] + 1)
+        pieces["bbox_grid_count"] = (pieces["row_max"] - pieces["row_min"]) * (pieces["col_max"] - pieces["col_min"])
         boxes = [grid.pixel_box_lon_lat(int(a), int(b), int(c), int(d)) for a, b, c, d in zip(pieces["row_min"], pieces["row_max"], pieces["col_min"], pieces["col_max"])]
         pieces["minlon"] = [b[0] for b in boxes]
         pieces["minlat"] = [b[1] for b in boxes]
@@ -5894,7 +5897,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                     piece_dataset.transform.b != 0.0 or piece_dataset.transform.d != 0.0 or \
                     abs(piece_dataset.transform.c - expected_transform.c) > origin_tolerance or \
                     abs(piece_dataset.transform.f - expected_transform.f) > origin_tolerance or \
-                    piece_dataset.width != window[3] - window[2] + 1 or piece_dataset.height != window[1] - window[0] + 1:
+                    piece_dataset.width != window[3] - window[2] or piece_dataset.height != window[1] - window[0]:
                 raise FlowDivideError("the piece raster %s is not an unsigned raster on the grid of the run, over the window of "
                                       "basin %d (rows %d .. %d, columns %d .. %d)"
                                       % (cuts[cut_id][1], cut_id, window[0], window[1], window[2], window[3]))
@@ -5946,11 +5949,11 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                 _mask_strip(bsn_strip, region_id_of_basin, region_index_of_basin, member_of_basin, rgn_strip,
                             r_count, r_row_min, r_row_max, r_col_min, r_col_max, r_col_min_shift, r_col_max_shift, member_count, row0, grid.ncol, grid.periodic)
                 for cut_id, (dataset, region_id_of_code, region_index_of_code, member_of_code, window) in piece_rasters.items():
-                    if window[1] < row0 or window[0] > row0 + nrow - 1:
+                    if window[1] <= row0 or window[0] >= row0 + nrow:
                         continue
                     read_row0 = max(row0, window[0])
-                    read_row1 = min(row0 + nrow - 1, window[1])
-                    piece_strip = dataset.read(1, window=Window(0, read_row0 - window[0], window[3] - window[2] + 1, read_row1 - read_row0 + 1))
+                    read_row1 = min(row0 + nrow - 1, window[1] - 1)          # the last row read, inside both
+                    piece_strip = dataset.read(1, window=Window(0, read_row0 - window[0], window[3] - window[2], read_row1 - read_row0 + 1))
                     status = _mask_strip_pieces(piece_strip, bsn_strip[read_row0 - row0:read_row1 - row0 + 1], np.uint32(cut_id), region_id_of_code, region_index_of_code, member_of_code,
                                                 rgn_strip[read_row0 - row0:read_row1 - row0 + 1], window[2],
                                                 r_count, r_row_min, r_row_max, r_col_min, r_col_max, r_col_min_shift, r_col_max_shift, member_count, read_row0, grid.ncol, grid.periodic)
@@ -6017,7 +6020,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
     for region in sorted(regions, key=lambda r: region_row_order_key(r.region_id)):
         index = region_index_of_id[region.region_id]
         window = region.window(grid)
-        window_pixels = (window[1] - window[0] + 1) * (window[3] - window[2] + 1)
+        window_pixels = (window[1] - window[0]) * (window[3] - window[2])
         box = grid.pixel_box_lon_lat(*window)
         # an island or seam region carries no code; its level1 is the continent's
         # an island group takes the Level-01 region it is numbered under; the rest of the groups without a
@@ -6031,7 +6034,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                      "level1_code": max(region.level1_code, 0) if region.level3_lead > 0 else (max(region.level1_code, 0) or level1_of_continent),
                      "level2_code": max(region.level2_code, 0), "level3_code": region.level3,
                      "row_min": window[0], "row_max": window[1], "col_min": window[2], "col_max": window[3],
-                     "nrow": window[1] - window[0] + 1, "ncol": window[3] - window[2] + 1, "region_grid_count": region.pixels,
+                     "nrow": window[1] - window[0], "ncol": window[3] - window[2], "region_grid_count": region.pixels,
                      "basin_count": int(region.basins.size) if region.cut_basin_id == 0 else 1, "piece_count": len(region.piece_codes), "window_grid_count": window_pixels,
                      "fill_percent": 100.0 * region.pixels / window_pixels, "minlon": box[0], "minlat": box[1], "maxlon": box[2], "maxlat": box[3],
                      "cut_basin_id": region.cut_basin_id, "bbox_row_min": int(r_row_min[index]), "bbox_row_max": int(r_row_max[index]),

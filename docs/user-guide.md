@@ -55,6 +55,11 @@ two 30 m grids, the figures. The attributes are a separate step on one capacity:
 
     python flowdivide.py run south-america --out-root /data/flowdivide --steps fd3 --attributes shv,ldn,hck,lup,lfp,ord --capacity 2^31
 
+FD3 holds one region's window at a time. The output blocks that two regions share wait for the second region in
+memory up to 512 MB (`FLOWDIVIDE_HELD_MEMORY_MB` sets another budget) and on disk beyond it, beside the output raster
+(`<raster>.held_blocks/`, removed when the step ends; on North America at 2^30 up to about 12 GB). Every region line
+of the log gives the peak memory so far.
+
 The HydroSHEDS ACC mosaic of a built-in grid can be replaced by a count made from the flow directions
 (`--acc`); the upstream area stays the provider's.
 
@@ -161,6 +166,12 @@ Under `<out-root>/<dataset>/` (`<c>` the continent,
 - `figures/` — Figures 3, 4 and 5; `_logs/` — the markers, the summary, the timings
 
 Every table is space separated with one header line.
+
+Every rectangle in the tables is left closed and right open: `row_min` is the first row inside, `row_max`
+the first row past it, so `nrow = row_max - row_min`, and a loop over the rows runs `row_min <= row < row_max`.
+The same holds for the columns, for the `basin_*`, `bbox_*` and `cell_*` rectangles, and for the block
+windows of the group tables (`window_row_max` is one past the last block).  A rectangle in degrees
+follows from the pixel edges, so `maxlon` is the left edge of column `col_max`.
 
 Every step checks itself: the recode counts add up and the file reads back as written; the counts
 ending at the outlets equal the land pixels; every basin's pixel count equals the upstream count at

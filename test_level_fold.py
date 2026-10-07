@@ -52,15 +52,15 @@ class _Grid:
         self.step = step
 
     def pixel_box_lon_lat(self, row_min, row_max, col_min, col_max):
-        return (self.west + col_min * self.step, self.north - (row_max + 1) * self.step,
-                self.west + (col_max + 1) * self.step, self.north - row_min * self.step)
+        return (self.west + col_min * self.step, self.north - row_max * self.step,
+                self.west + col_max * self.step, self.north - row_min * self.step)
 
 
 def a_made_up_fold():
     print("a made-up Level-03 table folded")
     rows = []
-    for group_id, code, kind, basins, window in ((621, 621, 2, 10, (0, 1, 0, 1)), (622, 622, 1, 1, (1, 3, 1, 2)),
-                                                 (611, 611, 2, 5, (4, 4, 0, 0)), (206001, 0, 3, 2, (9, 9, 9, 9))):
+    for group_id, code, kind, basins, window in ((621, 621, 2, 10, (0, 2, 0, 2)), (622, 622, 1, 1, (1, 4, 1, 3)),
+                                                 (611, 611, 2, 5, (4, 5, 0, 1)), (206001, 0, 3, 2, (9, 10, 9, 10))):
         rows.append({"group_id": group_id, "group_level": 3, "group_kind": kind, "level_code": code, "level3_count": 1 if code else 0,
                      "basin_count": basins, "coded_basin_count": basins, "neighbour_basin_count": 0, "land_grid_count": basins * 100,
                      "window_row_min": window[0], "window_row_max": window[1], "window_col_min": window[2], "window_col_max": window[3]})
@@ -71,18 +71,18 @@ def a_made_up_fold():
     unit_62 = level2[level2["group_id"] == 62].iloc[0]
     check("62 holds its two Level-03 groups", int(unit_62["level3_count"]), 2)
     check("its window is their union", (int(unit_62["window_row_min"]), int(unit_62["window_row_max"]),
-                                        int(unit_62["window_col_min"]), int(unit_62["window_col_max"])), (0, 3, 0, 2))
+                                        int(unit_62["window_col_min"]), int(unit_62["window_col_max"])), (0, 4, 0, 3))
     check("a folded group is of kind 2", int(unit_62["group_kind"]), 2)
     check("the island keeps its id and changes level", (int(level2.iloc[2]["group_id"]), int(level2.iloc[2]["group_level"])), (206001, 2))
     level1 = fd1.fold_level3_groups(level3, 1, grid)
     check("Level-01: 6, then the island", level1["group_id"].tolist(), [6, 206001])
     check("6 holds the basins of all three codes", int(level1.iloc[0]["basin_count"]), 16)
     # across the 180th meridian: a unit with a group at the western edge and one past the eastern edge
-    rows_seam = [dict(rows[0], window_col_min=0, window_col_max=1), dict(rows[1], window_col_min=98, window_col_max=100)]
+    rows_seam = [dict(rows[0], window_col_min=0, window_col_max=2), dict(rows[1], window_col_min=98, window_col_max=101)]
     seam_grid = _Grid(10, 1000, True)
     folded = fd1.fold_level3_groups(fd1._fill_group_window_columns(pd.DataFrame(rows_seam), seam_grid, 10), 2, seam_grid)
     check("the western part is moved one width east when that is narrower", (int(folded.iloc[0]["window_col_min"]),
-                                                                            int(folded.iloc[0]["window_col_max"])), (98, 101))
+                                                                            int(folded.iloc[0]["window_col_max"])), (98, 102))
 
 
 def the_run_tables_fold_the_same_here(root, run):

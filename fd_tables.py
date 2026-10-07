@@ -45,7 +45,7 @@ import time
 import numpy as np
 import pandas as pd
 
-VERSION = "1.0.0"
+VERSION = "0.7.4"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -200,9 +200,8 @@ def _check_column_types(frame, path, float_columns, text_columns):
                 raise TableError("column %s of %s holds a value outside 0 .. %d" % (name, path, largest))
 
 
-def _read_frame(path, columns, what, float_columns=(), text_columns=()):
-    """a whole table, its header demanded exactly (the first column that differs is named), its values of the types
-    the reader takes"""
+def _check_header(path, columns, what):
+    """the marker there and the header exactly the columns (the first column that differs is named)"""
     file_is_complete(path)
     with open(path) as handle:
         header = handle.readline().split()
@@ -213,6 +212,12 @@ def _read_frame(path, columns, what, float_columns=(), text_columns=()):
                                  % (path, what, index + 1, found, wanted))
         raise TableError("%s is not a %s of this version: it has %d columns, this version writes %d"
                          % (path, what, len(header), len(columns)))
+
+
+def _read_frame(path, columns, what, float_columns=(), text_columns=()):
+    """a whole table, its header demanded exactly (the first column that differs is named), its values of the types
+    the reader takes"""
+    _check_header(path, columns, what)
     frame = pd.read_csv(path, sep=" ", float_precision="round_trip", keep_default_na=False)
     _check_column_types(frame, path, float_columns, text_columns)
     return frame
@@ -280,18 +285,32 @@ def _check_basin_rows(table, source):
     unset = row_min == UNSET_PIXEL
     unset_right = (row_max == UNSET_PIXEL) & (col_min == UNSET_PIXEL) & (col_max == UNSET_PIXEL)
     outlet_row = table["outlet_row"].to_numpy(np.int64)
-    set_right = (row_min >= 0) & (col_min >= 0) & (row_max >= row_min) & (col_max >= col_min) \
-        & (outlet_row >= row_min) & (outlet_row <= row_max)
+    set_right = (row_min >= 0) & (col_min >= 0) & (row_max > row_min) & (col_max > col_min) \
+        & (outlet_row >= row_min) & (outlet_row < row_max)
     if not np.where(unset, unset_right, set_right).all():
         raise TableError("%s holds a row whose box is neither unset nor a box around its outlet" % source)
 
 
+def _box_sizes(table):
+    """(basin_nrow, basin_ncol) as the box gives them, 0 for a box not set"""
+    box_is_set = table["basin_row_min"].to_numpy(np.int64) >= 0
+    nrow = np.where(box_is_set, table["basin_row_max"].to_numpy(np.int64) - table["basin_row_min"].to_numpy(np.int64), 0)
+    ncol = np.where(box_is_set, table["basin_col_max"].to_numpy(np.int64) - table["basin_col_min"].to_numpy(np.int64), 0)
+    return nrow, ncol
+
+
 def _with_box_sizes(table):
     out = table.copy()
-    box_is_set = out["basin_row_min"].to_numpy(np.int64) >= 0
-    out["basin_nrow"] = np.where(box_is_set, out["basin_row_max"] - out["basin_row_min"] + 1, 0)
-    out["basin_ncol"] = np.where(box_is_set, out["basin_col_max"] - out["basin_col_min"] + 1, 0)
+    out["basin_nrow"], out["basin_ncol"] = _box_sizes(out)
     return out
+
+
+def _check_box_sizes(table, path):
+    """basin_nrow and basin_ncol as the box gives them, checked on the columns themselves: the copy of the whole
+    table that _with_box_sizes makes would double the 6.5 GB of North America's thirty million rows"""
+    nrow, ncol = _box_sizes(table)
+    if not (np.array_equal(nrow, table["basin_nrow"].to_numpy(np.int64)) and np.array_equal(ncol, table["basin_ncol"].to_numpy(np.int64))):
+        raise TableError("%s holds a row whose basin_nrow or basin_ncol is not its box" % path)
 
 
 def write_basin_table(table, path, stage, checks_summary=""):
@@ -329,9 +348,56 @@ def read_basin_table(path):
     if len(table) != promised:
         raise TableError("%s holds %d rows and its completion marker promises %d: the table was cut short" % (path, len(table), promised))
     _check_basin_rows(table, path)
-    sized = _with_box_sizes(table)
-    if not (np.array_equal(sized["basin_nrow"], table["basin_nrow"]) and np.array_equal(sized["basin_ncol"], table["basin_ncol"])):
-        raise TableError("%s holds a row whose basin_nrow or basin_ncol is not its box" % path)
+    _check_box_sizes(table, path)
+    return table
+
+
+# the columns the checks of a basin table read (_check_basin_rows, _check_box_sizes)
+BASIN_TABLE_CHECKED_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_flag", "basin_grid_count", "basin_area_km2",
+                               "basin_row_min", "basin_row_max", "basin_col_min", "basin_col_max", "basin_nrow", "basin_ncol")
+# rows parsed at once: the parser's buffers grow with the chunk (on 3 million made-up rows the peak above the
+# kept columns was 2.6 GB for chunks of 2 million rows and 0.6 GB for chunks of 250,000)
+BASIN_TABLE_CHUNK_ROWS = 250000
+
+
+def read_basin_table_columns(path, columns, chunk_rows=BASIN_TABLE_CHUNK_ROWS):
+    """the basin table with every check of read_basin_table, but held in memory only in the columns asked for.  The
+    rows are read in chunks; every chunk passes the column checks of the whole table (_check_column_types, column by
+    column, so a chunk is checked as the table would be), and only the columns asked for and those the row checks read
+    are kept, in arrays of the length the marker promises, filled chunk by chunk.  The row checks then run on the whole
+    table as in read_basin_table.  North America's thirty million rows take 6.5 GB in all 27 columns, and read whole
+    their parse took about five times as much; the attributes need eleven columns."""
+    promised, stage = basin_table_stage(path)
+    _check_header(path, BASIN_TABLE_COLUMNS, "basin table")
+    unknown = [name for name in columns if name not in BASIN_TABLE_COLUMNS]
+    if unknown:
+        raise TableError("the basin table has no columns %s" % ", ".join(unknown))
+    kept = [name for name in BASIN_TABLE_COLUMNS if name in columns or name in BASIN_TABLE_CHECKED_COLUMNS]
+    # the dtypes read_basin_table gives a table of this writer: Float64 the float columns, Int64 the others (a
+    # chunk is converted to them only after _check_column_types has passed it).  A row takes at least 54 bytes (27
+    # values, 26 blanks, the newline): a marker that promises more rows than the file can hold is not believed, the
+    # rows are only counted, and the table is refused as cut short, as read_basin_table refuses it
+    fits = promised <= os.path.getsize(path) // (2 * len(BASIN_TABLE_COLUMNS))
+    arrays = {name: np.empty(promised if fits else 0, np.float64 if name in BASIN_TABLE_FLOAT_FORMATS else np.int64) for name in kept}
+    rows = 0
+    for chunk in pd.read_csv(path, sep=" ", float_precision="round_trip", keep_default_na=False, chunksize=chunk_rows):
+        _check_column_types(chunk, path, BASIN_TABLE_FLOAT_FORMATS, ())
+        count = len(chunk)
+        if fits and rows + count <= promised:
+            for name in kept:
+                arrays[name][rows:rows + count] = chunk[name].to_numpy(arrays[name].dtype)
+        rows += count
+        del chunk
+    if rows != promised:
+        raise TableError("%s holds %d rows and its completion marker promises %d: the table was cut short" % (path, rows, promised))
+    table = pd.DataFrame(index=pd.RangeIndex(rows))
+    for name in kept:
+        table[name] = arrays.pop(name)
+    _check_basin_rows(table, path)
+    _check_box_sizes(table, path)
+    for name in kept:                     # the columns only the checks read go, without copying the others
+        if name not in columns:
+            del table[name]
     return table
 
 
@@ -366,7 +432,7 @@ def group_basin_map_path(root, run, grouping):
 
 def group_block_pixels(groups):
     """the block the windows of a group table are on: window_nrow over the block rows, the same for every row"""
-    rows = groups["window_row_max"].to_numpy(np.int64) - groups["window_row_min"].to_numpy(np.int64) + 1
+    rows = groups["window_row_max"].to_numpy(np.int64) - groups["window_row_min"].to_numpy(np.int64)
     nrow = groups["window_nrow"].to_numpy(np.int64)
     if (rows < 1).any() or (nrow % rows != 0).any():
         raise TableError("a window of the group table is not on whole blocks")
@@ -381,8 +447,8 @@ def _check_group_rows(groups, source):
     good = ((groups["group_id"] > 0) & groups["group_level"].between(0, 3)
             & groups["group_kind"].between(GROUP_KIND_ONE_BASIN, GROUP_KIND_ASTRIDE_THE_SEAM) & (groups["level_code"] >= 0)
             & (groups["basin_count"] > 0) & (groups["land_grid_count"] > 0) & (groups["window_row_min"] >= 0)
-            & (groups["window_col_min"] >= 0) & (groups["window_row_max"] >= groups["window_row_min"])
-            & (groups["window_col_max"] >= groups["window_col_min"])
+            & (groups["window_col_min"] >= 0) & (groups["window_row_max"] > groups["window_row_min"])
+            & (groups["window_col_max"] > groups["window_col_min"])
             & (groups["window_grid_count"] == groups["window_nrow"] * groups["window_ncol"]))
     if not good.all():
         raise TableError("row %d of %s is not a group" % (int(np.nonzero(~good.to_numpy())[0][0]) + 1, source))
@@ -400,8 +466,8 @@ def read_group_table(path, pixels_per_block=0):
     """pixels_per_block 0: the block the table was written on (a Hilbert grouping may run on blocks of its own)"""
     groups = _read_frame(path, GROUP_TABLE_COLUMNS, "group table", GROUP_TABLE_FLOAT_FORMATS)
     block = pixels_per_block or group_block_pixels(groups)
-    rows = groups["window_row_max"] - groups["window_row_min"] + 1
-    cols = groups["window_col_max"] - groups["window_col_min"] + 1
+    rows = groups["window_row_max"] - groups["window_row_min"]
+    cols = groups["window_col_max"] - groups["window_col_min"]
     if not ((groups["window_nrow"] == rows * block) & (groups["window_ncol"] == cols * block)).all():
         raise TableError("a row of %s has window columns that disagree with blocks of %d pixels" % (path, block))
     if groups["group_id"].duplicated().any():
@@ -437,9 +503,9 @@ def group_of_basin(root, run, grouping, basins=None):
 
 def _check_region_rows(regions, source):
     """the checks on every row of a region table"""
-    good = ((regions["region_id"] > 0) & (regions["row_max"] >= regions["row_min"]) & (regions["col_max"] >= regions["col_min"])
-            & (regions["nrow"] == regions["row_max"] - regions["row_min"] + 1)
-            & (regions["ncol"] == regions["col_max"] - regions["col_min"] + 1))
+    good = ((regions["region_id"] > 0) & (regions["row_max"] > regions["row_min"]) & (regions["col_max"] > regions["col_min"])
+            & (regions["nrow"] == regions["row_max"] - regions["row_min"])
+            & (regions["ncol"] == regions["col_max"] - regions["col_min"]))
     if not good.all():
         raise TableError("row %d of %s is not a region (its window and its nrow, ncol disagree)"
                          % (int(np.nonzero(~good.to_numpy())[0][0]) + 1, source))
@@ -447,8 +513,9 @@ def _check_region_rows(regions, source):
 
 def _check_piece_rows(pieces, source):
     """the checks on every row of a piece table"""
-    good = ((pieces["piece_id"] > 0) & (pieces["basin_id"] > 0) & (pieces["row_max"] >= pieces["row_min"])
-            & (pieces["col_max"] >= pieces["col_min"]))
+    good = ((pieces["piece_id"] > 0) & (pieces["basin_id"] > 0) & (pieces["row_max"] > pieces["row_min"])
+            & (pieces["col_max"] > pieces["col_min"])
+            & (pieces["bbox_grid_count"] == (pieces["row_max"] - pieces["row_min"]) * (pieces["col_max"] - pieces["col_min"])))
     if not good.all():
         raise TableError("row %d of %s is not a piece" % (int(np.nonzero(~good.to_numpy())[0][0]) + 1, source))
 

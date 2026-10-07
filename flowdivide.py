@@ -75,8 +75,10 @@ import fd2_views as fd2
 import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
-VERSION = "1.0.0"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
-RULES_VERSION = 1          # the rules that make the results; a step's marker is tied to this, not to the
+VERSION = "0.7.4"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
+RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
+                           # and a run into an old tree makes everything again instead of reading closed tables.
+                           # The rules that make the results; a step's marker is tied to this, not to the
                            # package version, so that a change of wording or timing reruns nothing
 REGIONS_RULES_VERSION = 2  # the rules of fd1.5.regions_final that are not its arguments (the order of the
                            # joins of merge=level2, partition_config.txt)
@@ -92,7 +94,8 @@ CHANNEL_RULES_VERSION = 2  # the test of a channel pixel in fd1.1: the threshold
                            # against the float32 area, as in FD3 (a double threshold decides otherwise at
                            # 1.00000001 km2).  In fd1.1's arguments, so that a mask of another test is made again,
                            # and asked of fd1.1's marker when fd3 runs alone
-FD3_RULES_VERSION = 5      # the rules of stage 3 alone: the distance and the upstream flow length cover every basin
+FD3_RULES_VERSION = 6      # 6: the channel and area grids must agree over the whole raster within 0.01 pixel
+                           # the rules of stage 3 alone: the distance and the upstream flow length cover every basin
                            # however small, their tables still list the basins of min_basin_area_km2 and more; the
                            # basin tables are printed column by column, with the longitudes and
                            # latitudes transformed on a projected grid; the lfp outputs carry .done markers;
@@ -740,12 +743,39 @@ class Chain:
         root = os.path.abspath(self.layout.root) + os.sep
         external_paths = [path for path in getattr(step, "inputs", None) or [] if path]
         external_paths += [path for path in getattr(self.layout, "external", {}).values() if path]
+        native = getattr(self.dataset, "raw_dir", None)
+        native_paths = set()
+        if native:
+            native_paths.add(os.fspath(native))
+            if os.path.isdir(native):
+                native_paths.update(glob.glob(os.path.join(native, "*.tif")))
+            external_paths.extend(native_paths)
         identities = []
         for path in sorted(set(external_paths)):
-            if not os.path.abspath(path).startswith(root) and os.path.exists(path):
+            if os.path.exists(path) and (path in native_paths or not os.path.abspath(path).startswith(root)):
                 status = os.stat(path)
                 identities.append("input %s %d %d" % (os.path.abspath(path), status.st_size, status.st_mtime_ns))
         return identities
+
+    def native_input_identity(self):
+        """The native DIR identity in recode arguments, including the tile list."""
+        native = self.dataset.raw_dir
+        if not os.path.exists(native):
+            return None
+        paths = sorted(glob.glob(os.path.join(native, "*.tif"))) if os.path.isdir(native) else [native]
+        if not paths:
+            return None
+        return ";".join("%s:%s" % (os.path.basename(path), file_identity(path)) for path in paths)
+
+    def marker_native_that_changed(self):
+        """Older recode markers kept the native identity in args, rather than external lines."""
+        arguments = self.marker_arguments("fd1.0")
+        if arguments is None:
+            return None
+        current = self.native_input_identity()
+        if current is None or not arguments.endswith(" input=" + current):
+            return self.dataset.raw_dir
+        return None
 
     def marker_external_that_changed(self, label):
         """the first outside input a finished step's marker recorded ("external: input <path> <bytes>
@@ -753,6 +783,9 @@ class Chain:
         path = self.marker(label)
         if not os.path.exists(path):
             return None
+        native_changed = self.marker_native_that_changed()
+        if native_changed:
+            return native_changed
         with open(path) as handle:
             for line in handle.read().splitlines():
                 if not line.startswith("external: input "):
@@ -1155,7 +1188,24 @@ class Chain:
                     self.note("dropped %s (%s): no step still to run reads it" % (variable, path))
 
     # ---- the steps ----
-    def run(self):
+    def run(self, _validate_only=False):
+        if self.only is not None and not self.only:
+            raise FlowDivideError("--only must name at least one step")
+        if self.only is not None and not self.summary_only and not _validate_only:
+            # Reuse the summary plan to check every selected name before recode can
+            # write. It reads metadata and may create directories, but stops before
+            # dependency checks and summary output. Actual execution still checks
+            # the inputs; this is only a check of the selected step names.
+            import copy
+            preflight = copy.copy(self)
+            preflight.dataset = copy.copy(self.dataset)
+            preflight.layout = copy.copy(self.layout)
+            preflight.layout.dataset = preflight.dataset
+            preflight.planned = {}
+            preflight.held_back = []
+            preflight.summary_only = True
+            preflight.note = lambda text: None
+            preflight.run(_validate_only=True)
         dataset = self.dataset
         layout = self.layout
         self.note("==== flowdivide %s %s %s steps=%s attributes=%s capacity=%s grouping=%s drop=%s ====" % (
@@ -1174,7 +1224,7 @@ class Chain:
             candidates = [native]
             layout.set_grid(fd1.Grid(native, periodic=dataset.periodic, block_pixels=dataset.block_pixels, earth_model=dataset.earth_model))
         # the native file's size and time are part of what identifies the recode, so a replaced input is seen
-        identity = ";".join("%s:%s" % (os.path.basename(p), file_identity(p)) for p in candidates)
+        identity = self.native_input_identity()
         dir_path = layout.raster("dir")
         if "fd1" in self.steps:
             # the coding the recode is given is part of what identifies it: a grid of one's own whose
@@ -1399,6 +1449,16 @@ class Chain:
                 # stages 1 and 2, which such a change does not touch, keep their markers
                 steps.append(Step("fd3_%s_%s" % (code, label), "capacity=%s grouping=%s min_area=%r fd3_rules=%d" % (self.capacity_name, grouping, float(self.min_basin_area_km2), FD3_RULES_VERSION), self.step_fd3, (code, blocks),
                                   outputs=outputs, products=products, inputs=needed, depends_on=depends, kind="fd3_%s" % code))
+        if self.only is not None:
+            # Recode was planned separately; a later selected step must not be
+            # rejected while that first plan contains only fd1.0.
+            available = {step.label for step in steps} | set(getattr(self, "planned", {}))
+            unknown = self.only - available
+            if unknown:
+                raise FlowDivideError("--only names unknown steps for this run: %s; available: %s"
+                                      % (", ".join(sorted(unknown)), ", ".join(sorted(available))))
+        if _validate_only:
+            return
         self.plan(steps)
         if "fd1" not in self.steps and dataset.hilbert and any(s.label == "fd2_basin_views" and s.will_execute for s in steps) and os.path.exists(self.marker("fd1.4_groups_hilbert")):
             # the automatic groups were counted on the 400th basin view; fd2 alone remakes that view and leaves the groups as they were
@@ -1446,8 +1506,8 @@ class Chain:
         basins = fd_tables.read_basin_table(self.layout.basin_table())
         block = self.grid.block_pixels
         rectangles = fd1.basin_rectangles(basins)
-        window_rows = (rectangles[:, 1] // block + 1) * block - rectangles[:, 0] // block * block
-        window_cols = (rectangles[:, 3] // block + 1) * block - rectangles[:, 2] // block * block
+        window_rows = ((rectangles[:, 1] - 1) // block + 1) * block - rectangles[:, 0] // block * block
+        window_cols = ((rectangles[:, 3] - 1) // block + 1) * block - rectangles[:, 2] // block * block
         windows = window_rows * window_cols
         return basins, [int(b) for b in basins.loc[windows > capacity_pixels, "basin_id"]]
 
@@ -1588,7 +1648,7 @@ class Chain:
         grouping = self.grouping
         view_name, factor = dataset.views[0]
         if dataset.figure_view is None:
-            box = grid.pixel_box_lon_lat(0, grid.nrow - 1, 0, grid.ncol - 1)
+            box = grid.pixel_box_lon_lat(0, grid.nrow, 0, grid.ncol)
             dataset.figure_view = (box[0], box[2], box[1], box[3])
         if dataset.figure_ticks is None:
             dataset.figure_ticks = (fd2._tick_values(dataset.figure_view[0], dataset.figure_view[1]), fd2._tick_values(dataset.figure_view[2], dataset.figure_view[3]))
@@ -1827,8 +1887,10 @@ def main(argv=None):
     chain = Chain(dataset, arguments.out_root, steps, attributes, capacity_name, drop, arguments.tile, arguments.min_basin_area_km2, channel_threshold_km2, not arguments.no_open,
                   grouping=grouping, levels=levels, vector_formats=vector_formats, colours=arguments.colours, separate_processes=not arguments.in_process)
     chain.timing = arguments.timing == "on"
-    if arguments.only:
+    if arguments.only is not None:
         chain.only = set(label.strip() for label in arguments.only.split(",") if label.strip())
+        if not chain.only:
+            raise FlowDivideError("--only must name at least one step")
         if chain.drop:
             # a variable is dropped when nothing left in the run reads it; with --only most of the run
             # is not in it, so dropping would take files the steps held back still need

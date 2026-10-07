@@ -66,7 +66,7 @@ from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, ch
                            basin_rectangles, group_windows_in_pixels)
 import fd_tables
 
-FLOWDIVIDE_VERSION = "1.0.0"            # named in the metadata of every vector file (flowdivide.py’s VERSION says the same)
+FLOWDIVIDE_VERSION = "0.7.4"            # named in the metadata of every vector file (flowdivide.py’s VERSION says the same)
 
 CELL_MIN_LAND_PERCENT = 25              # a cell with less land than this stays water
 CELL_MIN_WINNER_PERCENT = 25            # a candidate basin holds at least this much of the cell's land
@@ -213,12 +213,12 @@ def _fold_strip_largest_basin(fine, factor, basin_count_in_the_view, out_row, mi
             cell_count[winner] += 1
             if coarse_row < cell_row_min[winner]:
                 cell_row_min[winner] = coarse_row
-            if coarse_row > cell_row_max[winner]:
-                cell_row_max[winner] = coarse_row
+            if coarse_row >= cell_row_max[winner]:
+                cell_row_max[winner] = coarse_row + 1        # one past: left closed, right open
             if coarse_col < cell_col_min[winner]:
                 cell_col_min[winner] = coarse_col
-            if coarse_col > cell_col_max[winner]:
-                cell_col_max[winner] = coarse_col
+            if coarse_col >= cell_col_max[winner]:
+                cell_col_max[winner] = coarse_col + 1
 
 
 @njit(cache=True)
@@ -325,12 +325,12 @@ def _fold_strip_region(fine, basin_fine, basin_view_row, factor, lookup, out_row
             cell_count[winner] += 1
             if coarse_row < cell_row_min[winner]:
                 cell_row_min[winner] = coarse_row
-            if coarse_row > cell_row_max[winner]:
-                cell_row_max[winner] = coarse_row
+            if coarse_row >= cell_row_max[winner]:
+                cell_row_max[winner] = coarse_row + 1        # one past: left closed, right open
             if coarse_col < cell_col_min[winner]:
                 cell_col_min[winner] = coarse_col
-            if coarse_col > cell_col_max[winner]:
-                cell_col_max[winner] = coarse_col
+            if coarse_col >= cell_col_max[winner]:
+                cell_col_max[winner] = coarse_col + 1
 
 
 def min_land_pixels_of(factor):
@@ -987,9 +987,9 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
             col0 = int(record.cell_col_min)
             col1 = int(record.cell_col_max)
             if in_memory:
-                block = whole[row0:row1 + 1, col0:col1 + 1]
+                block = whole[row0:row1, col0:col1]
             else:
-                block = coarse.read(1, window=Window(col0, row0, col1 - col0 + 1, row1 - row0 + 1))
+                block = coarse.read(1, window=Window(col0, row0, col1 - col0, row1 - row0))
             mask = (block == object_id).astype(np.uint8)
             if int(mask.sum()) != int(record.coarse_grid_count):
                 raise FlowDivideError("object %d holds %d cells in its rectangle, the fold counted %d" % (object_id, int(mask.sum()), int(record.coarse_grid_count)))
