@@ -100,7 +100,7 @@ def strip_lines(dataset):
         raise SystemExit("the run page of %s does not say one direction convention: %r" % (dataset, flow[1]))
     convention = conventions[0]
     # The run as one command: the built-in grid south-america, which fixes the convention, the groups, the
-    # capacities with their depths, the land limit and the channel threshold; the run read the upstream pixel
+    # capacities with their depths and the channel threshold (the land limit is set too, and left out here); the run read the upstream pixel
     # count (--acc) and the grid's own area.  Every value shown still comes off the run page.
     groups_given = value_of(lines, "basin groups")
     if not (groups_given and groups_given[0].startswith("predefined")):
@@ -138,7 +138,7 @@ def strip_lines(dataset):
     out.append(("option", "  # set by the built-in grid:", ""))
     out.append(("option", "  #   convention %s; groups" % convention, "units of whole basins: %s" % (layers[0] if len(layers) == 1 else re.sub(r"_[a-z]{2}_", "_*_", layers[0]))))
     out.append(("option", "  #   capacities %s" % ",".join("%s:%s" % (n, d) for n, d in zip(names, depths)), "%s deg²; the cut %s deep" % (", ".join(degrees), ", ".join(depths))))
-    out.append(("option", "  #   land limit, channel threshold", "7.5 × 10⁸ and 1.5 × 10⁸ land pixels; %s km²" % km2))
+    out.append(("option", "  #   channel threshold", "%s km²" % km2))
     widest_text = max(len(text) for kind, text, note in out)
     widest_note = max(len(note) for kind, text, note in out)
     if widest_text > STRIP_NOTE_COLUMN - 2 or STRIP_NOTE_COLUMN + widest_note > STRIP_WIDTH_CHARACTERS:
