@@ -1,0 +1,14 @@
+# the versions the figures of the paper were drawn with
+numpy==2.3.3
+matplotlib==3.10.8
+pandas==2.2.3
+scipy==1.16.1
+geopandas==1.1.1
+shapely==2.1.2
+GDAL==3.6.2
+# for Fig. 8, which imports the flowdivide package, and for the data scripts
+rasterio==1.4.3
+pyogrio==0.10.0
+fiona==1.10.1
+numba==0.63.1
+pyarrow==18.1.0

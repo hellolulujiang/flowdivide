@@ -54,7 +54,6 @@ import math
 import os
 import platform
 import resource
-import shutil
 import time
 
 try:
@@ -148,7 +147,10 @@ class HeldBlocks:
     A block is kept whole in the raster's own type.  The most recently held blocks stay in memory up to a budget of
     bytes; the older ones go to a scratch directory as raw .npy files and come back from there when a region needs
     them (np.save and np.load keep the dtype and every bit, so a block comes back as it went).  The directory is
-    <prefix>.<process id>: a run removes the directories of runs that are no longer alive, never one in use.  Without the budget the
+    <prefix>.<process id>.  Nothing is deleted (0.7.9): a block read back leaves its file where it is (the file is
+    this run's own scratch, written again if the same block goes to disk a second time), the directory is moved
+    into _tmp_/ beside the output when the step ends, and so are the directories of runs that are no longer alive,
+    never one in use; the scratch left in _tmp_ is at most every shared block once.  Without the budget the
     held blocks grew with the continent and not with the capacity: up to 12,024 blocks, 12.6 GB, for the upstream flow
     length on North America at 2^30.  Used as a dictionary by RegionWindow.write_back: `in`, pop, item assignment, len."""
 
@@ -161,7 +163,7 @@ class HeldBlocks:
         self.largest_memory_bytes = 0
         self.largest_count = 0
         self.written_to_disk = 0
-        self._remove_what_stopped_runs_left(prefix)
+        self._put_aside_what_stopped_runs_left(prefix)
 
     def _path(self, index):
         return os.path.join(self.directory, "block_%d_%d.npy" % index)
@@ -195,8 +197,7 @@ class HeldBlocks:
         if index in self.on_disk:
             path = self._path(index)
             values = np.load(path, allow_pickle=False)
-            os.remove(path)
-            self.on_disk.discard(index)
+            self.on_disk.discard(index)                 # the file stays: nothing is deleted
             return values
         if default:
             return default[0]
@@ -213,25 +214,27 @@ class HeldBlocks:
         self.memory.clear()
         self.memory_bytes = 0
         self.on_disk.clear()
-        self.remove_directory()
+        self.put_directory_aside()
 
-    def remove_directory(self):
+    def put_directory_aside(self):
+        """the scratch directory, when there is one, moved into _tmp_/ beside the output; returns where it went"""
         if os.path.isdir(self.directory):
-            shutil.rmtree(self.directory)
+            return fd_tables.set_aside(self.directory)
+        return None
 
-    def remove_quietly(self, tag="fd3"):
-        """on the way out of an error: the scratch directory goes if it can, and a failure here is logged, not raised,
-        so that it does not hide the error"""
+    def put_aside_quietly(self, tag="fd3"):
+        """on the way out of an error: the scratch directory is put aside if it can be, and a failure here is logged,
+        not raised, so that it does not hide the error"""
         try:
-            if os.path.isdir(self.directory):
-                shutil.rmtree(self.directory)
+            self.put_directory_aside()
         except Exception as failure:
-            log(tag, "the scratch directory %s could not be removed: %s" % (self.directory, failure))
+            log(tag, "the scratch directory %s could not be put aside: %s" % (self.directory, failure))
 
     @staticmethod
-    def _remove_what_stopped_runs_left(prefix):
+    def _put_aside_what_stopped_runs_left(prefix):
         """the scratch directories of this output whose run is gone: <prefix> itself (0.7.4 named it so) and every
-        <prefix>.<process id> whose process no longer exists; a directory of a live process is left alone"""
+        <prefix>.<process id> whose process no longer exists are moved into _tmp_/; a directory of a live process is
+        left alone"""
         for path in [prefix] + glob.glob(glob.escape(prefix) + ".*"):
             if not os.path.isdir(path):
                 continue
@@ -247,7 +250,7 @@ class HeldBlocks:
                     pass
                 except PermissionError:
                     continue                           # alive, another user's
-            shutil.rmtree(path)
+            fd_tables.set_aside(path)
 
 
 # =============================================================================
@@ -376,6 +379,21 @@ class Partition:
                 steps += 1
                 if steps > len(self.members):
                     raise FlowDivideError("the pieces of basin %d flow into each other in a cycle" % member.basin_id)
+        # a cut basin has one piece without a parent, and it ends at the basin's outlet (the C's
+        # main_hydrosheds30m_fd3_3_derive_lfp_from_regions.c refuses a chain whose root's outlet is not the basin's): a
+        # root piece that ended a pixel short gave a longest flow path a pixel short, within its length's tolerance
+        for basin_id, basin in self.basins.items():
+            if int(region_of_basin[basin_id]) != 0:
+                continue
+            roots = [piece for piece in basin["members"] if not piece.parent_member_id]
+            if len(roots) != 1:
+                raise FlowDivideError("basin %d is cut into pieces of which %d have no parent; exactly one must, the one "
+                                      "that holds the basin's outlet" % (basin_id, len(roots)))
+            if roots[0].outlet_row != basin["outlet_row"] or (roots[0].outlet_col - basin["outlet_col"]) % grid.ncol != 0:
+                raise FlowDivideError("piece %d has no parent, but its outlet (row %d, column %d) is not the outlet of its "
+                                      "basin %d (row %d, column %d)" % (roots[0].member_id, roots[0].outlet_row,
+                                                                       roots[0].outlet_col, basin_id, basin["outlet_row"],
+                                                                       basin["outlet_col"]))
         self.regions = {int(row.region_id): row for row in regions.itertuples(index=False)}
         # the basins below the table's area that the raster still covers, as arrays sorted by region
         self.small_by_region = {}
@@ -474,7 +492,7 @@ class Partition:
             # once: the tables do not say which column is free (the box of a region may span every column although one
             # is free, and the small basins' boxes are not kept), and with one copy of it the column of a child's outlet
             # there, which decides the tie of the Hack order's main stem, would depend on where the window starts
-            # (Codex, review of 0.7.8)
+            # (0.7.8)
             raise FlowDivideError("region %d spans %d of the %d columns of the periodic grid: its window, with a column of "
                                   "margin on each side, would hold a column twice, and a region all the way round the grid, "
                                   "or all but one column, is not computed; build the partition at a smaller capacity"
@@ -785,7 +803,7 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
 #  The six provided attributes no longer build the order over the whole window.  The window holds the
 #  flow directions (one byte a pixel), the channel mask when the class lives on the network (one byte),
 #  and, while the structure is built, the number of every pixel of this region (int32): four arrays
-#  over the window shrank to one, as in the C programs (CCode fd3.*, compact_the_pixels_of_the_region).
+#  over the window shrank to one, as in the C code (its FD3, compact_the_pixels_of_the_region).
 #  Everything else is held for the pixels of the region only, in the order they are numbered:
 #      pixel_of_compact       int32, the window pixel
 #      member_of_compact      int32, the member (its index among the region's outlets)
@@ -1036,6 +1054,58 @@ def compact_the_pixels_of_the_region(dir_window, mask, use_mask, outlet_pixels, 
     return 0, count, count_in_order, state, pixel_of_compact, member_of_compact, downstream_of_compact, compact_of_outlet
 
 
+def check_the_outlet_flows_into_the_inlet(attribute, grid, child, code):
+    """the piece table against the flow directions at one cut: the outlet of `child`, which carries the direction
+    `code`, must point to the pixel the table calls its parent's inlet (the column folded on a periodic grid)"""
+    row_offset = int(DROW[code])
+    col_offset = int(DCOL[code])
+    if IS_LAND[code] == 0 or (row_offset == 0 and col_offset == 0):
+        raise FlowDivideError("%s: the outlet of piece %d at row %d column %d flows nowhere, but the piece table "
+                              "names piece %d as its parent"
+                              % (attribute, child.member_id, child.outlet_row, child.outlet_col, child.parent_member_id))
+    below_row = child.outlet_row + row_offset
+    below_col = child.outlet_col + col_offset
+    if grid.periodic:
+        below_col %= grid.ncol
+    if below_row != child.parent_inlet_row or below_col != child.parent_inlet_col:
+        raise FlowDivideError("%s: the piece table says the outlet of piece %d at row %d column %d flows into row %d "
+                              "column %d, but its flow direction points to row %d column %d"
+                              % (attribute, child.member_id, child.outlet_row, child.outlet_col,
+                                 child.parent_inlet_row, child.parent_inlet_col, below_row, below_col))
+
+
+def check_the_cuts_of_the_region(attribute, region_id, grid, window, members, state, member_of_compact, on_the_channel):
+    """Every cut of this region, the piece table against the flow directions, before anything crosses it.
+
+    A child piece hands what it carries to the pixel its outlet flows into, and the piece table says which pixel
+    that is and which member it belongs to.  Until 0.7.8 the table was taken at its word: a table naming another
+    pixel, or another parent, gave the child's value to a stranger and every count still added up.  Checked here for
+    every child of every member of this region, whichever region the child lies in:
+
+      1. the child's outlet carries one of the eight directions, and the pixel it points to is the table's
+         parent inlet pixel;
+      2. that pixel is a pixel of the member the table calls the parent (on the network classes: when the pixel is
+         on the network; a pixel off the network carries nothing).
+
+    state: the number + 1 of every window pixel, or a mark (compact_the_pixels_of_the_region)."""
+    for index, member in enumerate(members):
+        for child in member.children:
+            outlet_row, outlet_col = window.local(grid, child.outlet_row, child.outlet_col)
+            check_the_outlet_flows_into_the_inlet(attribute, grid, child, int(window.dir[outlet_row, outlet_col]))
+            inlet_row, inlet_col = window.local(grid, child.parent_inlet_row, child.parent_inlet_col)
+            number = int(state[inlet_row * window.ncol + inlet_col])
+            if number > 0:
+                if int(member_of_compact[number - 1]) != index:
+                    raise FlowDivideError("%s: the outlet of piece %d flows into a pixel of region %d that does not "
+                                          "belong to piece %d, which the piece table calls its parent"
+                                          % (attribute, child.member_id, region_id, member.member_id))
+            elif IS_LAND[int(window.dir[inlet_row, inlet_col])] != 0 and (
+                    not on_the_channel or window.channel[inlet_row, inlet_col] != 0):
+                raise FlowDivideError("%s: the outlet of piece %d flows into a pixel that belongs to no member of "
+                                      "region %d, but the piece table names piece %d of that region as its parent"
+                                      % (attribute, child.member_id, region_id, member.member_id))
+
+
 @njit(cache=True)
 def channel_mask_breaks(dir_window, mask):
     """whether a pixel of the mask flows into a land pixel of the window that is not of the mask: the `broken` of
@@ -1237,7 +1307,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     started = started if started is not None else time.time()
     grid = partition.grid
     regions_in_order = partition.region_order(spec["downstream_first"])
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     profile = raster_profile(grid, spec["dtype"], spec["nodata"])
     member_rows = []
     states = {}                      # member_id -> the value that crosses its cut, in full precision
@@ -1286,7 +1356,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                 dataset.close()
             except Exception as failure:          # logged: the error that brought the run here is the one raised
                 log(tag, "closing %s after the error failed too: %s" % (getattr(dataset, "name", "a dataset"), failure))
-        held.remove_quietly(tag)
+        held.put_aside_quietly(tag)
         raise
     try:
         for visit, region_id in enumerate(regions_in_order):
@@ -1387,6 +1457,9 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
             pixel_of_compact = pixel_of_compact[:count]
             member_of_compact = member_of_compact[:count]
             downstream_of_compact = downstream_of_compact[:count]
+            # the piece table against the flow directions at every cut of this region, before anything crosses one
+            check_the_cuts_of_the_region(attribute, region_id, grid, window, members, compact_of_pixel,
+                                         member_of_compact, on_the_channel)
             # what the window says of the few pixels the sweeps read across a cut, before the window goes: the number
             # of the pixel a child of another region flows into, and whether the child's outlet and that pixel are on
             # the network
@@ -1641,7 +1714,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                 dataset.close()
             except Exception as failure:          # logged: the error that brought the run here is the one raised
                 log(tag, "closing %s after the error failed too: %s" % (getattr(dataset, "name", "a dataset"), failure))
-        held.remove_quietly(tag)
+        held.put_aside_quietly(tag)
         raise
     log(tag, "the regions are done %.1f s into the run; held blocks: at most %d at once, at most %.0f MiB of them in "
              "memory, %d written to disk; peak memory %.1f GB"
@@ -1711,7 +1784,7 @@ def write_basin_table_as_the_c_code_does(table, path):
     """a basin table with its header and its format column by column, published when complete"""
     formats = [BASIN_TABLE_FORMAT[column] for column in table.columns]
     line_format = " ".join(formats) + "\n"
-    temporary = path + ".partial"
+    temporary = fd_tables.free_name(path + ".partial")
     with timing("output"):
         with open(temporary, "w") as handle:
             handle.write(" ".join(table.columns) + "\n")
@@ -1748,6 +1821,12 @@ class RegionWindow:
         self.nrow = rectangle[1] - rectangle[0]
         self.ncol = rectangle[3] - rectangle[2]
         self.grid = grid
+        # a pixel of the window is named by a 32-bit index in the sweeps (downstream, order, member, the compact
+        # numbering), so the window must fit one, as in the C code (fd3 "more than an int32 can name"); until 0.7.8
+        # a window past 2^31 - 1 pixels, from a capacity above 2^31, would have run on and wrapped the indices
+        if self.nrow * self.ncol > 2 ** 31 - 1:
+            raise FlowDivideError("the window %s holds %d pixels, more than a 32-bit index can name; the attributes "
+                                  "are computed on partitions of at most 2^31 pixels" % (rectangle, self.nrow * self.ncol))
         # the type on the file, before it is read into bytes: a Float32 1.4 read into uint8 would come out as
         # the direction 1 and pass the check of the codes
         if dir_dataset.dtypes[0] != "uint8":
@@ -1972,8 +2051,8 @@ def _the_only_run_writing(out_path):
     file stays (empty): flock locks the file, not its name, and a run that removed it could let two later runs lock two
     files of one name."""
     if fcntl is None:
-        yield
-        return
+        raise FlowDivideError("FlowDivide needs the system's file locks (fcntl) to keep two runs off one output: it runs "
+                              "on Linux and macOS")
     lock_path = out_path + ".lock"
     os.makedirs(os.path.dirname(os.path.abspath(lock_path)), exist_ok=True)
     handle = open(lock_path, "a")
@@ -2059,15 +2138,14 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
         derive_attribute("ldn", partition, dir_path, scratch, table_path + ".ldn_scratch.csv", ldn_member_table, tag=tag + ".ldn",
                          gdal_cache_mb=gdal_cache_mb)
         for path in (scratch, scratch + ".report.json", table_path + ".ldn_scratch.csv"):
-            if os.path.exists(path):
-                os.remove(path)
+            fd_tables.set_aside(path)                  # the walk's raster and table are not products: into _tmp_
     members_ldn = read_table(ldn_member_table, exact_floats=True)
     # the distance covers every basin, so its member table also lists the pieces of a basin below the tables' area
     # that is cut (a min_basin_area_km2 above the cut's); the path is drawn for the basins of the tables only
     # reads its members at the tables' area
     # the basins of the tables' area only: a partition read for the distance or the upstream flow length
     # (raster_min_basin_area_km2=0) also holds the cut basins below that area, which lfp leaves out as a partition
-    # read for it leaves them out (Codex, review of 0.7.8)
+    # read for it leaves them out (0.7.8)
     path_basins = np.asarray(sorted(basin_id for basin_id, basin in partition.basins.items()
                                     if basin["area_km2"] >= partition.table_min_basin_area_km2), np.int64)
     members_ldn = members_ldn[np.isin(members_ldn["basin_id"].to_numpy(np.int64), path_basins)]
@@ -2089,7 +2167,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # outlet and its parent's inlet are neighbours, so the member's columns are shifted by the whole turns that bring the
     # two within a column of each other, from the outlet member down the tree.  That lays the basin out as one connected
     # run, the order a single window holding the whole basin gives its columns; inside one member the distance's sweep
-    # already broke the tie in its window, which holds the member as such a run too (Codex, review of 0.7.8)
+    # already broke the tie in its window, which holds the member as such a run too (0.7.8)
     turn_of_member = {}
     if grid.periodic:
         window_start = {}
@@ -2127,7 +2205,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
             member = parent
     order = partition.region_order(True)
     log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB" % (len(order), peak_memory_gb()))
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     profile = raster_profile(grid, "uint32", 0)
     with rasterio.open(temporary, "w", **profile) as created:
         pass
@@ -2136,6 +2214,12 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     path_rows = np.empty(PATH_FRAMES, np.int64)
     path_cols = np.empty(PATH_FRAMES, np.int64)
     segments = {}
+    # the outlet pixel of every member of the partition: a segment runs from its entry down to its own member's outlet
+    # and meets no other member's outlet on the way, or its entry is not a pixel of that member (0.7.9; a piece table
+    # that names another parent across a cut, whose outlet does flow into the inlet named, was taken at its word here
+    # while the distance table it reuses listed the right members)
+    outlet_cells = np.unique(np.asarray([m.outlet_row * grid.ncol + m.outlet_col % grid.ncol
+                                         for m in partition.members.values()], np.int64))
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "r+") as out_dataset:
         for visit, region_id in enumerate(order):
             # .get: a partition read for the distance or the upstream flow length (raster_min_basin_area_km2=0) also
@@ -2157,6 +2241,15 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                     path_cols = np.empty(path_rows.size, np.int64)
                 if status != 0:
                     raise FlowDivideError("lfp: the path segment of member %d (basin %d) ended with status %d" % (member.member_id, member.basin_id, status))
+                if count > 1:
+                    on_the_way = (path_rows[:count - 1] + window.row0) * grid.ncol + (path_cols[:count - 1] + window.col0) % grid.ncol
+                    if np.isin(on_the_way, outlet_cells).any():
+                        raise FlowDivideError("lfp: the path of member %d (basin %d) from row %d column %d passes the outlet of "
+                                              "another member before its own: the piece table names a parent that does not hold "
+                                              "the inlet pixel" % (member.member_id, member.basin_id, *entry[member.member_id]))
+                # the step across the cut is measured to the table's parent inlet pixel: the outlet must flow there
+                if member.parent_member_id:
+                    check_the_outlet_flows_into_the_inlet("lfp", grid, member, int(window.dir[end_row, end_col]))
                 lon = grid.transform.c + (((path_cols[:count] + window.col0) % grid.ncol) + 0.5) * grid.pixel_width
                 lat = grid.transform.f + (path_rows[:count] + window.row0 + 0.5) * grid.pixel_height
                 segments[member.member_id] = (np.column_stack([lon, lat]), int(count), float(length))
@@ -2214,8 +2307,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # ("... km2 (N basins, ..."), which the table is checked against when it is read; the old
     # markers go before anything is replaced
     for marked_path in (out_path, table_path):
-        if os.path.exists(marked_path + ".done"):
-            os.remove(marked_path + ".done")
+        fd_tables.set_aside(marked_path + ".done")
     publish(temporary, out_path)
     write_table(pd.DataFrame(segment_rows, columns=MEMBER_TABLE_COLUMNS["lfp"]), member_table_path, float_format="%.6f")
     write_basin_table_as_the_c_code_does(table, table_path)
@@ -2263,9 +2355,7 @@ def _write_lines(path, table, geometries, grid):
         parts = [part for part in parts if len(part) >= 2 and not np.array_equal(part[0], part[-1]) or len(part) > 2]
         lines.append(MultiLineString([LineString(part) for part in parts]) if parts else LineString(points[:2]))
     frame = geopandas.GeoDataFrame(table, geometry=lines, crs=grid.crs)
-    temporary = path + ".partial.gpkg"
-    if os.path.exists(temporary):
-        os.remove(temporary)
+    temporary = fd_tables.free_name(path + ".partial.gpkg")
     frame.to_file(temporary, driver="GPKG", layer="longest_flow_path")
     publish(temporary, path)
 
@@ -2331,7 +2421,7 @@ def _derive_user_attribute(code, partition, dir_path, out_path, table_path, chan
     grid = partition.grid
     started = time.time()
     regions_in_order = partition.region_order(spec["downstream_first"])
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     with rasterio.open(temporary, "w", **raster_profile(grid, spec["dtype"], spec["nodata"])):
         pass
     rows = []
@@ -2375,6 +2465,18 @@ def _derive_user_attribute(code, partition, dir_path, out_path, table_path, chan
                     blocked.append(child_row * window.ncol + child_col)
             member_of_pixel = window_member_of_pixel(order, downstream, outlet_pixels,
                                                      np.asarray(sorted(blocked), np.int64), pixel_count)
+            # the piece table against the flow directions at every cut of this region, as the provided attributes
+            # check it: the child's outlet flows into the table's inlet pixel, and that pixel is the parent's
+            for index, member in enumerate(members):
+                for child in member.children:
+                    child_row, child_col = window.local(grid, child.outlet_row, child.outlet_col)
+                    check_the_outlet_flows_into_the_inlet(code, grid, child, int(window.dir[child_row, child_col]))
+                    inlet_row, inlet_col = window.local(grid, child.parent_inlet_row, child.parent_inlet_col)
+                    if (int(member_of_pixel[inlet_row * window.ncol + inlet_col]) != index
+                            and IS_LAND[int(window.dir[inlet_row, inlet_col])] != 0):
+                        raise FlowDivideError("%s: the outlet of piece %d flows into a pixel of region %d that does "
+                                              "not belong to piece %d, which the piece table calls its parent"
+                                              % (code, child.member_id, region_id, member.member_id))
             channel = window.channel if window.channel is not None else np.zeros((1, 1), np.uint8)
             area = window.area if window.area is not None else np.zeros((1, 1), np.float32)
             visited_of_member = np.zeros(len(members), np.int64)

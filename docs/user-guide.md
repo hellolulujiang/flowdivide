@@ -12,7 +12,7 @@ directory layout, the same file names and table columns as the published product
 |---|---|
 | `flowdivide.py` | the datasets, the chain (markers, timing, the keep option), the command line |
 | `fd1_partition.py` | stage 1, the partition: FD1.0 recoding, FD1.1 accumulation, FD1.2 outlets, FD1.3 delineation, FD1.4 grouping (by Level-03 unit, and automatically along a Hilbert curve), FD1.5 fitting to memory |
-| `fd2_views.py` | stage 2, the views: resampling, vectorisation, colouring, the Level-02 tables; and Figures 3, 4 and 5 of the paper |
+| `fd2_views.py` | stage 2, the views: folding, vectorisation, colouring, the Level-02 tables; and Figures 3, 4 and 5 of the paper |
 | `fd3_attributes.py` | stage 3, the attributes region by region: Shreve, distance to outlet, Hack, upstream flow length, longest flow path, Strahler, and a rule of your own |
 | `fd_tables.py` | the tables: one writer and one reader for each |
 | `tile_kernels.py`, `test_tile_kernels.py` | the same four kernels on the tiles the data are distributed in, one tile at a time (see below) |
@@ -21,7 +21,7 @@ directory layout, the same file names and table columns as the published product
 ## Requirements
 
 Python 3.10 or later with `numpy`, `numba`, `rasterio`, GDAL's own Python bindings (`osgeo`; fd1.4 burns the
-Level-03 polygons with them), `pandas`, `geopandas`, `pyogrio`, `pyarrow`, `shapely`, `scipy`,
+Level-03 polygons with them), `pandas`, `geopandas`, `pyogrio`, `pyarrow`, `shapely` (2.0 or later), `scipy`,
 `matplotlib`. A conda environment with GDAL is the easy way:
 
     conda create -n flowdivide -c conda-forge python=3.11 numpy numba rasterio gdal pandas geopandas pyogrio pyarrow shapely scipy matplotlib
@@ -29,7 +29,7 @@ Level-03 polygons with them), `pandas`, `geopandas`, `pyogrio`, `pyarrow`, `shap
 
 ## Running
 
-Three grids are built in, the three of the paper: HydroSHEDS v2 at 1 arc-second over South America
+Three grids are built in, the three of the paper: HydroSHEDS v2.0 at 1 arc-second over South America
 and over North America, and MERIT Hydro at 3 arc-seconds over the whole globe. The inputs are not part
 of this repository; download them from their producers and use them under their terms
 ([`DATA_NOTICE.md`](../DATA_NOTICE.md)). Point the package at your copies with environment variables:
@@ -63,7 +63,7 @@ FD3 holds one region at a time. What it holds, and what sets each part:
 |---|---|---|
 | The region's window: the rectangle its pixels cover, sea and the land of other regions included | 1 byte a pixel for the flow directions, 1 more for the channel mask (shv, hck, ord), 4 more while the region's own pixels are numbered; hck also 4 for the upstream area | the capacity |
 | The region's own pixels | about 12 bytes a pixel to number them, and the values: 8 bytes for the distance and the upstream flow length (double precision), 4 for the Shreve magnitude, 1 for the Hack and Strahler orders | the capacity |
-| The output blocks two regions share, until the second has written its pixels | up to 512 MiB in memory, the rest on disk beside the output raster (`<raster>.held_blocks.<process id>/`, removed when the step ends) | `FLOWDIVIDE_HELD_MEMORY_MB` (MiB) |
+| The output blocks two regions share, until the second has written its pixels | up to 512 MiB in memory, the rest on disk beside the output raster (`<raster>.held_blocks.<process id>/`, moved into `_tmp_/` beside the raster when the step ends) | `FLOWDIVIDE_HELD_MEMORY_MB` (MiB) |
 | GDAL's block cache | 512 MiB | `--gdal-cache-mb`, or `FLOWDIVIDE_GDAL_CACHE_MB` (MiB) |
 | The partition's tables | North America (30 million basins): 1.9 GB held; reading them peaks at about 8 GB | the grid |
 
@@ -117,16 +117,16 @@ Any flow-direction grid runs the same way, at any resolution, projected or geogr
 
 | what differs between producers | how it is given |
 |---|---|
-| the eight direction codes | `--convention merit` / `esri` (1 E, 2 SE … 128 NE), `hydrosheds` (the same codes, 0 an inland sink, 255 no data), `taudem` (1 E, then counter-clockwise), `grass` (1 NE … 8 E), `degrees` (45 NE … 360 E), or `custom --direction-codes E=1,SE=2,S=4,SW=8,W=16,NW=32,N=64,NE=128` |
-| the value of an inland sink, of no data, of a river mouth | `--sink-code`, `--nodata-code`, `--mouth-code`, where they differ from the convention's own; without a mouth code a direction pointing into no data or off the grid is the mouth |
+| the eight direction codes | `--convention merit` / `esri` (1 E, 2 SE … 128 NE), `hydrosheds` (the same codes, 0 an inland sink, 255 no data), `taudem` (1 E, then counter-clockwise), `grass` (1 NE … 8 E), `degrees` (45 NE … 360 E), or `custom --direction-codes E=1,SE=2,S=4,SW=8,W=16,NW=32,N=64,NE=128` (a custom coding has no values of its own for no data, sinks and mouths: MERIT's codes written out whole are `--convention custom --direction-codes E=1,SE=2,S=4,SW=8,W=16,NW=32,N=64,NE=128 --nodata-code 247 --sink-code 255 --mouth-code 0`) |
+| the value of an inland sink, of no data, of a river mouth | `--sink-code`, `--nodata-code`, `--mouth-code`, where they differ from the convention's own. A direction pointing into no data or off the grid is made a river mouth, with or without a mouth code; only `--convention merit` refuses it (MERIT Hydro marks its mouths itself). Every code is a whole number from 0 to 65535: a raster whose no data is negative (-9999) or that marks its edge outlets with negative directions (GRASS `r.watershed`) is given non-negative values first |
 | the raster type | any integer raster (the degrees do not fit a byte, and GRASS writes a CELL raster) |
-| the resolution and the projection | read from the grid; a geographic grid's blocks are one degree, a projected grid's about 100 km, and `--block` sets another |
+| the resolution and the projection | read from the grid; a geographic grid's blocks are one degree, a projected grid's about 100 km (10 km when the pixels are finer than 10 m), and `--block` sets another |
 | the basin groups | `--group-vectors <polygons>` (repeat for several; `:<pandas query>` filters one), any file whose units are whole basins; without it the basins are grouped along a Hilbert curve (`--groups hilbert`) |
-| the views | named by their cell size on a grid this package has no fixed names for: 100 m, 500 m, 2.5 km on a 10 m grid; 10 s, 50 s, 240 s on a 1 arc-second grid |
+| the views | named by their cell size on a grid this package has no fixed names for: 100 m, 500 m, 2.5 km on a 10 m grid; 10 s, 50 s, 240 s on a 1 arc-second grid. A default view a quarter of whose cell is more pixels than the whole grid is left out, the finest made finer if it must be; `--view-factors 10,50` sets the views (pixels to a cell), taken as they are |
 
 [![](media/basin_groups_south_america.png)](media/basin_groups_south_america.png)
 
-*South America, HydroSHEDS v2 at 1 arc-second: (a) the basins, (b) grouped by HydroBASINS Level-03 unit, (c) grouped automatically along a Hilbert curve; hatched, the groups over a capacity of 2³¹ pixels.*
+*South America, HydroSHEDS v2.0 at 1 arc-second: (a) the basins, (b) grouped by HydroBASINS Level-03 unit, (c) grouped automatically along a Hilbert curve; hatched, the groups over a capacity of 2³¹ pixels.*
 
 FD1.0 is the only step that reads the producer's coding: it writes the grid in one coding (1 E … 128 NE,
 0 a river mouth, 255 an inland sink, 247 no data) and every later step reads only that.
@@ -154,7 +154,7 @@ runs nothing.
 `python flowdivide.py run --help` lists every option under five headings: what to run, the partition
 (`--groups l3|hilbert`, `--levels`), the keep option (`--drop`), the views and the figures
 (`--vector geoparquet|gpkg|both`, `--colours`), a grid of your own (`--island-reach`, `--island-max`
-for the island rule).
+for the island rule, `--view-factors` for the views).
 
 Every step leaves a marker with a signature of its arguments and of the steps it depends on, so a run
 that stopped is taken up where it stopped, an identical run does nothing, and a changed parameter (the
@@ -175,13 +175,19 @@ what the step adds.
 ## The keep option
 
 Two ways of saying which of the intermediates stay on disk: `--keep bsn,rgn,pieces` keeps those and
-deletes every other one as soon as the last step that reads it is done, and `--drop acc,aca,str` says the
+puts every other one aside as soon as the last step that reads it is done, and `--drop acc,aca,str` says the
 same thing the other way round. The recoded flow directions, the tables and the polygon files are always
 kept.
 
 Every raster written to disk is a variable that can be dropped with `--drop`; a dropped variable is
-deleted as soon as the last step of the run that reads it is done, and made again if a later run
-needs it.
+moved into `_tmp_/` beside it as soon as the last step of the run that reads it is done. A later run makes it
+again when it needs it and the step that makes it is among its `--steps`; a run of `--steps fd3` alone that needs a
+dropped variable of FD1 stops and names the file.
+
+The package deletes nothing and writes over nothing. Whatever a run replaces -- an output it makes again, the
+marker of that output, the basin table of an earlier stage of FD1 (one copy a run), a dropped variable, what a
+stopped run left under a temporary name -- is moved into `_tmp_/<date>_<time>_<process>/` beside it. Those
+directories free no disk space until they are emptied by hand.
 
 | variable | file | what | read by |
 |---|---|---|---|
@@ -204,8 +210,8 @@ Under `<out-root>/<dataset>/` (`<c>` the continent,
 
 - `global/fineresolution/{dir,upg,upa,str,l3,bsn}/` — the continental rasters
 - `global/table/` — `basin_table_fine_<c>.csv` (one table from fd1.2 on, one row per basin: outlet, count, area, rectangle from fd1.3, the groups from fd1.4, the columns of fd1.6 and fd1.7), `group_l3_fine_<c>.csv`, `group_l2_fine_<c>.csv` and `group_l1_fine_<c>.csv` (fd1.4; each basin's `level3_id`, `level2_id` and `level1_id` are columns of the basin table, there is no separate basin-to-group file for them), and for the automatic groups `group_hilbert_fine_<c>.csv` and `basin_group_hilbert_fine_<c>.csv`
-- `global/coarseresolution/{bsn,grp}/` and `global/vector/` — the basin and group views at 400, 200, 120 and 20 cells to the degree (1/20° is the grid GloFAS v4 runs on), as rasters and as polygon files. The views are an upscaling: a view holds the basins of at least a quarter of a cell at the equator (0.0194, 0.0775, 0.2151 and 7.7450 km² at 1/400°, 1/200°, 1/120° and 1/20°), and since the basins are numbered from the largest down those are the ids 1..N; a cell that is at least a quarter land goes to the largest of them — the smallest id — holding at least a quarter of its land; the region and group views follow the basin view of the same resolution (a cell with a basin lies in the region, or the group, of that basin; a cell without one takes the region or group holding most of it, the cell being a quarter land). Every view carries the rule in its metadata item `FLOWDIVIDE_VIEW_RULE`, and a basin view the area of its smallest basin as `FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2`.
-  The polygon files: one layer per view, the rows 1..N of the basin table (fid = basin_id, so one index, basin_id − 1, reaches a basin in the fine table and in every view) or every row of the region or group table (fid = row); a row whose object holds no cell at that resolution keeps its row with no geometry, 0 in `coarse_grid_count` and −9999 in the cell columns and `color_id`, never dropped in silence. A file carries few columns — the identifier, the size and the place of the object (`basin_id, basin_area_km2, outlet_lon, outlet_lat`; `region_id, cut_basin_id, topological_level, region_grid_count`; `group_id, group_level, group_kind, level_code, level3_count, basin_count, land_grid_count`) and what the view adds (`coarse_grid_count, cells_per_degree, cell_row_min, cell_row_max, cell_col_min, cell_col_max, color_id`); everything else is in the fine table at the row the identifier names. `--vector geoparquet` (the default) writes GeoParquet 1.1 (`.parquet`: ISO WKB, zstd, row groups of 65,536 rows, no `crs` entry so the coordinates are longitude and latitude on WGS84, OGC:CRS84; the file metadata carries the rule, the area, the resolution and what the rows are), `--vector gpkg` a GeoPackage, `--vector both` the two with the same rows and columns. The boundary files `bnd_` hold the outer rings of the basins drawn, with the identifier and the first two added columns, and carry their table row as the GeoPackage fid. A GeoPackage view carries a default style: a QGIS categorized fill on `color_id` in the file's `layer_styles` table, seven colours of Okabe and Ito's palette and a purple, then three reserves, so that QGIS colours the layer the moment it is opened; a GeoParquet file carries no style, and which hue a `color_id` number gets is then the map's choice
+- `global/coarseresolution/{bsn,grp}/` and `global/vector/` — the basin and group views at 400, 200, 120 and 20 cells to the degree (1/20° is the grid GloFAS v4 runs on), as rasters and as polygon files. The views are folds of the masks, for drawing: a view holds the basins of at least a quarter of a cell at the equator (0.0194, 0.0775, 0.2151 and 7.7450 km² at 1/400°, 1/200°, 1/120° and 1/20°), and since the basins are numbered from the largest down those are the ids 1..N; a cell that is at least a quarter land goes to the largest of them — the smallest id — holding at least a quarter of its land; the region and group views follow the basin view of the same resolution (a cell with a basin lies in the region, or the group, of that basin; a cell without one takes the region or group holding most of it, the cell being a quarter land). Every view carries the rule in its metadata item `FLOWDIVIDE_VIEW_RULE`, and a basin view the area of its smallest basin as `FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2`.
+  The polygon files: one layer per view, the rows 1..N of the basin table (fid = basin_id, so one index, basin_id − 1, reaches a basin in the fine table and in every view) or every row of the region or group table (fid = row); a row whose object holds no cell at that resolution keeps its row with no geometry, 0 in `coarse_grid_count` and −9999 in the cell columns and `color_id`, never dropped in silence. A file carries few columns — the identifier, the size and the place of the object (`basin_id, basin_area_km2, outlet_lon, outlet_lat`; `region_id, cut_basin_id, topological_level, region_grid_count`; `group_id, group_level, group_kind, level_code, level3_count, basin_count, land_grid_count`) and what the view adds (`coarse_grid_count, cells_per_degree, cell_row_min, cell_row_max, cell_col_min, cell_col_max, color_id`); everything else is in the fine table at the row the identifier names. `--vector geoparquet` (the default) writes GeoParquet 1.1 (`.parquet`: ISO WKB, zstd, row groups of 65,536 rows, on a WGS84 geographic grid no `crs` entry, so the coordinates are longitude and latitude on WGS84, OGC:CRS84 (a grid in another coordinate system keeps its own coordinates, and its CRS is written in the file); the file metadata carries the rule, the area, the resolution and what the rows are), `--vector gpkg` a GeoPackage, `--vector both` the two with the same rows and columns. The boundary files `bnd_` hold the outer rings of the basins drawn, with the identifier and the first two added columns, and carry their table row as the GeoPackage fid. A GeoPackage view carries a default style: a QGIS categorized fill on `color_id` in the file's `layer_styles` table, seven colours of Okabe and Ito's palette and a purple, then three reserves, so that QGIS colours the layer the moment it is opened; a GeoParquet file carries no style, and which hue a `color_id` number gets is then the map's choice
 - `partitions/<capacity>/global/table/` — `region_fine_<c>.csv`, `piece_fine_<c>.csv`, `basin_region_<c>.csv`, `region_merges_<c>.csv`, `pfafstetter_pieces_<c>_basin<id>.csv`, and the attribute tables `shreve_basin_<c>.csv`, `distance_to_outlet_basin_<c>.csv`, `hack_basin_<c>.csv`, `lup_basin_<c>.csv`, `lfp_basin_<c>.csv`, `strahler_basin_<c>.csv`
 - `partitions/<capacity>/global/{preview,fineresolution/<var>,coarseresolution/rgn,vector}/` — the piece rasters and the preview of the figure basin's pieces (one cell per 30 x 30 pixels, the corner pixel), the region mask and the attributes (rasters and tables), the region views (no member mask is written; the members are the rows of the tables)
 - `figures/` — Figures 3, 4 and 5; `_logs/` — the markers, the summary, the timings
@@ -318,7 +324,10 @@ The two by-part ways are the same code; only the part id per pixel differs. Seve
 upstream pixel count and area, the Shreve magnitude, the distance to the outlet, the upstream flow
 length (with its source pixel), the Strahler order and the Hack order. The lengths are whole
 centimetres and the areas whole square metres, so every sum is exact and the comparison is plain
-equality. When the parts cannot be ordered (a river leaves a tile and comes back), the Strahler
+equality. These are the check's own numbers, not the production ones: the package sums each pixel's
+fractional area before rounding and measures a step by the step lengths of its row, as the C programs do, so a
+length of `three_ways.py` can differ from the published raster by up to about 2 × 10⁻⁴ of its value (1.6 × 10⁻⁴
+on the Parnaíba). The check shows that the cut does not change the answer, not the production numbers bit for bit. When the parts cannot be ordered (a river leaves a tile and comes back), the Strahler
 order sweeps the parts again until nothing changes, and the number of sweeps is reported.
 
     python test_three_ways_on_one_basin.py prepare /data/flowdivide south-america 7 40 /data/three_ways/basin7
@@ -329,6 +338,25 @@ rectangle pixel for `int64` and 65 for a by-part way. Our check was made on basi
 the Parnaíba (349,598,006 land pixels, 749,344,500 in its rectangle), the largest basin a 64 GB laptop
 can run all three ways on; the results are in `compare_python.txt` of the case directory. The production run of the package holds one region at a time
 (`fd3_attributes.py`); these two files are for checking, not for producing.
+
+## What the C programs do that the package does not
+
+The partitions published at <https://fullhydro.org> were computed by a C implementation of the same workflow (the
+FullHydro C code, not part of this repository). The package follows its version 10.35, with these differences, none
+of which changes a published partition or attribute:
+
+- **Earth model.** The C programs can measure on a sphere as well as on the WGS84 ellipsoid; the package measures
+  on the WGS84 ellipsoid (and on MERIT Hydro's own areas for that grid).
+- **Cycles in the flow directions.** The C flow accumulation can repair a cycle by making one pixel of it an inland
+  sink; the package refuses a grid with a cycle.
+- **FD4 and FD5.** The C programs also clip and mosaic the products (FD4) and write the publication formats (FD5);
+  the package stops at FD3.
+- **`--merge balanced`.** When two parts can join, the package takes the join with the most land, the C code the
+  join with the largest window. The published partitions do not use this policy (HydroSHEDS: none; MERIT Hydro:
+  level2).
+- **The size of a region.** As in the C code, a region's window with its ring of one pixel must fit a 32-bit index
+  (2³¹ − 1 pixels); a larger window is refused when the attributes are computed. The package refuses it for the
+  longest flow path as well; the C program of the longest flow path alone takes a larger window.
 
 ## Tests
 
@@ -344,11 +372,13 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_fd3_memory.py                     # the held blocks, the chunked basin table, the Hack donor
     python test_fd3_compact.py                    # the region's own pixels numbered (0.7.7) against the window order
     python test_fd3_seam_and_reuse.py             # a basin across the seam of a periodic grid; a partition reused
+    python test_fd2_outline_across_the_seam.py    # the outline of an object across the 180th meridian (0.7.9)
+    python test_fine_grids_and_run_lock.py        # very fine geographic grids; the lock of a run (0.7.9)
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first ten need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first twelve need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their
@@ -356,31 +386,52 @@ answers into it.
 
 ## Adding an attribute
 
-Write a Numba kernel with the shape `derive_user_attribute` calls and register it:
+Write a Numba kernel with the shape `derive_user_attribute` calls and register it. This one counts the pixels
+upstream of every pixel, the upstream pixel count of FD1.1; on the Sri Lanka sample cut into 41 regions it gives that
+count at every one of its 7.7 million pixels:
 
 ```python
+import fd1_partition as fd1
 import fd3_attributes as fd3
 
 @fd3.njit(cache=True)
-def my_rule(order, downstream, member_of_pixel, dir_window, out_window, channel_window, area_window, lengths, ncol,
-            visited_of_member):
-    # order: the window's pixels, upstream first; downstream: the window pixel each flows into (-1 at an outlet or
-    # off the window); member_of_pixel: the member each pixel belongs to (its index in the region's members; -1 for a
-    # pixel that drains through a cut into another region)
-    ...
-    return 0          # a status: 0 when the sweep went through, any other value stops the run
+def upstream_pixels(order, downstream, member_of_pixel, dir_window, out_window, channel_window, area_window, lengths,
+                    ncol, visited_of_member):
+    # order: the land pixels of the window, every pixel before the one it flows into; downstream: the window pixel
+    # each flows into (-1 where the flow ends, leaves the window or leaves the land); member_of_pixel: the member each
+    # pixel belongs to (its index in the region's members), -1 for a pixel of the window outside them
+    values = out_window.reshape(-1)        # the window as written so far: a pixel of another region holds its value
+    for pixel in order:
+        if member_of_pixel[pixel] >= 0:
+            values[pixel] = 0.0            # this region's pixels start from nothing
+    for pixel in order:                    # upstream first
+        member = member_of_pixel[pixel]
+        target = downstream[pixel]
+        if member >= 0:
+            values[pixel] += 1.0           # the pixel itself
+            visited_of_member[member] += 1
+        if target >= 0 and member_of_pixel[target] >= 0:
+            values[target] += values[pixel]   # also across a cut: the outlet of a piece in another region
+    return 0                               # a status: 0 when the sweep went through, any other value stops the run
+
+fd3.register_attribute("upc", "upstream pixel count", "float64", -9999.0, downstream_first=False, channel=False,
+                       area=False, kernel=upstream_pixels)       # float64: whole numbers up to 2^53 (float32 stops at 2^24)
+grid = fd1.Grid(dir_path, periodic=False, block_pixels=None)    # the run's recoded flow directions, as the run read them:
+                                                                # periodic=True for merit-global or --periodic, its --block
+partition = fd3.Partition(basin_table, region_table, piece_table, basin_region_table, 1.0, grid)
+fd3.derive_user_attribute("upc", partition, dir_path, out_path, table_path)
 ```
 
-```python
-fd3.register_attribute("myr", "my attribute", "float32", -9999.0, downstream_first=False, channel=False, area=False, kernel=my_rule)
-fd3.derive_user_attribute("myr", partition, dir_path, out_path, table_path)
-```
-
-The driver reads each region as one window, works out the visiting order, the pixel each flows into and the
-member of every pixel (the child pieces in other regions not entered), calls the kernel once per region, and
-writes the window back; the kernel writes into `out_window` and counts the pixels it gives a value, member by
-member, into `visited_of_member`, which goes into the table.  The regions are visited in the order the rule
-needs (`downstream_first=True` for a value handed up from the outlet).  A registered rule is given the whole window,
+The tables are those of the run: `global/table/basin_table_fine_<run>.csv` and
+`partitions/<capacity>/global/table/{region_fine,piece_fine,basin_region}_<run>.csv`; 1.0 is the smallest basin, in
+km², the attribute is computed for. The driver visits the regions in the order the rule needs (`downstream_first=True`
+for a value handed up from the outlet), reads each region as one window together with the values already written in
+it, works out the visiting order, the pixel each flows into and the member of every pixel, calls the kernel once per
+region, and writes the whole window back. One value crosses each cut, and the kernel takes it itself: a value that
+travels downstream at the outlet of the child piece in the other region (a pixel of member -1 that flows into one of
+this region's pixels), a value that travels upstream at the pixel this region's outlet flows into. The kernel leaves
+the pixels of member -1 as they are, since the window is written back whole, and counts the pixels it gives a value,
+member by member, into `visited_of_member`, which goes into the table.  A registered rule is given the whole window,
 so it holds the window's arrays (12 bytes a window pixel for the order, the downstream pixel and the member,
 besides the output window), where the six provided attributes hold only the region's own pixels
 ([the memory of FD3](#the-memory-of-fd3)); GDAL's block cache is bounded the same way (`gdal_cache_mb`).

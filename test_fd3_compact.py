@@ -514,7 +514,7 @@ def test_refusals():
                                                                    np.array([0], np.int64), blocked, 6)[:3]
     check("a child's outlet of another region: it and the pixels above it are not ours (%d pixels)" % count,
           status == 0 and count == 2 and in_order == 2)
-    # a child's outlet of another region on a cycle (Codex, round 1): the cycle is refused as 0.7.6 refuses it
+    # a child's outlet of another region on a cycle: the cycle is refused as 0.7.6 refuses it
     directions = np.array([[1, 1, 0], [1, 16, 0]], np.uint8)
     for mask, use_mask, what in ((nothing, False, "the land"), (np.ones((2, 3), np.uint8), True, "a mask of every pixel")):
         status = fd3.compact_the_pixels_of_the_region(directions, mask, use_mask, np.array([2], np.int64),

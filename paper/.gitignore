@@ -1,0 +1,6 @@
+data/*
+!data/README.md
+!data/SHA256SUMS.txt
+flowdivide-paper-data.zip
+__pycache__/
+*.pyc

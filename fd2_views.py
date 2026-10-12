@@ -1,12 +1,12 @@
 """fd2_views.py -- FlowDivide stage 2, the views delivered with the partition (FD2 of Figure 2), and the
 figures of the manuscript drawn from them.
 
-Most users meet the partition beside data on coarser grids, so the basin and region masks are folded
-by an integer factor to a coarse grid, one object per cell, turned into polygons carrying their
-rows of the tables, and coloured so that no two neighbours share a number:
+A mask at the resolution of the grid is too fine to draw a continent, so the basin and region masks
+are folded by an integer factor to a coarse grid, one object per cell, turned into polygons carrying
+their rows of the tables, and coloured so that no two neighbours share a number:
 
-    resampling     a coarse cell covers factor x factor pixels, and the view is an upscaling: the
-                   large basins are kept first, a small basin is read at a finer view.  A view holds the basins of at least an area, a
+    folding        a coarse cell covers factor x factor pixels; the large basins are kept first, a
+                   small basin is read at a finer view.  A view holds the basins of at least an area, a
                    quarter of a cell at the equator (0.0194, 0.0775, 0.2151 and 7.7450 km2 at 1/400,
                    1/200, 1/120 and 1/20 degree), and since fd1.2 numbers the basins from the largest
                    down, those are the ids 1..N: the table of the view is the first N rows of the basin
@@ -66,7 +66,7 @@ from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, ch
                            basin_rectangles, group_windows_in_pixels)
 import fd_tables
 
-FLOWDIVIDE_VERSION = "0.7.8"            # named in the metadata of every vector file (flowdivide.py’s VERSION says the same)
+FLOWDIVIDE_VERSION = fd_tables.VERSION  # named in the metadata of every vector file
 
 CELL_MIN_LAND_PERCENT = 25              # a cell with less land than this stays water
 CELL_MIN_WINNER_PERCENT = 25            # a candidate basin holds at least this much of the cell's land
@@ -75,8 +75,10 @@ VIEW_RULE_TAG = ("v9.63: the view holds the basins of at least its minimum area,
                  "largest of them (the smallest id) holding a quarter of that land; the region view follows the basin view")   # written into every view
 # the rule of the polygons and the boundary lines, written last among the
 # metadata items of every vector file (the polygons given to users must be OGC-valid)
-VECTOR_RULE_TAG = ("v9.90: the polygons are GDAL Polygonize's with 4-connected cells, OGC-valid (two cells that meet only at a corner are two "
-                   "polygons of the MultiPolygon); the boundary lines are the outer rings of the 8-connected polygons")
+# (the C code's text, word for word: v10.35 outlines a basin astride the 180th meridian in one piece, 0.7.9 here)
+VECTOR_RULE_TAG = ("v10.35: the polygons are GDAL Polygonize's with 4-connected cells, OGC-valid (two cells that meet only at a corner are "
+                   "two polygons of the MultiPolygon); the boundary lines are the outer rings of the 8-connected polygons, those of a "
+                   "basin astride the 180th meridian made with the basin in one piece and cut at the meridian")
 EQUATOR_KM = 40075.017                  # the WGS84 equator, for the area of a cell
 NO_CELL_AT_THIS_RESOLUTION = -9999      # the cell rectangle and the colour of a row of a view that holds no cell
 VIEW_ADDED_COLUMNS = ["coarse_grid_count", "cells_per_degree", "cell_row_min", "cell_row_max", "cell_col_min", "cell_col_max", "color_id"]
@@ -116,12 +118,32 @@ COLOR_ID_STYLE_NAME = "color_id"
 COLOURS_AT_LEAST = 8
 
 
-def min_basin_area_km2_of(cell_side_km):
+def min_basin_area_km2_of(cell_side_km, cell_height_km=None):
     """the smallest basin of a view: a quarter of a cell of that side (at the equator on a geographic grid),
     rounded to four decimals half up (0.0194 / 0.0775 / 0.2151 / 7.7450 km2 for
-    1/400, 1/200, 1/120 and 1/20 degree)"""
+    1/400, 1/200, 1/120 and 1/20 degree, the C code's).  Under 0.01 km2 (cells under some 200 m) it keeps four
+    significant digits instead: four decimals would take a 1 m grid's quarter cell of 25 m2 to 0, and every basin
+    into the view (0.7.9).  cell_height_km: the cell's other side when its pixels are not square (until 0.7.8 the
+    width was squared whatever the height: on pixels of 10 m by 20 m the threshold was half of a quarter cell)"""
+    if cell_height_km is None or float(cell_height_km) == float(cell_side_km):
+        quarter = Decimal(repr(float(cell_side_km))) ** 2 / Decimal(4)
+    else:
+        quarter = Decimal(repr(float(cell_side_km))) * Decimal(repr(float(cell_height_km))) / Decimal(4)
+    if quarter >= Decimal("0.01") or quarter <= 0:
+        return float(quarter.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+    return float(quarter.quantize(Decimal(1).scaleb(quarter.adjusted() - 3), rounding=ROUND_HALF_UP))
+
+
+def min_basin_area_km2_until_0_7_8(cell_side_km):
+    """the smallest basin of a view as 0.7.8 took it (the width squared, four decimals): a run whose views had
+    another is told so in the views' signature, and its views are made again"""
     quarter = Decimal(repr(float(cell_side_km))) ** 2 / Decimal(4)
     return float(quarter.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+
+def area_text(area_km2):
+    """the smallest basin of a view as text: four decimals (the C's), four significant digits under 0.01 km2"""
+    return "%.4f" % area_km2 if area_km2 >= 0.01 else "%.4g" % area_km2
 
 
 def integral_ids(column, name):
@@ -161,12 +183,13 @@ def basins_of_the_view(basins, min_area_km2, table_path=""):
         raise FlowDivideError("the basin table %s is not in order of area: the basins of at least an area would not be the ids 1..N" % table_path)
     in_the_view = int(np.count_nonzero(areas >= min_area_km2))
     if in_the_view == 0:
-        raise FlowDivideError("no basin of %s has the %.4f km2 of the view" % (table_path, min_area_km2))
+        raise FlowDivideError("no basin of %s has the %s km2 of the view (a quarter of its cell): the view is coarser than every "
+                              "basin of the grid; on a grid of your own give finer views with --view-factors" % (table_path, area_text(min_area_km2)))
     return in_the_view
 
 
 # =============================================================================
-#  [1] Resampling: which object a coarse cell belongs to
+#  [1] Folding: which object a coarse cell belongs to
 # =============================================================================
 
 @njit(cache=True)
@@ -424,8 +447,8 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                 if min_area_text is None:
                     raise FlowDivideError("the basin view %s carries no FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2" % basin_view_path)
             else:
-                min_area_text = "%.4f" % min_area_km2
-            dataset = stack.enter_context(rasterio.open(out_path + ".partial.tif", "w", **profile))
+                min_area_text = area_text(min_area_km2)
+            dataset = stack.enter_context(rasterio.open(fd_tables.free_name(out_path + ".partial.tif"), "w", **profile))
             dataset.update_tags(FLOWDIVIDE_VIEW_RULE=VIEW_RULE_TAG, FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2=min_area_text)
             states.append({
                 "out_path": out_path, "factor": factor, "coarse_nrow": coarse_nrow, "coarse_ncol": coarse_ncol,
@@ -707,6 +730,96 @@ def _multipolygon_as_gdal_gives_it(polygons, cell_count, cell_area):
         raise FlowDivideError("the polygons of an object are not OGC-valid (%s) or enclose %.12g against its %d cells' %.12g"
                               % (result.is_valid, area, cell_count, expected))
     return result
+
+
+def _ring_lines_across_the_seam(points, east_x, turn, tolerance):
+    """One ring of an object's outline in a frame unrolled across the 180th meridian, as lines on the grid's own
+    longitudes (the C code's ring_lines_across_the_seam, v10.35): a point east of the grid's east edge (east_x) is
+    moved a turn west, and the ring is cut where it crosses that edge (a side along a row passes it at a grid line;
+    the crossing point ends one line at east_x and starts the next at east_x less a turn).  A point on the edge is
+    taken on its east_x side.  The ring's last line runs into its first when the ring was cut.  points: the ring's
+    (x, y); returns the lines, each a list of (x, y) of at least two points."""
+    lines = []
+    if len(points) < 2:
+        return lines
+    first_line = None
+    cut = False
+    previous_x, previous_y = points[0]
+    previous_beyond = previous_x > east_x + tolerance
+    line = [(previous_x - turn if previous_beyond else previous_x, previous_y)]
+    for x, y in points[1:]:
+        beyond = x > east_x + tolerance
+        if beyond != previous_beyond:
+            # the side crosses the edge (or leaves it): the point on the edge, on the side of the line so far
+            if not (abs(previous_x - east_x) <= tolerance) or previous_beyond:
+                line.append((east_x - turn if previous_beyond else east_x, previous_y))
+            if not cut:
+                first_line = line
+                cut = True
+            elif len(line) >= 2:
+                lines.append(line)
+            line = [(east_x - turn if beyond else east_x, y)]
+            if not (abs(x - east_x) <= tolerance) or beyond:
+                line.append((x - turn if beyond else x, y))
+        else:
+            line.append((x - turn if beyond else x, y))
+        previous_x, previous_y, previous_beyond = x, y, beyond
+    if cut and first_line is not None:
+        line.extend(first_line[1:])                    # the ring closes where it started: the last line goes on into the first
+        first_line = None
+    if len(line) >= 2:
+        lines.append(line)
+    if first_line is not None and len(first_line) >= 2:
+        lines.append(first_line)
+    return lines
+
+
+def outline_across_the_seam(rows_of_the_object, transform, row0, object_id=0):
+    """The boundary lines of an object that holds cells in the first and the last column of a grid round the earth
+    (the C code's outline_across_the_seam, v10.35).
+
+    rows_of_the_object: the object's rows over the whole width of the grid, 1 where a cell is the object's.  The
+    widest run of columns without a cell of it (going round) is found, and the columns are taken from the first
+    column after that run on, round past the last column into the first ones: the object lies in one piece there, as
+    on the earth.  Its 8-connected polygons in that frame have its holes as inner rings, so their outer rings are
+    the divide alone; the lines go back to the grid's longitudes, cut at the meridian.  Until 0.7.8 the object was
+    polygonised in the grid's own frame, where it is in two halves, and their sides along the meridian were drawn as
+    a divide although the same basin lies across: a block of 4 x 3 cells with a hole of two cells across the meridian
+    had 24 cell sides of lines, not 14 (4 along the meridian and 6 round the hole).  Returns the lines as lists of (x, y); an object holding a cell in every
+    column is refused (no basin goes round the earth)."""
+    from rasterio import features
+    nrow, ncol = rows_of_the_object.shape
+    column_held = rows_of_the_object.any(axis=0)
+    # the widest run of columns without a cell of the object, going round: it ends at gap_last
+    gap_length = 0
+    gap_last = -1
+    run = 0
+    for step in range(2 * ncol):
+        col = step % ncol
+        run = 0 if column_held[col] else run + 1
+        if run > ncol:
+            run = ncol
+        if run > gap_length:
+            gap_length = run
+            gap_last = col
+    if gap_length == 0 or gap_length >= ncol:
+        raise FlowDivideError("object %d holds %s column of the grid; it cannot be outlined across the meridian"
+                              % (object_id, "every" if gap_length == 0 else "no"))
+    first_col = (gap_last + 1) % ncol
+    unrolled_ncol = ncol - gap_length
+    columns = (first_col + np.arange(unrolled_ncol)) % ncol
+    unrolled = np.ascontiguousarray(rows_of_the_object[:, columns]).astype(np.uint8)
+    unrolled_transform = transform * rasterio.Affine.translation(first_col, row0)
+    turn = ncol * transform.a                           # 360 degrees
+    east_x = transform.c + turn
+    tolerance = 1e-9 * (1.0 + abs(east_x))
+    lines = []
+    for ring, value in features.shapes(unrolled, mask=unrolled.astype(bool), connectivity=8, transform=unrolled_transform):
+        if value != 1:
+            continue
+        exterior = ring["coordinates"][0]
+        lines.extend(_ring_lines_across_the_seam([(float(x), float(y)) for x, y in exterior], east_x, turn, tolerance))
+    return lines
 
 
 def columns_the_view_keeps(table, id_column, identifier_only=False):
@@ -1003,8 +1116,14 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
             if boundaries_stem is not None:
                 # the outline from the 8-connected polygons: a cell touching the
                 # rest at a corner only is not a ring of its own (it would show as a dot inside the Mississippi)
-                outline = [shape(ring) for ring, value in features.shapes(mask, mask=mask.astype(bool), connectivity=8, transform=window_transform) if value == 1]
-                boundary_geometries.append(MultiLineString([LineString(polygon.exterior.coords) for polygon in outline]))
+                if periodic and col0 == 0 and col1 == coarse.width:
+                    # cells in the first and the last column of a grid round the earth: the object lies astride the
+                    # 180th meridian and is outlined in one piece (0.7.9, as the C code since v10.35)
+                    boundary_geometries.append(MultiLineString([LineString(line) for line in
+                                                                outline_across_the_seam(mask, transform, row0, object_id)]))
+                else:
+                    outline = [shape(ring) for ring, value in features.shapes(mask, mask=mask.astype(bool), connectivity=8, transform=window_transform) if value == 1]
+                    boundary_geometries.append(MultiLineString([LineString(polygon.exterior.coords) for polygon in outline]))
                 boundary_rows.append(row_index)
     attributes = pd.DataFrame({name: view_table[name].to_numpy() for name in kept})
     attributes["coarse_grid_count"] = cell_count
@@ -1019,20 +1138,18 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
                  if id_column == "basin_id" else "every row of the fine table in its order, as the GeoPackage's fid = row number")
     metadata = {"FLOWDIVIDE_VERSION": FLOWDIVIDE_VERSION, "FLOWDIVIDE_VIEW_RULE": VIEW_RULE_TAG, "FLOWDIVIDE_RESOLUTION": resolution_text, "FLOWDIVIDE_ROWS": rows_text}
     if min_basin_area_km2 is not None:
-        metadata["FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2"] = "%.4f" % min_basin_area_km2
+        metadata["FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2"] = area_text(min_basin_area_km2)
     metadata["FLOWDIVIDE_VECTOR_RULE"] = VECTOR_RULE_TAG
     drawn = int(len(objects))
     without_geometry = rows_in_the_view - drawn
     written = {}
     if "geoparquet" in formats:
-        temporary = out_stem + ".partial.parquet"
+        temporary = fd_tables.free_name(out_stem + ".partial.parquet")
         with timing("output"):
             write_geoparquet(frame, temporary, "MultiPolygon", metadata)
         written["geoparquet"] = temporary
     if "gpkg" in formats:
-        temporary = out_stem + ".partial.gpkg"
-        if os.path.exists(temporary):
-            os.remove(temporary)
+        temporary = fd_tables.free_name(out_stem + ".partial.gpkg")
         with timing("output"):
             # the layer is declared MultiPolygon, as the GeoParquet file is: a view in which no object holds a cell
             # has no geometry to take the type from, and would be written as a layer of unknown type
@@ -1083,14 +1200,12 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
         boundary_frame = geopandas.GeoDataFrame(boundary_attributes, geometry=geopandas.GeoSeries(boundary_geometries, crs=crs), crs=crs)
         boundary_written = {}
         if "geoparquet" in formats:
-            temporary = boundaries_stem + ".partial.parquet"
+            temporary = fd_tables.free_name(boundaries_stem + ".partial.parquet")
             with timing("output"):
                 write_geoparquet(boundary_frame, temporary, "MultiLineString", metadata)
             boundary_written["geoparquet"] = temporary
         if "gpkg" in formats:
-            temporary = boundaries_stem + ".partial.gpkg"
-            if os.path.exists(temporary):
-                os.remove(temporary)
+            temporary = fd_tables.free_name(boundaries_stem + ".partial.gpkg")
             # the fid of a boundary is its table row (row + 1), not 1..k in
             # the order written: with a basin without a cell in the view the two numberings part
             boundary_frame_with_fid = boundary_frame.set_index(pd.Index(np.asarray(boundary_rows, np.int64) + 1, name="fid"))

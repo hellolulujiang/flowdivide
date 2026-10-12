@@ -38,16 +38,26 @@ Function index:
     [4] The region and piece tables: write_region_table, read_region_table, write_piece_table, read_piece_table
     [5] Basin maps: region_map_key, write_basin_map, read_basin_map, region_of_basin
 """
+import contextlib
+import ctypes
+import ctypes.util
+import errno
 import io
 import itertools
 import os
 import platform
+import sys
 import time
+
+try:
+    import fcntl                                   # the system's file locks (Linux, macOS)
+except ImportError:
+    fcntl = None
 
 import numpy as np
 import pandas as pd
 
-VERSION = "0.7.8"
+VERSION = "1.0.0"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -108,15 +118,163 @@ class TableError(Exception):
 #  [1] Markers and publication
 # =============================================================================
 
+_SET_ASIDE_STAMP = [None]
+
+
+def rename_exclusive(source, destination):
+    """The system's rename that never replaces a file, as the C's pipeline_rename_exclusive: renamex_np with
+    RENAME_EXCL on macOS, renameat2 with RENAME_NOREPLACE on Linux.  True when moved, False when the name is taken;
+    TableError where the system or the file system has no such rename: refused rather than risk replacing a file, as
+    the C code refuses."""
+    if sys.platform != "darwin" and not sys.platform.startswith("linux"):
+        raise TableError("%s cannot be moved to %s: this system has no rename that never replaces a file"
+                         % (source, destination))
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)       # None on Linux: the process's own C library
+    old, new = os.fsencode(source), os.fsencode(destination)
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        result = libc.renamex_np(old, new, 0x00000004)                      # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = libc.renameat2(-100, old, -100, new, 1)                    # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise TableError("%s cannot be moved to %s: this system has no rename that never replaces a file"
+                         % (source, destination))
+    if result == 0:
+        return True
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        return False
+    raise TableError("%s cannot be moved to %s without the risk of replacing a file: %s" % (source, destination, os.strerror(code)))
+
+
+def move_without_replacing(source, destination):
+    """Move a file to a name that must be free: True when moved, False when the name is taken.  A hard link and the
+    source's name removed is a move that cannot replace a file which appeared in the meantime; where a hard link
+    cannot be made (a directory, a disk without them) the system's exclusive rename moves it (rename_exclusive), and
+    where there is none the move is refused: never a rename that could replace a file."""
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError:
+        return False
+    except OSError:
+        return rename_exclusive(source, destination)
+    os.unlink(source)                              # the file stays, under its new name
+    return True
+
+
+GDAL_SIDE_FILES = (".aux.xml", ".msk", ".ovr")     # statistics and metadata, an external mask, external overviews
+
+
+def set_aside(path):
+    """A file a step is about to replace (an output of an earlier run, or its .done marker) is moved into
+    _tmp_/<date>_<time>_<process>/ beside it, under its own name, and stays there: nothing a run replaces is
+    deleted or written over, as in the C code since v10.34.  A second file of one name in one run gets a number.
+    GDAL's side files <path>.aux.xml, .msk and .ovr go first, and whether or not the file itself is there, as the C
+    moves them (io_geotiff.c): left behind, GDAL would lay the old statistics, mask or overviews over the new file,
+    also after a run that stopped between the two moves.  Returns where the file went, or None when there was none."""
+    for suffix in GDAL_SIDE_FILES:
+        _set_one_aside(path + suffix)
+    return _set_one_aside(path)
+
+
+def _set_one_aside(path):
+    if not os.path.lexists(path):
+        return None
+    if _SET_ASIDE_STAMP[0] is None:
+        _SET_ASIDE_STAMP[0] = "%s_%d" % (time.strftime("%Y%m%d_%H%M%S"), os.getpid())
+    directory = os.path.join(os.path.dirname(os.path.abspath(path)), "_tmp_", _SET_ASIDE_STAMP[0])
+    os.makedirs(directory, exist_ok=True)
+    destination = os.path.join(directory, os.path.basename(path))
+    number = 1
+    while not move_without_replacing(path, destination):
+        number += 1
+        destination = os.path.join(directory, "%s.%d" % (os.path.basename(path), number))
+    return destination
+
+
+def free_name(path):
+    """The temporary name a file is about to be written under, made free: what a stopped run left there is moved into
+    _tmp_/ (set_aside), not written over.  With publish_file's move that never replaces a file, the package writes
+    over nothing and removes nothing.  Returns the name."""
+    set_aside(path)
+    return path
+
+
+def publish_file(temporary, path):
+    """A file written whole under a temporary name takes its final name: a file there already is moved aside first
+    (set_aside), and the move never replaces a file, so one that appeared in the meantime stops the step and the new
+    file is left under its temporary name."""
+    if not os.path.exists(temporary):
+        raise TableError("%s was not written: %s keeps what it holds" % (temporary, path))
+    set_aside(path)
+    if not move_without_replacing(temporary, path):
+        raise TableError("%s appeared while it was being made; the new file is left at %s" % (path, temporary))
+
+
+def write_text(path, text):
+    """A small text file (a listing, a configuration line) written under a temporary name and published"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = free_name("%s.tmp.%d" % (path, os.getpid()))
+    with open(temporary, "w", encoding="utf8") as handle:
+        handle.write(text)
+    publish_file(temporary, path)
+
+
+@contextlib.contextmanager
+def the_only_run_on(root):
+    """An exclusive lock on the directory <root>/_logs while a run writes under root (a dataset's outputs): a second
+    run on the same outputs, whatever its steps, is refused before it writes anything; steps of two runs would read
+    and replace the same basin table.  The lock is the system's (flock) on the directory itself, released when the
+    process ends however it ends.  No lock file is made: a run that is refused by its own checks leaves no file under
+    root, as before.  A file system that gives no lock on a directory (NFS takes an exclusive lock only on a file
+    open for writing) gets the lock on the file <root>/_logs/run.lock, which stays: a lock is on the file, not on
+    its name.  Every run on one root meets the same file system and so takes the same lock.  Without the system's
+    file locks (Windows) a run is refused: FlowDivide runs on Linux and macOS."""
+    if fcntl is None:
+        raise TableError("FlowDivide needs the system's file locks (fcntl) to keep two runs off one output: it runs on "
+                         "Linux and macOS")
+    lock_directory = os.path.join(root, "_logs")
+    os.makedirs(lock_directory, exist_ok=True)
+    opened = [os.open(lock_directory, os.O_RDONLY)]
+    try:
+        try:
+            fcntl.flock(opened[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise TableError("another run is writing under %s (it holds the lock on %s)" % (root, lock_directory))
+        except OSError:
+            # no lock on a directory here: the lock file
+            lock_path = os.path.join(lock_directory, "run.lock")
+            try:
+                opened.append(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644))
+            except OSError as error:                 # a directory that cannot be written to, a lock file of another user
+                raise TableError("the lock file %s cannot be opened (%s); FlowDivide needs it to keep two runs off one "
+                                 "output" % (lock_path, error))
+            try:
+                fcntl.flock(opened[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise TableError("another run is writing under %s (it holds the lock on %s)" % (root, lock_path))
+            except OSError as error:
+                raise TableError("the file system of %s gives no lock (%s); FlowDivide needs one to keep two runs off "
+                                 "one output" % (root, error))
+        try:
+            yield
+        finally:
+            fcntl.flock(opened[-1], fcntl.LOCK_UN)
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+
+
 def write_done_marker(path, checks_summary):
     """<path>.done: the file, the time, the version, the machine and
     the checks, under a temporary name and renamed"""
     marker = path + ".done"
-    temporary = "%s.tmp.%d" % (marker, os.getpid())
+    temporary = free_name("%s.tmp.%d" % (marker, os.getpid()))
     with open(temporary, "w") as handle:
         handle.write("file %s\ncompleted %s\nversion flowdivide %s\nmachine %s\nchecks %s\n"
                      % (path, time.strftime("%Y-%m-%dT%H:%M:%S"), VERSION, platform.node() or "?", checks_summary or "-"))
-    os.replace(temporary, marker)
+    publish_file(temporary, marker)
 
 
 def read_marker_checks(path):
@@ -138,10 +296,12 @@ def file_is_complete(path):
 
 
 def publish_with_marker(temporary, path, checks_summary):
-    """the old marker removed first (it describes the old file), the file renamed, the new marker written"""
-    if os.path.exists(path + ".done"):
-        os.remove(path + ".done")
-    os.replace(temporary, path)
+    """the old marker moved aside first (it describes the old file), then the old file; the new file renamed, the
+    new marker written"""
+    if not os.path.exists(temporary):
+        raise TableError("%s was not written: %s keeps what it holds" % (temporary, path))
+    set_aside(path + ".done")
+    publish_file(temporary, path)
     write_done_marker(path, checks_summary)
 
 
@@ -174,7 +334,7 @@ def _write_frame(frame, columns, float_formats, path, checks_summary, text_colum
         else:
             out[name] = values.to_numpy(np.int64)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    temporary = "%s.tmp.%d" % (path, os.getpid())
+    temporary = free_name("%s.tmp.%d" % (path, os.getpid()))
     out.to_csv(temporary, sep=" ", index=False, header=True, lineterminator="\n")
     publish_with_marker(temporary, path, checks_summary)
 
@@ -619,7 +779,7 @@ def write_basin_map(path, values, run, kind, key):
     header = "%s run=%s kind=%s key=%s basins=%d payload_bytes=%d\n" % (BASIN_MAP_MAGIC, run, kind, key, len(values) - 1,
                                                                        len(body.encode("ascii")))
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    temporary = "%s.tmp.%d" % (path, os.getpid())
+    temporary = free_name("%s.tmp.%d" % (path, os.getpid()))
     with open(temporary, "w", newline="\n") as handle:
         handle.write(header)
         handle.write(body)

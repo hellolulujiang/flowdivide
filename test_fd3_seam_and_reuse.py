@@ -15,6 +15,13 @@
 5. Two pixels equally far from the outlet of a basin across the seam: lfp draws the same path whether the basin is one
    region or three pieces in three regions, also when the basin table gives the basin a box over every column and a
    region's window is unrolled a whole turn away (the members' heads placed by the links between the members).
+6. The piece table against the flow directions at a cut (0.7.9): a basin cut into three pieces in two regions runs
+   with the right table, and every attribute is refused when the table names another inlet pixel, when it names
+   another parent, when the child's outlet flows nowhere, when the piece without a parent does not end at the basin's
+   outlet and when two pieces have no parent; lfp is also refused on the table that names another
+   parent when it is given the distance table of the right pieces (the distance walk, which refuses it, not run).
+7. A region window of more than 2^31 - 1 pixels (0.7.9): refused before anything is read, as in the C code, since a
+   pixel of the window is named by a 32-bit index (until 0.7.8 a capacity above 2^31 would have wrapped the indices).
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
 """
@@ -299,8 +306,8 @@ def test_lfp_tie_across_the_seam(scratch):
     """a basin over columns 9, 0 and 1 of a periodic grid, its outlet at (2, 0), and two pixels equally far from it:
     (0, 9) and (0, 1) (each a step south, a step east or west, a step south).  Computed as one region, the head is the
     one further west in the basin, column 9; cut into three pieces in three regions (column 0, the outlet piece; 9 and
-    1 flowing into it), the members' heads are compared across regions, and up to 0.7.8's round 5 the column of each
-    was taken in its own region's window, which made it column 1 (Codex, round 5).  Both must give the same lfp"""
+    1 flowing into it), the members' heads are compared across regions, and in a first version of 0.7.8 the column of
+    each was taken in its own region's window, which made it column 1.  Both must give the same lfp"""
     directions = np.full((NROW, NCOL), fd1.MERIT_NODATA, np.uint8)
     directions[0, 0], directions[1, 0], directions[2, 0] = 4, 4, 0            # column 0: south to the mouth (2, 0)
     directions[0, 9], directions[1, 9], directions[2, 9] = 4, 1, 64           # column 9: to (1, 9), then east across the seam
@@ -344,7 +351,7 @@ def test_lfp_tie_across_the_seam(scratch):
 
 
 def test_lfp_tie_with_a_loose_box(scratch):
-    """Codex, round 6: a basin whose box in the basin table spans every column ([5, 15)) although it holds columns 3..7
+    """A basin whose box in the basin table spans every column ([5, 15)) although it holds columns 3..7
     only, as FD1 may unroll it, and whose regions' windows are unrolled from different columns (region 2 at [14, 15),
     the same column as 4).  Its two farthest pixels, (0, 4) and (0, 6), are exactly equally far.  As one region the
     head is the one further west, column 4; cut into three pieces it must be the same: the members' heads are placed by
@@ -394,6 +401,128 @@ def test_lfp_tie_with_a_loose_box(scratch):
           np.array_equal(one[0], three[0]) and one[1:] == three[1:] and one[2] == 4)
 
 
+def test_the_piece_table_against_the_directions(scratch):
+    """basin 1 (region 1) over columns 0..2; basin 2 over columns 6..9 with its outlet at (2, 9), cut into piece 4
+    (column 9, the outlet) and piece 6 (column 8, flowing into piece 4), both in region 3, and piece 5 (columns 6..7,
+    region 4), whose outlet (2, 7) flows into (2, 8), a pixel of piece 6"""
+    def directions_of(mouth_at_the_cut):
+        directions = np.full((NROW, NCOL), fd1.MERIT_NODATA, np.uint8)
+        for first, last in ((0, 2), (6, 9)):
+            directions[0:2, first:last + 1] = 4
+            directions[2, first:last + 1] = 1
+            directions[2, last] = 0
+            directions[3:, first:last + 1] = 64
+        if mouth_at_the_cut:
+            directions[2, 7] = 0
+        return directions
+
+    def piece(piece_id, parent, region, outlet_col, inlet_col, first, last, depth):
+        return {"piece_id": piece_id, "basin_id": 2, "piece_kind": 1, "parent_piece_id": parent, "region_id": region,
+                "outlet_row": 2, "outlet_col": outlet_col, "parent_inlet_row": 2 if parent else -1, "parent_inlet_col": inlet_col,
+                "piece_grid_count": NROW * (last - first), "acc_at_outlet": NROW * (outlet_col - 5),
+                "aca_at_outlet_km2": 1.0 * (outlet_col - 5), "piece_area_km2": 1.0 * (last - first), "row_min": 0,
+                "row_max": NROW, "col_min": first, "col_max": last, "bbox_grid_count": NROW * (last - first),
+                "downstream_depth": depth}
+
+    basins = [{"outlet_row": 2, "outlet_col": 2, "basin_grid_count": NROW * 3, "basin_area_km2": 5.0, "basin_row_min": 0,
+               "basin_row_max": NROW, "basin_col_min": 0, "basin_col_max": 3, "region_id": 1},
+              {"outlet_row": 2, "outlet_col": 9, "basin_grid_count": NROW * 4, "basin_area_km2": 4.0, "basin_row_min": 0,
+               "basin_row_max": NROW, "basin_col_min": 6, "basin_col_max": 10, "region_id": 3}]
+    regions = [{"region_id": 1, "row_min": 0, "row_max": NROW, "col_min": 0, "col_max": 3, "pixels": NROW * 3, "basins": 1},
+               {"region_id": 3, "row_min": 0, "row_max": NROW, "col_min": 8, "col_max": 10, "pixels": NROW * 2, "basins": 0},
+               {"region_id": 4, "row_min": 0, "row_max": NROW, "col_min": 6, "col_max": 8, "pixels": NROW * 2, "basins": 0}]
+    right = [piece(4, 0, 3, 9, -1, 9, 10, 0), piece(6, 4, 3, 8, 9, 8, 9, 1), piece(5, 6, 4, 7, 8, 6, 8, 2)]
+    cases = (("the right table", right, False, None),
+             ("the table names another inlet pixel", [right[0], right[1], piece(5, 6, 4, 7, 9, 6, 8, 2)], False,
+              "but its flow direction points to row 2 column 8"),
+             ("the table names another parent", [right[0], right[1], piece(5, 4, 4, 7, 8, 6, 8, 1)], False,
+              "does not belong to piece 4"),
+             ("the child's outlet flows nowhere", right, True, "flows nowhere"),
+             # 0.7.9: the piece without a parent ends at the basin's outlet, and there is one such piece
+             ("the root piece ends a pixel before the basin's outlet", [piece(4, 0, 3, 8, -1, 9, 10, 0), right[1], right[2]],
+              False, "is not the outlet of its basin"),
+             ("two pieces without a parent", [right[0], piece(6, 0, 3, 8, -1, 8, 9, 0), right[2]], False,
+              "have no parent"))
+    fd3.register_attribute("tmc", "the members marked", "uint8", 0, downstream_first=False, channel=False, area=False,
+                           kernel=mark_the_members)
+    for number, (what, pieces, mouth_at_the_cut, message) in enumerate(cases):
+        directory = os.path.join(scratch, "cuts%d" % number)
+        os.makedirs(directory)
+        directions = directions_of(mouth_at_the_cut)
+        dir_path = os.path.join(directory, "dir.tif")
+        write_raster(dir_path, directions, fd1.MERIT_NODATA)
+        area = upstream_count(directions_of(False), False)
+        write_raster(os.path.join(directory, "upa.tif"), area, 0.0)
+        write_raster(os.path.join(directory, "str.tif"), (area > 0).astype(np.uint8), 0)
+        grid = fd1.Grid(dir_path, periodic=False, block_pixels=1200)
+        paths = write_partition(os.path.join(directory, "tables"), "cuts", basins, regions, [1, 0])
+        write_pieces(paths["piece"], pieces)
+        for code in ("shv", "ldn", "hck", "lup", "ord", "lfp", "tmc"):
+            out = os.path.join(directory, "%s.tif" % code)
+            try:
+                partition = fd3.Partition(paths["basin"], paths["region"], paths["piece"], paths["basin_region"], 1.0, grid)
+                if code == "tmc":
+                    fd3.derive_user_attribute(code, partition, dir_path, out, os.path.join(directory, "tmc.csv"))
+                else:
+                    fd3.derive_attribute(code, partition, dir_path, out, os.path.join(directory, "%s_basin.csv" % code),
+                                         os.path.join(directory, "%s_member.csv" % code),
+                                         channel_path=os.path.join(directory, "str.tif"),
+                                         area_path=os.path.join(directory, "upa.tif"), tag="test." + code)
+                check("%s: %s %s" % (what, code, "runs" if message is None else "is refused"), message is None)
+            except fd3.FlowDivideError as error:
+                check("%s: %s %s (%s)" % (what, code, "runs" if message is None else "is refused", str(error)[:110]),
+                      message is not None and message in str(error))
+        if message is None:
+            with rasterio.open(os.path.join(directory, "shv.tif")) as dataset:
+                magnitude = dataset.read(1)
+            with rasterio.open(os.path.join(directory, "lup.tif")) as dataset:
+                upstream_length = dataset.read(1)
+            check("the right table: the Shreve magnitude at the outlet of basin 2 counts the %d sources of its four "
+                  "columns across both cuts (%d)" % (2 * 4, int(magnitude[2, 9])), int(magnitude[2, 9]) == 2 * 4)
+            check("the right table: the upstream flow length grows across both cuts (%.0f < %.0f < %.0f m)"
+                  % (upstream_length[2, 7], upstream_length[2, 8], upstream_length[2, 9]),
+                  0 < upstream_length[2, 7] < upstream_length[2, 8] < upstream_length[2, 9])
+    # lfp given the distance's member table of the right pieces, on a piece table that names another parent for piece 5
+    # (0.7.9): the distance walk that refuses such a table does not run, and the path from the
+    # inlet named would run through the outlet of piece 6, which the table leaves off the chain
+    directory = os.path.join(scratch, "cuts_given_table")
+    os.makedirs(directory)
+    dir_path = os.path.join(scratch, "cuts0", "dir.tif")
+    grid = fd1.Grid(dir_path, periodic=False, block_pixels=1200)
+    paths = write_partition(os.path.join(directory, "tables"), "cuts", basins, regions, [1, 0])
+    write_pieces(paths["piece"], [right[0], right[1], piece(5, 4, 4, 7, 8, 6, 8, 1)])
+    try:
+        partition = fd3.Partition(paths["basin"], paths["region"], paths["piece"], paths["basin_region"], 1.0, grid)
+        fd3.derive_attribute("lfp", partition, dir_path, os.path.join(directory, "lfp.tif"),
+                             os.path.join(directory, "lfp_basin.csv"), os.path.join(directory, "lfp_member.csv"),
+                             tag="test.lfp", ldn_member_table=os.path.join(scratch, "cuts0", "ldn_member.csv"))
+        check("the table names another parent, the distance table given: lfp is refused", False)
+    except fd3.FlowDivideError as error:
+        check("the table names another parent, the distance table given: lfp is refused (%s)" % str(error)[:150],
+              "passes the outlet of another member before its own" in str(error))
+    check("the table names another parent, the distance table given: no lfp raster is left as a product",
+          not os.path.exists(os.path.join(directory, "lfp.tif")))
+
+
+def test_the_window_fits_an_int32():
+    class NotRead:
+        """a dataset the window must not touch: the size is refused before anything is read"""
+        @property
+        def dtypes(self):
+            raise AssertionError("the window was read")
+    grid = None                                         # the size is refused before the grid is used
+    for nrow, ncol, refused in ((46341, 46341, True), (46340, 46340, False)):
+        try:
+            fd3.RegionWindow(grid, (0, nrow, 0, ncol), NotRead(), None, "float32", -1.0)
+            outcome = "read"
+        except fd3.FlowDivideError as error:
+            outcome = "refused" if "32-bit index" in str(error) else "other: %s" % error
+        except AssertionError:
+            outcome = "read"
+        check("a window of %d x %d = %d pixels is %s" % (nrow, ncol, nrow * ncol, "refused" if refused else "let through to the read"),
+              outcome == ("refused" if refused else "read"))
+
+
 if __name__ == "__main__":
     scratch = tempfile.mkdtemp(prefix="fd3_seam_")          # left in the system's temporary directory, nothing removed
     test_seam(scratch)
@@ -401,6 +530,8 @@ if __name__ == "__main__":
     test_lfp_tie_across_the_seam(scratch)
     test_lfp_tie_with_a_loose_box(scratch)
     test_reuse_and_lock(scratch)
+    test_the_piece_table_against_the_directions(scratch)
+    test_the_window_fits_an_int32()
     print("the test's files are in %s" % scratch)
     print("%d failures" % len(FAILURES))
     sys.exit(1 if FAILURES else 0)

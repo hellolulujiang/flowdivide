@@ -95,5 +95,18 @@ class NativeCacheProvenance(unittest.TestCase):
         self.assertTrue(any(str(tiles)+" " in row for row in identities))
 
 
+class TheVersion(unittest.TestCase):
+    def test_one_version_everywhere(self):
+        """the package's version is fd_tables.VERSION; flowdivide.py, the vector files' metadata and pyproject.toml
+        name the same"""
+        import re
+        import fd2_views
+        import fd_tables
+        import flowdivide
+        text = (Path(__file__).resolve().parent / "pyproject.toml").read_text(encoding="utf-8")
+        declared = re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+        self.assertEqual({declared, flowdivide.VERSION, fd2_views.FLOWDIVIDE_VERSION}, {fd_tables.VERSION})
+
+
 if __name__ == "__main__":
     unittest.main()

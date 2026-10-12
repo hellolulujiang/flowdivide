@@ -8,7 +8,7 @@ vectors to the partition, its views, the figures and the attributes, on one mach
     python flowdivide.py run mygrid --dir /data/dir.tif --convention merit --group-vectors /data/basins.shp --out-root /data/flowdivide
     python flowdivide.py list
 
-Three grids are built in (the three of the manuscript): HydroSHEDS v2 at 1 arc-second over South
+Three grids are built in (the three of the paper): HydroSHEDS v2.0 at 1 arc-second over South
 America and over North America, and MERIT Hydro at 3 arc-seconds over the whole globe (periodic in
 longitude).  Any other flow-direction grid runs with --dir and --convention, at any resolution and in any
 coding: the codings of MERIT Hydro, ESRI, HydroSHEDS, TauDEM, GRASS and the degrees are known by name, and
@@ -37,8 +37,9 @@ The products are laid out as follows:
 Every step leaves a marker in _logs/ with its arguments, its wall time, the time of its own checks and
 its peak memory, so a run that stopped is taken up where it stopped and a step is never repeated with
 the same arguments; _logs/timings_<dataset>.csv gathers the times.  Every raster written to disk is a
-variable with a keep option (--drop): a dropped variable is deleted as soon as the last step of the run
-that reads it is done.  The variables and the steps that read them:
+variable with a keep option (--drop): a dropped variable is moved into _tmp_/ beside it as soon as the last
+step of the run that reads it is done (nothing is deleted, so dropping frees no disk space until _tmp_/ is
+emptied by hand).  The variables and the steps that read them:
 
     dir     the recoded flow directions       read by everything; never dropped
     acc     upstream pixel count (upg)        fd1.2, fd1.5 (the cut)
@@ -51,6 +52,7 @@ that reads it is done.  The variables and the steps that read them:
     shv ldn hck lup lfp ord                   products of fd3 (lfp reads the member table of ldn, not its raster)
 """
 import argparse
+import contextlib
 import glob
 import hashlib
 import math
@@ -75,7 +77,7 @@ import fd2_views as fd2
 import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
-VERSION = "0.7.8"          # the package (pyproject.toml and fd2_views.FLOWDIVIDE_VERSION say the same)
+VERSION = fd_tables.VERSION  # the package; pyproject.toml says the same (test_native_cache_provenance.py checks it)
 RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
                            # and a run into an old tree makes everything again instead of reading closed tables.
                            # The rules that make the results; a step's marker is tied to this, not to the
@@ -97,7 +99,11 @@ CHANNEL_RULES_VERSION = 2  # the test of a channel pixel in fd1.1: the threshold
 LFP_RULES_VERSION = 2      # the longest flow path's own rules, in its step's signature only (the other five attributes
                            # keep their markers): 2 (0.7.8): on a periodic grid the tie between the heads of a cut basin's
                            # members is broken with the members laid out by their links, not in their regions' windows
-FD3_RULES_VERSION = 6      # 6: the channel and area grids must agree over the whole raster within 0.01 pixel
+FD3_RULES_VERSION = 7      # 7 (0.7.9): every cut's piece table checked against the flow directions (the child's outlet
+                           # flows into the table's inlet pixel, which belongs to the parent), and a region window of
+                           # more than 2^31 - 1 pixels refused, which 0.7.8 indexed with 32 bits: a product of 0.7.8 that
+                           # these checks would have stopped is made again, not kept
+                           # 6: the channel and area grids must agree over the whole raster within 0.01 pixel
                            # the rules of stage 3 alone: the distance and the upstream flow length cover every basin
                            # however small, their tables still list the basins of min_basin_area_km2 and more; the
                            # basin tables are printed column by column, with the longitudes and
@@ -160,12 +166,61 @@ def view_name_of_factor(grid, factor):
     return "%gm" % width
 
 
-def views_by_cell_size(grid, factors=(10, 50, 250)):
-    """the views of a grid this package has no fixed names for: three coarse grids, each a whole number of
-    pixels to a cell and a divisor of the block, so that a block holds whole cells; named by their cell size"""
+VIEW_FACTORS_DEFAULT = (10, 50, 250)
+
+
+def footprint_pixels(dir_argument, probe):
+    """the pixels of the rectangle the flow directions span: one file's, or that of all the tiles of a directory"""
+    if not os.path.isdir(dir_argument):
+        return probe.nrow * probe.ncol
+    left = bottom = float("inf")
+    right = top = float("-inf")
+    for path in sorted(glob.glob(os.path.join(dir_argument, "*.tif"))):
+        with rasterio.open(path) as tile:
+            left, bottom = min(left, tile.bounds.left), min(bottom, tile.bounds.bottom)
+            right, top = max(right, tile.bounds.right), max(top, tile.bounds.top)
+    return int(round((right - left) / abs(probe.pixel_width))) * int(round((top - bottom) / abs(probe.pixel_height)))
+
+
+def view_min_basin_area_km2(grid, factor):
+    """FD2's smallest basin of a view (Chain.min_basin_area_km2_of_view, before a chain is made): a quarter of a cell,
+    at the equator on a geographic grid, rounded as fd2.min_basin_area_km2_of rounds it"""
+    scale = METRES_PER_DEGREE if grid.geographic else 1.0
+    return fd2.min_basin_area_km2_of(abs(grid.pixel_width) * factor * scale / 1000.0, abs(grid.pixel_height) * factor * scale / 1000.0)
+
+
+def largest_basin_area_km2(grid, pixels, slack=False):
+    """all the grid's pixels at the area of its largest pixel (on a geographic grid the pixel at the equator, whether
+    the grid reaches it or not): no basin covers more.  With slack, a bound no stored basin area passes either (FD1
+    keeps areas in whole square metres): a square metre a pixel more, and a thousandth"""
+    if grid.geographic:
+        pixel_m2 = fd1.pixel_area_m2(0.0, abs(grid.pixel_width), abs(grid.pixel_height), grid.earth_model)
+    else:
+        pixel_m2 = abs(grid.pixel_width) * abs(grid.pixel_height)
+    area_m2 = pixels * pixel_m2
+    if slack:
+        area_m2 = (area_m2 + pixels + 1.0) * 1.001
+    return area_m2 / 1e6
+
+
+def views_by_cell_size(grid, factors=VIEW_FACTORS_DEFAULT, pixels=None, prune=True):
+    """the views of a grid this package has no fixed names for: coarse grids, each a whole number of pixels to a
+    cell and a divisor of the block, so that a block holds whole cells; named by their cell size.  With prune (the
+    default views), a view whose smallest basin (FD2's threshold) is larger than any basin of the grid could be
+    (pixels: all its tiles together) is left out: no basin would be in it and the run would stop there, so no grid
+    that ran before loses a view.  The finest is kept, made finer until its threshold is below that area.  Views
+    asked for by name (prune=False) are taken as they are"""
+    pixels = grid.nrow * grid.ncol if pixels is None else pixels
+    largest = largest_basin_area_km2(grid, pixels, slack=True)
+    covered = largest_basin_area_km2(grid, pixels)
     chosen = []
     for wanted in factors:
-        factor = max((f for f in range(1, max(wanted, 1) + 1) if grid.block_pixels % f == 0), default=1)
+        divisors = [f for f in range(1, max(wanted, 1) + 1) if grid.block_pixels % f == 0]
+        factor = max(divisors, default=1)
+        if prune and view_min_basin_area_km2(grid, factor) > largest:
+            if chosen:
+                continue
+            factor = max([f for f in divisors if view_min_basin_area_km2(grid, f) < covered], default=1)
         name = view_name_of_factor(grid, factor)
         if factor not in [f for _, f in chosen] and name not in [n for n, _ in chosen]:
             chosen.append((name, factor))
@@ -647,6 +702,7 @@ class Chain:
         self.timing = True                              # --timing on|off: the split of every step's time recorded, or only its total
         self.gdal_cache_mb = None                       # --gdal-cache-mb: GDAL's block cache in fd3, MiB (None: FLOWDIVIDE_GDAL_CACHE_MB or 512)
         self.done = set()
+        self.steps_run = 0                         # the steps this run executed (the timings table is made when it has)
         self.grid = None
         self.capacity_name = capacity_name
         self.blocks_of = {name: blocks for name, blocks, _ in dataset.capacities}
@@ -815,9 +871,11 @@ class Chain:
 
     def an_output_lost_its_marker(self, step):
         """an output that is empty, or that carried a .done marker when the step finished and carries none now
-        (a table left half written or its marker taken away by a failed rerun), is not taken as done"""
+        (a table left half written or its marker taken away by a failed rerun), is not taken as done.  An output the
+        step names as one that may be empty (the list of the basins cut, where none had to be) is taken as it is"""
         for path in list(step.outputs) + self.product_paths(step):
-            if os.path.exists(path) and os.path.isfile(path) and os.path.getsize(path) == 0:
+            if os.path.exists(path) and os.path.isfile(path) and os.path.getsize(path) == 0 \
+                    and path not in getattr(step, "may_be_empty", ()):
                 return True
         path = self.marker(step.label)
         if not os.path.exists(path):
@@ -843,7 +901,7 @@ class Chain:
         the disk estimate"""
 
         def __init__(self, label, arguments, function, args, outputs=(), products=None, inputs=(), depends_on=(), kind=None,
-                     refresh=None):
+                     refresh=None, may_be_empty=()):
             self.label = label
             self.arguments = arguments
             self.function = function
@@ -856,6 +914,7 @@ class Chain:
             self.signature = None
             self.will_execute = False
             self.refresh = refresh                      # () -> (outputs, products), after the step ran
+            self.may_be_empty = set(may_be_empty)       # outputs that are whole when they are empty
 
     def plan(self, steps):
         """Which steps will actually execute: a step runs when its marker is missing or carries another
@@ -964,12 +1023,17 @@ class Chain:
             self.note("%s done already" % step.label)
             self.done.add(step.label)
             return None
+        # one run at a time on a step: two runs on one output root that reach the same step would write the same
+        # temporary files and take each other's (0.7.9; the lock is the system's, gone with the process however it ends)
+        with fd3._the_only_run_writing(self.marker(step.label)):
+            return self._execute_alone(step)
+
+    def _execute_alone(self, step):
         for path in step.inputs:
             if not os.path.exists(path):
                 raise FlowDivideError("%s needs %s, which is not on disk; it was dropped or its step has not run" % (step.label, path))
         self.check_disk(step)
-        if os.path.exists(self.marker(step.label)):
-            os.remove(self.marker(step.label))               # a step that fails must not keep the marker of an earlier success
+        fd_tables.set_aside(self.marker(step.label))         # a step that fails must not keep the marker of an earlier success
         started = time.perf_counter()
         self.note("%s start %s :: %s" % (step.label, time.strftime("%m-%d %H:%M:%S"), step.arguments))
         if self.separate_processes:
@@ -995,21 +1059,22 @@ class Chain:
         # piece table that later lost its .done would pass as done
         if step.refresh is not None:
             step.outputs, step.products = step.refresh()
-        with open(self.marker(step.label), "w") as handle:
-            handle.write("%s version %s\nargs: %s\nsignature: %s\nseconds: %.1f\npeak_bytes: %d\n" % (
-                time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, step.arguments, step.signature, seconds, peak))
-            for identity in self.external_identities(step):
-                handle.write("external: %s\n" % identity)
-            # the outputs that carried their own .done marker when the step finished, asked for again on a resume
-            done_marked = [path for path in list(step.outputs) + self.product_paths(step)
-                           if os.path.exists(path + ".done")]
-            handle.write("done_marked: %s\n" % "|".join(done_marked))
-            if self.timing:
-                handle.write("input_seconds: %.1f\ncompute_seconds: %.1f\noutput_seconds: %.1f\ncheck_seconds: %.1f\n" % (
-                    io_seconds["input"], compute_seconds, io_seconds["output"], check_seconds))
-        self.done.add(step.label)
+        # the marker is written whole under a temporary name and takes its name when it is complete: a marker cut
+        # short by a crash would say that the step is done without the lines that are checked on a resume
+        marker_lines = ["%s version %s\nargs: %s\nsignature: %s\nseconds: %.1f\npeak_bytes: %d\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), VERSION, step.arguments, step.signature, seconds, peak)]
+        for identity in self.external_identities(step):
+            marker_lines.append("external: %s\n" % identity)
+        # the outputs that carried their own .done marker when the step finished, asked for again on a resume
+        done_marked = [path for path in list(step.outputs) + self.product_paths(step)
+                       if os.path.exists(path + ".done")]
+        marker_lines.append("done_marked: %s\n" % "|".join(done_marked))
         if self.timing:
-            self.write_timings()
+            marker_lines.append("input_seconds: %.1f\ncompute_seconds: %.1f\noutput_seconds: %.1f\ncheck_seconds: %.1f\n" % (
+                io_seconds["input"], compute_seconds, io_seconds["output"], check_seconds))
+        fd_tables.write_text(self.marker(step.label), "".join(marker_lines))
+        self.done.add(step.label)
+        self.steps_run += 1
         return result
 
     def write_timings(self):
@@ -1088,8 +1153,8 @@ class Chain:
         add("  merge policy         %s" % dataset.merge_policy)
         add("  channel threshold    %g km2;  attributes for basins of at least %g km2" % (self.channel_threshold_km2, self.min_basin_area_km2))
         add("  work tile            %d pixels of %s" % (self.tile, fine))
-        add("  views                %s" % ";  ".join("%s = %d pixels a cell, basins of %.4f km2 and more" % (
-            resolution_text(grid.pixel_width, grid.geographic, factor), factor, self.min_basin_area_km2_of_view(factor)) for _, factor in dataset.views))
+        add("  views                %s" % ";  ".join("%s = %d pixels a cell, basins of %s km2 and more" % (
+            resolution_text(grid.pixel_width, grid.geographic, factor), factor, fd2.area_text(self.min_basin_area_km2_of_view(factor))) for _, factor in dataset.views))
         add("  vector files         %s; at least %d colour numbers" % (" and ".join("GeoParquet" if f == "geoparquet" else "GeoPackage" for f in self.vector_formats), self.colours))
         if "fd3" in self.steps:
             add("  attributes           %s on %s" % (", ".join(self.attributes), self.capacity_name))
@@ -1137,8 +1202,8 @@ class Chain:
         for name, what, resolution, path, what_becomes in rows:
             add(("  %-*s  %-*s  %-*s  %s  %s" % (name_width, name, what_width, what, resolution_width, resolution, path, what_becomes)).rstrip())
         text = "\n".join(lines)
-        with open(os.path.join(layout.root, "_logs", "run_summary_%s.txt" % dataset.name), "w", encoding="utf8") as handle:
-            handle.write(text + "\n")
+        # the summary of the run before goes aside, like every file a run replaces
+        fd_tables.write_text(os.path.join(layout.root, "_logs", "run_summary_%s.txt" % dataset.name), text + "\n")
         self.note(text)
 
     # ---- the keep option ----
@@ -1180,21 +1245,43 @@ class Chain:
         return any(label in self.planned and self.planned[label].will_execute and label not in self.done for label in self.consumers(variable))
 
     def drop_what_is_no_longer_read(self):
-        """delete every dropped variable that no step still to execute reads"""
+        """every dropped variable that no step still to execute reads is moved into _tmp_/ beside it (nothing is
+        deleted, 0.7.9: the space is freed when that directory is deleted by hand)"""
         partitions = [(blocks, self.grouping) for _, blocks, _ in self.dataset.capacities]
         for variable in sorted(self.drop):
             if self.still_needed(variable):
                 continue
             for path in self.layout.files_of_variable(variable, partitions):
                 if os.path.exists(path):
-                    os.remove(path)
+                    destination = fd_tables.set_aside(path)
                     for side in (".report.json", ".objects.csv"):
-                        if os.path.exists(path + side):
-                            os.remove(path + side)
-                    self.note("dropped %s (%s): no step still to run reads it" % (variable, path))
+                        fd_tables.set_aside(path + side)
+                    self.note("dropped %s (%s): no step still to run reads it; moved to %s" % (variable, path, destination))
 
     # ---- the steps ----
     def run(self, _validate_only=False):
+        """the run, one at a time on a dataset's outputs (fd_tables.the_only_run_on): two runs on one output root
+        would read and replace the same basin table between their steps, whatever steps they run"""
+        if _validate_only:
+            return self._run(_validate_only)
+        with fd_tables.the_only_run_on(self.layout.root):
+            failed = True
+            try:
+                result = self._run(_validate_only)
+                failed = False
+                return result
+            finally:
+                # the timings table gathers the markers once, when the run ends, also when a later step failed.  Made
+                # after every step, each table went into _tmp_/ when the next took its place (nothing is written over)
+                if self.timing and self.steps_run:
+                    try:
+                        self.write_timings()
+                    except Exception as error:
+                        if not failed:
+                            raise
+                        self.note("the timings table was not written: %s" % error)   # the step's own error goes up
+
+    def _run(self, _validate_only=False):
         if self.only is not None and not self.only:
             raise FlowDivideError("--only must name at least one step")
         if self.only is not None and not self.summary_only and not _validate_only:
@@ -1225,6 +1312,9 @@ class Chain:
             candidates = sorted(glob.glob(os.path.join(native, "*.tif")))
             if not candidates:
                 raise FlowDivideError("no .tif tile in %s" % native)
+            # every run, also one that takes up a tree whose tiles are assembled already: 0.7.8 wrote one tile over
+            # the other without a word, and its result must not pass for a current one by being there
+            fd1.refuse_tiles_that_overlap(candidates)
             layout.set_grid(fd1.Grid(candidates[0], periodic=dataset.periodic, block_pixels=dataset.block_pixels, earth_model=dataset.earth_model))
         else:
             candidates = [native]
@@ -1247,6 +1337,12 @@ class Chain:
                 coding = " codes=%s sink=%s nodata=%s mouth=%s" % (
                     ",".join("%s=%s" % (name, code) for name, code in sorted(convention["codes"].items())),
                     convention["sink"], convention["nodata"], convention["mouth"])
+            # 0.7.9: in the MERIT convention a direction that points into nodata or off the grid is
+            # refused, where 0.7.8 made the pixel a mouth.  The recode of a tree finished with 0.7.8 in that convention
+            # is therefore made again (and the steps that read it), so that it cannot pass the refusal by being there
+            # already; the other conventions' signature is 0.7.8's and nothing of theirs is made again
+            if dataset.convention == "merit":
+                coding += " into_nodata=refused"
             first = self.plan([Step("fd1.0", "recode %s -> %s convention=%s%s periodic=%s input=%s" % (native, dir_path, dataset.convention, coding, dataset.periodic, identity),
                                     self.step_fd1_0, (dir_path,), outputs=[dir_path], kind="fd1.0")])
             self.grid = layout.grid
@@ -1277,12 +1373,38 @@ class Chain:
         else:
             if not os.path.exists(dir_path):
                 raise FlowDivideError("the recoded flow directions %s are not there; run fd1 first" % dir_path)
+            # the recode is taken as it lies on disk: one of the MERIT convention made before 0.7.9 turned a direction
+            # into no data into a river mouth where this version refuses it, and never passed that refusal.  So is a
+            # recode whose marker is gone while the steps after it keep theirs: a recode made again (its old marker
+            # set aside first) that stopped on the refusal left the old file in place.  When this run makes the recode
+            # (fd1 among --steps, FD1.0 not left out by --only), --summary-only and the check of --only only plan it,
+            # so the check waits for the recode itself
+            recorded = self.marker_arguments("fd1.0")
+            recode_in_this_run = "fd1" in self.steps and (self.only is None or "fd1.0" in self.only)
+            if dataset.convention == "merit" and not (self.summary_only and recode_in_this_run):
+                if recorded is None and self.marker_arguments("fd1.1") is not None:
+                    raise FlowDivideError("the flow directions %s have no marker of their recode (FD1.0) while the steps after it "
+                                          "have theirs: a recode made again stopped, and the file on disk may be one this version "
+                                          "refuses; add fd1 to --steps so that the recode is made again" % dir_path)
+                tail = " input=%s" % identity
+                body = recorded[:-len(tail)] if recorded is not None and identity is not None and recorded.endswith(tail) \
+                    else (recorded or "").rsplit(" input=", 1)[0]
+                if recorded is not None and not re.search(r" into_nodata=refused periodic=(True|False)$", body):
+                    raise FlowDivideError("the flow directions %s were recoded by a version before 0.7.9, which made a direction "
+                                          "that points into no data a river mouth; this version refuses such a direction: add "
+                                          "fd1 to --steps so that the recode is made again" % dir_path)
             self.grid = fd1.Grid(dir_path, periodic=dataset.periodic, block_pixels=dataset.block_pixels, earth_model=dataset.earth_model)
         layout.set_grid(self.grid)
         grid = self.grid
         self.note("grid %d x %d pixels, block %d pixels, %s, %s, tag %s" % (grid.ncol, grid.nrow, grid.block_pixels, "geographic" if grid.geographic else "projected",
                                                                              "periodic in longitude" if grid.periodic else "not periodic", layout.tag))
         views_text = ",".join("%s:%d" % (n, f) for n, f in dataset.views) + " vector=%s colours=%d rule=%d" % ("+".join(self.vector_formats), self.colours, fd2.VIEW_RULE)
+        # 0.7.9: the smallest basin of a view is the cell's width times its height, and keeps four significant digits
+        # under 0.01 km2.  Where that changed a view's area from 0.7.8's (pixels that are not square, cells under
+        # some 200 m) the areas are named in the signature, so that views made with the old areas are made again;
+        # elsewhere the signature is 0.7.8's and nothing is made again
+        if any(self.min_basin_area_km2_of_view(f) != fd2.min_basin_area_km2_until_0_7_8(self.view_side_km(f)) for _, f in dataset.views):
+            views_text += " min_areas=" + ",".join(fd2.area_text(self.min_basin_area_km2_of_view(f)) for _, f in dataset.views)
         first_view = dataset.views[0][0]
         grouping = self.grouping
         steps = []
@@ -1323,7 +1445,7 @@ class Chain:
             if dataset.vectorise_basins:
                 for n, _ in dataset.views:
                     basin_view_files += layout.vector_files(layout.vector("bsn", n), self.vector_formats) + layout.vector_files(layout.vector("bnd", n), self.vector_formats)
-            vector_rules_text = " vector_rules=%d" % FD2_VECTOR_RULES_VERSION if dataset.vectorise_basins else ""
+            vector_rules_text = " " + self.vector_rules_text() if dataset.vectorise_basins else ""
             steps.append(Step("fd2_basin_views", "views=%s vectorise=%s%s" % (views_text, dataset.vectorise_basins, vector_rules_text), self.step_fd2_basin_views, (), outputs=basin_view_files,
                               inputs=[layout.raster("bsn")], depends_on=["fd1.3"], kind="fd2"))
         if "fd1" in self.steps:
@@ -1353,7 +1475,9 @@ class Chain:
                                   outputs=cut_files, products=cut_products,
                                   inputs=[layout.raster("bsn"), layout.raster("str"), layout.raster("acc"), layout.group_table(grouping)],
                                   depends_on=["fd1.1", "fd1.3", "fd1.4_groups_%s" % grouping], kind="fd1.5_cut",
-                                  refresh=lambda blocks=blocks, grouping=grouping: self.cut_step_files(blocks, grouping)))
+                                  refresh=lambda blocks=blocks, grouping=grouping: self.cut_step_files(blocks, grouping),
+                                  # no basin over the capacity: the listing is an empty file, and the step is done
+                                  may_be_empty=[layout.cut_listing(blocks, grouping)]))
                 merge_text = dataset.merge_policy if dataset.merge_policy == "none" else "%s(%s)" % (dataset.merge_policy, fd1.MERGE_RULE)
                 # regions_rules (REGIONS_RULES_VERSION): the order of the joins of merge=level2 and partition_config.txt
                 # -- in the arguments so that a partition made under other rules is made again, not reused
@@ -1399,14 +1523,14 @@ class Chain:
             dataset.figures = False
         if "fd2" in self.steps:
             for group in (("l3", "l2", "l1") if dataset.has_given_groups else ()) + (("hilbert",) if dataset.hilbert else ()):
-                steps.append(Step("fd2_group_views_%s" % group, "views=%s vector_rules=%d" % (views_text, FD2_VECTOR_RULES_VERSION), self.step_fd2_group_views, (group,),
+                steps.append(Step("fd2_group_views_%s" % group, "views=%s %s" % (views_text, self.vector_rules_text()), self.step_fd2_group_views, (group,),
                                   outputs=[layout.group_view(group, n) for n, _ in dataset.views] + [layout.group_view(group, n) + ".objects.csv" for n, _ in dataset.views] +
                                   sum((layout.vector_files(layout.vector("grp_%s" % group, n), self.vector_formats) for n, _ in dataset.views), []),
                                   inputs=[layout.raster("bsn"), layout.group_table(group)] + [layout.basin_view(n) for n, _ in dataset.views],
                                   depends_on=["fd1.4_groups_%s" % ("l3" if group in ("l2", "l1") else group), "fd2_basin_views"], kind="fd2"))
             for name, blocks, _ in dataset.capacities:
                 label = self.partition_label(name)
-                steps.append(Step("fd2_region_views_%s" % label, "views=%s grouping=%s vector_rules=%d" % (views_text, grouping, FD2_VECTOR_RULES_VERSION), self.step_fd2_region_views, (blocks,),
+                steps.append(Step("fd2_region_views_%s" % label, "views=%s grouping=%s %s" % (views_text, grouping, self.vector_rules_text()), self.step_fd2_region_views, (blocks,),
                                   outputs=[layout.region_view(blocks, grouping, n) for n, _ in dataset.views] + [layout.region_view(blocks, grouping, n) + ".objects.csv" for n, _ in dataset.views] +
                                   sum((layout.vector_files(layout.region_view(blocks, grouping, n, "vector"), self.vector_formats) for n, _ in dataset.views), []),
                                   inputs=[layout.partition_raster(blocks, grouping, "rgn"), layout.raster("bsn")] + [layout.basin_view(n) for n, _ in dataset.views],
@@ -1532,8 +1656,7 @@ class Chain:
                                       layout.piece_table(blocks, self.grouping, basin_id), layout.piece_raster(blocks, self.grouping, basin_id), layout.mainstem_table(blocks, self.grouping, basin_id),
                                       codes_path=layout.piece_codes(blocks, self.grouping, basin_id), region_code=group_of[basin_id], levels=levels, aca_path=layout.raster("aca"),
                                       aca_to_km2=self.dataset.aca_to_km2, channel_threshold_km2=self.channel_threshold_km2, tile=self.tile)
-        with open(layout.cut_listing(blocks, self.grouping), "w") as handle:
-            handle.write("\n".join(str(b) for b in over) + ("\n" if over else ""))
+        fd_tables.write_text(layout.cut_listing(blocks, self.grouping), "\n".join(str(b) for b in over) + ("\n" if over else ""))
         return over
 
     def step_fd1_5_regions(self, capacity_pixels, blocks):
@@ -1554,8 +1677,8 @@ class Chain:
         groups_text = grouping if grouping == "l3" else ("hilbert" if capacity_text == "160deg2" and not view_suffix else
                                                          "hilbert_" + capacity_text + view_suffix)
         index_bits = 32 if capacity_pixels <= 2 ** 31 - 1 else 64
-        with open(os.path.join(layout.partition(blocks, grouping), "partition_config.txt"), "w") as handle:
-            handle.write("capacity_px=%d block_px=%d groups=%s index_bits=%d\n" % (capacity_pixels, self.grid.block_pixels, groups_text, index_bits))
+        fd_tables.write_text(os.path.join(layout.partition(blocks, grouping), "partition_config.txt"),
+                             "capacity_px=%d block_px=%d groups=%s index_bits=%d\n" % (capacity_pixels, self.grid.block_pixels, groups_text, index_bits))
         return fd1.fd1_5_regions_final(layout.basin_table(), grouping, layout.raster("bsn"),
                                        layout.cuts(blocks, grouping), self.grid, capacity_pixels, outputs, self.dataset.continent, merge_policy=self.dataset.merge_policy,
                                        land_cut_above=self.dataset.land_cut_above, land_merge_below=self.dataset.land_merge_below, level1=self.dataset.level1)
@@ -1565,12 +1688,24 @@ class Chain:
         grid = self.grid
         return int(round(1.0 / (abs(grid.pixel_width) * factor))) if grid.geographic else 0
 
+    def vector_rules_text(self):
+        """the rules of the polygons, as the steps that write them name them: on a grid periodic in longitude the
+        outline of an object across the 180th meridian is traced with the object in one piece and cut at the meridian
+        (C v10.35, 0.7.9), so the polygons of 0.7.8 there are made again; elsewhere the outlines did not change and
+        the signature is 0.7.8's"""
+        return "vector_rules=%d%s" % (FD2_VECTOR_RULES_VERSION, " outline_across_the_seam=v10.35" if self.grid.periodic else "")
+
+    def view_side_km(self, factor):
+        """the width of a view's cell in km, at the equator on a geographic grid"""
+        grid = self.grid
+        return abs(grid.pixel_width) * factor * METRES_PER_DEGREE / 1000.0 if grid.geographic else abs(grid.pixel_width) * factor / 1000.0
+
     def min_basin_area_km2_of_view(self, factor):
         """the smallest basin of a view: a quarter of a cell, at the equator on a geographic grid
         (basin_min_area_km2; the view is the basins of at least this area, the ids 1..N)"""
         grid = self.grid
-        side_km = abs(grid.pixel_width) * factor * METRES_PER_DEGREE / 1000.0 if grid.geographic else abs(grid.pixel_width) * factor / 1000.0
-        return fd2.min_basin_area_km2_of(side_km)
+        height_km = abs(grid.pixel_height) * factor * METRES_PER_DEGREE / 1000.0 if grid.geographic else abs(grid.pixel_height) * factor / 1000.0
+        return fd2.min_basin_area_km2_of(self.view_side_km(factor), height_km)
 
     def view_resolution_text(self, factor):
         return resolution_text(self.grid.pixel_width, self.grid.geographic, factor)
@@ -1588,7 +1723,7 @@ class Chain:
             min_area = self.min_basin_area_km2_of_view(factor)
             in_the_view[name] = fd2.basins_of_the_view(basins, min_area, layout.basin_table())
             jobs.append((layout.basin_view(name), factor, in_the_view[name], None, min_area))
-            self.note("  the %s view holds the %d basins of at least %.4f km2 (ids 1..%d)" % (name, in_the_view[name], min_area, in_the_view[name]))
+            self.note("  the %s view holds the %d basins of at least %s km2 (ids 1..%d)" % (name, in_the_view[name], fd2.area_text(min_area), in_the_view[name]))
         fd2.fold_mask_at_factors(layout.raster("bsn"), jobs, object_count_limit=limit, rule="largest_basin")
         if self.dataset.vectorise_basins:
             for name, factor in self.dataset.views:
@@ -1632,8 +1767,7 @@ class Chain:
         piece_view = layout.piece_preview(blocks, self.grouping, basin_id)
         if basin_id not in layout.cut_basins(blocks, self.grouping):
             self.note("  basin %d was not cut at %s; no piece preview and no Figure 4" % (basin_id, name))
-            if os.path.exists(piece_view):
-                os.remove(piece_view)                   # a preview of an earlier cut that no longer exists
+            fd_tables.set_aside(piece_view)             # a preview of an earlier cut that no longer exists
             return
         if not os.path.exists(piece_raster):
             raise FlowDivideError("the piece raster of basin %d at %s was dropped; run fd1 again to make it" % (basin_id, name))
@@ -1642,7 +1776,7 @@ class Chain:
             profile = {"driver": "GTiff", "dtype": "uint16", "count": 1, "width": sampled.shape[1], "height": sampled.shape[0], "crs": pieces.crs,
                        "transform": pieces.transform * rasterio.Affine.scale(PREVIEW_STEP), "nodata": 0, "tiled": True, "blockxsize": fd1.RASTER_BLOCK,
                        "blockysize": fd1.RASTER_BLOCK, "compress": "DEFLATE"}
-        temporary = piece_view + ".partial.tif"
+        temporary = fd_tables.free_name(piece_view + ".partial.tif")
         with rasterio.open(temporary, "w", **profile) as out:
             out.write(sampled, 1)
         fd1.publish(temporary, piece_view)
@@ -1690,8 +1824,7 @@ class Chain:
             cut_lists.append(layout.cut_basins(blocks, grouping))
         made.append(fd2.figure5_three_capacities(region_views, region_gpkgs, region_tables, layout.basin_view(view_name), labels, cut_lists, out, dataset.figure_view,
                                                  dataset.figure_ticks[0], dataset.figure_ticks[1], figure_size=dataset.figure5_size, vector_formats=self.vector_formats))
-        with open(os.path.join(out, "figures_manifest.txt"), "w") as handle:
-            handle.write("\n".join(made) + "\n")
+        fd_tables.write_text(os.path.join(out, "figures_manifest.txt"), "\n".join(made) + "\n")
         if self.open_figures and platform.system() == "Darwin":
             for path in made:
                 subprocess.call(["open", path])
@@ -1735,8 +1868,8 @@ def parse_arguments(argv):
     partition.add_argument("--min-basin-area-km2", type=float, default=1.0, help="the attributes are computed for the basins of at least this area (default 1)")
     partition.add_argument("--tile", type=int, default=fd1.WORK_TILE_DEFAULT, help="the square work tile of fd1.1, fd1.3 and fd1.5 in pixels, a multiple of 512 (default %d)" % fd1.WORK_TILE_DEFAULT)
     keep = run.add_argument_group("the keep option")
-    keep.add_argument("--keep", default=None, help="the variables kept on disk, comma-separated among %s; every other one is deleted as soon as the last step that reads it is done (dir, the tables and the polygon files are always kept).  The other way round is --drop" % ",".join(DROPPABLE))
-    keep.add_argument("--drop", default="", help="the variables deleted as soon as nothing left in the run reads them, comma-separated among %s (the other way round is --keep)" % ",".join(DROPPABLE))
+    keep.add_argument("--keep", default=None, help="the variables kept on disk, comma-separated among %s; every other one is moved into _tmp_/ beside it as soon as the last step that reads it is done (nothing is deleted: the space is freed when _tmp_/ is emptied by hand) (dir, the tables and the polygon files are always kept).  The other way round is --drop" % ",".join(DROPPABLE))
+    keep.add_argument("--drop", default="", help="the variables moved into _tmp_/ beside them as soon as nothing left in the run reads them, comma-separated among %s (the other way round is --keep)" % ",".join(DROPPABLE))
     views = run.add_argument_group("the views and the figures")
     views.add_argument("--vector", default="geoparquet", choices=["geoparquet", "gpkg", "both"], help="the format of the polygon files: geoparquet (the default; GeoParquet 1.1, zstd), gpkg (GeoPackage), or both, with the same rows and columns")
     views.add_argument("--colours", type=int, default=fd2.COLOURS_AT_LEAST, help="the colouring uses at least this many colour numbers, so that a colour does not come back two objects apart (default %d)" % fd2.COLOURS_AT_LEAST)
@@ -1755,6 +1888,7 @@ def parse_arguments(argv):
     own.add_argument("--aca", default=None, help="an upstream area raster on the grid of --dir, given with --acc (none: fd1.1 computes it)")
     own.add_argument("--aca-unit", default="km2", choices=["km2", "m2"], help="the unit of --aca (default km2, as HydroSHEDS and MERIT Hydro ship it)")
     own.add_argument("--periodic", action="store_true", help="the grid spans 360 degrees of longitude")
+    own.add_argument("--view-factors", default=None, help="the views: pixels to a cell, comma-separated, each lowered to a divisor of the block (default: the paper's four views on a grid of a whole number of pixels to the degree, else 10,50,250; either without a view whose smallest basin is larger than the whole grid, the finest made finer if it must be; views given here are taken as they are)")
     own.add_argument("--block", type=int, default=None, help="the block of the windows, in pixels (default one degree)")
     own.add_argument("--capacities", default="2^31:3,2^30:3,2^29:4", help="the capacities and the depth of the cut at each, name:levels pairs, the largest first (a name is 2^k or a number of blocks such as 160deg2)")
     own.add_argument("--merge", default="none", choices=["none", "within_parent", "any", "balanced", "level2"], help="the merge policy of fd1.5 for the groups under the capacity (level2: a region is a Level-02 unit, a unit that does not fit is divided along its Level-03 units)")
@@ -1798,7 +1932,12 @@ def main(argv=None):
             runs.append((datasets[name].continent, int(datasets[name].level1), fd_tables.basin_table_path(layout_root, datasets[name].continent)))
         # the global table sits where the whole grid's own table would: <out-root>/global/global/table/
         global_table = fd_tables.basin_table_path(os.path.join(arguments.out_root, "global"), "global")
-        fd1.fd1_7_global_basin_id(runs, global_table)
+        # every run whose basin table this writes, and the global root, locked as a run locks them (in one order)
+        with contextlib.ExitStack() as locks:
+            for root in sorted(set([os.path.join(arguments.out_root, name) for name in arguments.datasets]
+                                   + [os.path.join(arguments.out_root, "global")])):
+                locks.enter_context(fd_tables.the_only_run_on(root))
+            fd1.fd1_7_global_basin_id(runs, global_table)
         return 0
     if arguments.command != "run":
         print(__doc__)
@@ -1821,10 +1960,23 @@ def main(argv=None):
         # 400, 200, 120 and 20 cells to the degree.  On any other grid -- projected, 10 m, 1 m, a block that is
         # not a degree -- a view is named by the size of its cell, which is what a reader of the file name needs
         # (any baseline hydrography is supported): coarse_<name>, e.g. 100m or 1km.
-        if probe.geographic and abs(probe.block_pixels * abs(probe.pixel_width) - 1.0) < 1e-6 and all(probe.block_pixels % cells == 0 for cells in (400, 200, 120, 20)):
+        if arguments.view_factors:
+            try:
+                factors = tuple(int(text) for text in arguments.view_factors.split(",") if text.strip())
+            except ValueError:
+                raise FlowDivideError("--view-factors takes whole numbers of pixels to a cell, comma-separated: %r" % arguments.view_factors)
+            if not factors or min(factors) < 1:
+                raise FlowDivideError("--view-factors takes whole numbers of pixels to a cell, at least 1: %r" % arguments.view_factors)
+            views = views_by_cell_size(probe, factors, prune=False)
+        elif probe.geographic and abs(probe.block_pixels * abs(probe.pixel_width) - 1.0) < 1e-6 and all(probe.block_pixels % cells == 0 for cells in (400, 200, 120, 20)):
             views = [("400th", probe.block_pixels // 400), ("200th", probe.block_pixels // 200), ("120th", probe.block_pixels // 120), ("20th", probe.block_pixels // 20)]
+            # the same rule as views_by_cell_size: no view whose smallest basin is larger than any basin could be
+            pixels = footprint_pixels(arguments.dir, probe)
+            largest = largest_basin_area_km2(probe, pixels, slack=True)
+            views = ([view for view in views if view_min_basin_area_km2(probe, view[1]) <= largest]
+                     or views_by_cell_size(probe, (views[0][1],), pixels=pixels))
         else:
-            views = views_by_cell_size(probe)
+            views = views_by_cell_size(probe, pixels=footprint_pixels(arguments.dir, probe))
         dataset = Dataset(arguments.dataset, arguments.dir, arguments.convention, layers, periodic=arguments.periodic, block_pixels=arguments.block, capacities=capacities,
                           direction_codes=arguments.direction_codes, sink_code=arguments.sink_code, nodata_code=arguments.nodata_code, mouth_code=arguments.mouth_code,
                           merge_policy=arguments.merge, island_reach_blocks=arguments.island_reach, island_max_blocks=arguments.island_max, views=views, hilbert=not arguments.no_hilbert or not layers,
@@ -1917,6 +2069,6 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except FlowDivideError as error:
+    except (FlowDivideError, fd_tables.TableError) as error:
         print("flowdivide: %s" % error, file=sys.stderr)
         sys.exit(1)

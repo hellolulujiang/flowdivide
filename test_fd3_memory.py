@@ -13,6 +13,7 @@
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
 """
+import glob
 import os
 import shutil
 import sys
@@ -72,6 +73,9 @@ def test_held_blocks():
             check("budget %d: the directory is the prefix and this process's id" % budget, held.directory == directory)
             check("budget %d: what a stopped run left is cleared at the start (0.7.4's name, a dead process's)" % budget,
                   not os.path.exists(prefix) and not os.path.exists("%s.%d" % (prefix, dead)))
+            aside = glob.glob(os.path.join(scratch, "_tmp_", "*", "out.tif.held_blocks*", "block_9_9.npy"))
+            check("budget %d: and it is kept in _tmp_, not deleted (0.7.9)" % budget,
+                  len(aside) >= 2 and all(open(path).read() == "left over by a run" for path in aside))
             check("budget %d: a live process's directory is left alone" % budget,
                   os.path.isdir("%s.%d" % (prefix, os.getppid())))
             shutil.rmtree("%s.%d" % (prefix, os.getppid()))
@@ -113,13 +117,20 @@ def test_held_blocks():
             check("budget %d: items gives the rest" % budget, sorted(rest) == indices[len(indices) // 2:])
             check("budget %d: items gives every block bit for bit" % budget,
                   all(rest[index].tobytes() == kept[index].tobytes() and rest[index].dtype == kept[index].dtype for index in rest))
+            popped_files = len(glob.glob(os.path.join(directory, "block_*.npy")))
+            check("budget %d: a block read back leaves its file where it was (0.7.9)" % budget,
+                  popped_files == held.written_to_disk)
             held.clear()
             check("budget %d: clear leaves nothing, the scratch directory gone" % budget,
                   len(held) == 0 and not os.path.exists(directory))
+            check("budget %d: the scratch directory is in _tmp_ with every file it held (0.7.9)" % budget,
+                  held.written_to_disk == 0 or any(
+                      len(glob.glob(os.path.join(path, "block_*.npy"))) == popped_files
+                      for path in glob.glob(os.path.join(scratch, "_tmp_", "*", os.path.basename(directory) + "*"))))
             held[(5, 5)] = kinds[0][1].copy()
             held[(6, 6)] = kinds[1][1].copy()
-            held.remove_quietly()
-            check("budget %d: remove_quietly takes the directory away" % budget, not os.path.exists(directory))
+            held.put_aside_quietly()
+            check("budget %d: put_aside_quietly takes the directory away" % budget, not os.path.exists(directory))
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 

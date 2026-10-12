@@ -6,7 +6,7 @@
 
 <dataset root> holds global/table/basin_table_fine_<run>.csv, global/fineresolution/dir/dir_<run>_<tag>_merit.tif and
 partitions/<capacity directory>/global/table/{region_fine,piece_fine,basin_region}_<run>.csv, the layout the C chain
-(CCode v10.x) and this package both write.  Nothing is written under the dataset root: the attribute's raster and its
+(the FullHydro C code, v10) and this package both write.  Nothing is written under the dataset root: the attribute's raster and its
 tables go to <out directory>, which must be new or empty, and so does <attribute>_memory.txt with the peak resident set of the whole process (the
 tables read, every region, the tables written), the seconds and the held blocks.  The FD3 log lines give the peak so
 far after the tables and after every region.
@@ -106,8 +106,7 @@ def main(argv):
              "regions %d" % report["regions_visited"], "seconds_tables %.1f" % seconds_tables,
              "peak_gb_after_tables %.2f" % peak_tables, "seconds %.1f" % (time.time() - started),
              "peak_bytes %d" % peak, "peak_gb %.2f" % (peak / 1e9)]
-    with open(os.path.join(out, "%s_memory.txt" % code), "w") as handle:
-        handle.write("\n".join(lines) + "\n")
+    fd_tables.write_text(os.path.join(out, "%s_memory.txt" % code), "\n".join(lines) + "\n")   # the report before goes aside
     print("\n".join(lines))
 
 

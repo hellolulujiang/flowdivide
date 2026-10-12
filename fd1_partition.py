@@ -355,14 +355,50 @@ class Grid:
         self.earth_model = earth_model
         self.pixel_width = float(self.transform.a)
         self.pixel_height = float(self.transform.e)       # negative on a north-up grid
+        # the upstream area is kept in whole square metres: a pixel below one would count as 0 (0.7.9: said here,
+        # before FD1.2 stopped at an outlet of area 0)
+        if not self.geographic and abs(self.pixel_width * self.pixel_height) < 1.0:
+            raise FlowDivideError("the pixels are %.6g x %.6g m, less than a square metre; areas are kept in whole "
+                                  "square metres, so the finest grid is 1 m"
+                                  % (abs(self.pixel_width), abs(self.pixel_height)))
+        if self.geographic:
+            # the same for a grid in degrees (0.7.9: 0.000001-degree pixels, 0.012 m2 at the equator,
+            # went as far as FD1.2).  Its pixels are largest in the row nearest the equator: when even that row is
+            # below a square metre no pixel of the grid can be counted.  A grid whose rows near a pole alone are
+            # that small is not refused here -- those rows are often empty; FD1.2 stops at an outlet of area 0
+            top_latitude = float(self.transform.f) + 0.5 * self.pixel_height
+            bottom_latitude = float(self.transform.f) + (self.nrow - 0.5) * self.pixel_height
+            if top_latitude * bottom_latitude <= 0.0:
+                widest_latitude = 0.0
+            else:
+                widest_latitude = top_latitude if abs(top_latitude) < abs(bottom_latitude) else bottom_latitude
+            largest_pixel_m2 = float(pixel_area_m2(widest_latitude, abs(self.pixel_width), abs(self.pixel_height), earth_model))
+            if largest_pixel_m2 < 1.0:
+                raise FlowDivideError("the largest pixels of this grid (at %.6f degrees of latitude) are %.6g m2, less than "
+                                      "a square metre; areas are kept in whole square metres, so the finest grid has "
+                                      "pixels of 1 m2" % (widest_latitude, largest_pixel_m2))
+        if block_pixels is not None and int(block_pixels) < 1:
+            raise FlowDivideError("the block must be at least one pixel, not %s" % block_pixels)
         if block_pixels is None:
             if self.geographic:
-                block_pixels = int(round(1.0 / abs(self.pixel_width)))      # one degree
+                # one degree; a grid coarser than a degree (5-degree pixels) has blocks of one pixel
+                block_pixels = max(1, int(round(1.0 / abs(self.pixel_width))))
+                # a grid so fine that the smallest default capacity (2^29 pixels) does not hold one block of a
+                # degree (finer than about a sixth of an arc-second) stopped with "less than one block" (until
+                # 0.7.8): its default block goes down by tens, as a projected grid's below, until 2^29
+                # holds at least four.  Every grid of a third of an arc-second or coarser keeps its block of a degree
+                if block_pixels * block_pixels > (1 << 29):
+                    while block_pixels >= 10 and 4 * block_pixels * block_pixels > (1 << 29):
+                        block_pixels //= 10
             else:
-                # a projected grid: a block of about 100 km, so that a capacity of a few 10^9 pixels is a round
-                # number of blocks at any resolution (10,000 blocks of 100 km at 1 m, 100 at 10 m; a fixed number
-                # of pixels would be 5 km at 1 m and 50 km at 10 m), so that grids of 10 m and 1 m are supported too
+                # a projected grid: a block of about 100 km (10,000 pixels at 10 m, 3,333 at 30 m)
                 block_pixels = max(1, int(round(BLOCK_METRES_DEFAULT / abs(self.pixel_width))))
+                # a capacity is a number of whole blocks.  Below 10 m a block of 100 km is too many pixels: at 1 m
+                # it is 10^10, more than the largest capacity (2^31), and until 0.7.8 the run stopped with "less
+                # than one block".  The default block goes down by tens until a capacity of 2^29 pixels holds at
+                # least four of them: 10 km at 1 m, 2 m and 5 m
+                while block_pixels >= 10 and 4 * block_pixels * block_pixels > (1 << 29):
+                    block_pixels //= 10
         self.block_pixels = int(block_pixels)
         if self.periodic:
             span = self.ncol * abs(self.pixel_width)
@@ -595,22 +631,30 @@ def read_halo_tile(dataset, row0, nrow, col0, ncol, periodic, fill, dtype=None):
 
 def publish(temporary_path, final_path):
     """a step writes to a temporary name and renames it when every check has passed, so that a file
-    under its final name is always a complete one"""
-    if os.path.exists(final_path):
-        os.remove(final_path)
-    os.replace(temporary_path, final_path)
+    under its final name is always a complete one.  A file already there under the final name is moved aside
+    first (fd_tables.set_aside), not deleted: until 0.7.8 it was removed before the rename, and a temporary that
+    was missing left neither"""
+    if not os.path.exists(temporary_path):
+        raise FlowDivideError("%s was not written: %s keeps what it holds" % (temporary_path, final_path))
+    fd_tables.set_aside(final_path)
+    # a move that never replaces a file: one that appeared in the meantime stops the step (the C's
+    # pipeline_rename_exclusive)
+    if not fd_tables.move_without_replacing(temporary_path, final_path):
+        raise FlowDivideError("%s appeared while it was being made; the new file is left at %s" % (final_path, temporary_path))
 
 
 def write_json(path, payload):
-    with open(path, "w") as handle:
+    temporary = fd_tables.free_name("%s.tmp.%d" % (path, os.getpid()))
+    with open(temporary, "w") as handle:
         json.dump(payload, handle, indent=1, default=str)
+    publish(temporary, path)
 
 
 # ---- tables: space separated with one header line, as the paper writes every table ----
 
 def write_table(frame, path, float_format="%.6f"):
     """a table written under a temporary name and published when the write is complete"""
-    temporary = path + ".partial"
+    temporary = fd_tables.free_name(path + ".partial")
     with timing("output"):
         frame.to_csv(temporary, index=False, sep=" ", float_format=float_format)
     publish(temporary, path)
@@ -815,6 +859,32 @@ def _count_merit_strip(strip, counts):
                 counts[4] += 1
 
 
+def refuse_tiles_that_overlap(tile_paths):
+    """No two tiles hold the same pixel: the later one would be written over the earlier, its nodata over the other's
+    land and its outlets over the other's (until 0.7.8 without a word).  Only the tiles' headers are read; the places
+    are counted in pixels of the first tile from the north-west corner of them all, as the assembly places them."""
+    extents = []
+    pixel_width = pixel_height = None
+    for path in tile_paths:
+        with rasterio.open(path) as dataset:
+            if pixel_width is None:
+                pixel_width = dataset.transform.a
+                pixel_height = dataset.transform.e
+            extents.append((dataset.transform.c, dataset.transform.f, dataset.width, dataset.height))
+    if len(extents) < 2 or not pixel_width or not pixel_height:
+        return
+    x_left = min(e[0] for e in extents)
+    y_top = max(e[1] for e in extents)
+    boxes = sorted((int(round((y_top - e[1]) / -pixel_height)), int(round((e[0] - x_left) / pixel_width)), e[3], e[2], path)
+                   for e, path in zip(extents, tile_paths))
+    for index, (box_row0, box_col0, box_nrow, box_ncol, box_path) in enumerate(boxes):
+        for other_row0, other_col0, other_nrow, other_ncol, other_path in boxes[index + 1:]:
+            if other_row0 >= box_row0 + box_nrow:
+                break                                   # sorted by the first row: no later tile reaches this one
+            if other_col0 < box_col0 + box_ncol and box_col0 < other_col0 + other_ncol:
+                raise FlowDivideError("the tiles %s and %s overlap; each pixel must come from one tile" % (box_path, other_path))
+
+
 def assemble_tiles(tile_paths, out_path, nodata_value, tag="fd1.0"):
     """The producer's tiles joined into one file on their common grid: the union of their extents at
     their common pixel size, filled with the native nodata where no tile is.  The tiles must share the
@@ -858,8 +928,9 @@ def assemble_tiles(tile_paths, out_path, nodata_value, tag="fd1.0"):
     profile = {"driver": "GTiff", "dtype": tile_dtype, "count": 1, "width": ncol, "height": nrow, "crs": crs,
                "transform": transform, "nodata": nodata_value, "tiled": True, "blockxsize": RASTER_BLOCK,
                "blockysize": RASTER_BLOCK, "compress": "DEFLATE", "BIGTIFF": "YES", "NUM_THREADS": GDAL_WRITE_THREADS}
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     log(tag, "assembling %d tiles into %d x %d pixels" % (len(tile_paths), ncol, nrow))
+    refuse_tiles_that_overlap(tile_paths)
     with rasterio.open(temporary, "w", **profile) as out:
         # the file starts as all nodata; every tile is copied in strips onto its place in the lattice
         for path in tile_paths:
@@ -884,7 +955,8 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
     convention is a name of DIRECTION_CONVENTIONS (merit, esri, hydrosheds, taudem, grass, degrees) or
     "custom" with direction_codes ("E=1,SE=2,..."); sink_code, nodata_code and mouth_code override the
     named coding's values.  A pixel whose direction points into nodata or off the grid becomes a river
-    mouth, whatever the coding.  Writes <out_path> and <out_path>.report.json."""
+    mouth; under the merit convention, whose own mouths are written, it is refused instead (the grid is then
+    verified and copied, as the C code does).  Writes <out_path> and <out_path>.report.json."""
     started = time.time()
     coding = direction_convention(convention, codes=direction_codes, sink=sink_code, nodata=nodata_code, mouth=mouth_code)
     merit_code_of_byte = merit_code_table_of(coding)
@@ -898,7 +970,7 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
         if source.transform.b != 0.0 or source.transform.d != 0.0 or source.transform.e >= 0.0 or source.transform.a <= 0.0:
             raise FlowDivideError("the flow directions must be a north-up, unrotated raster: %s" % native_path)
     profile = raster_profile(grid, "uint8", MERIT_NODATA, predictor=False)
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     counts = np.zeros(9, np.int64)
     with rasterio.open(native_path) as source, rasterio.open(temporary, "w", **profile) as out:
         for row0 in range(0, grid.nrow, strip_rows):
@@ -915,6 +987,15 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
               "sink_out": int(counts[7]), "nodata_out": int(counts[8]), "mouths_made_from_directions": int(counts[6] - counts[3])}
     if counts[4] != 0:
         raise FlowDivideError("%d pixels carry a value that is no direction, no outlet and no nodata under the %s convention (%s)" % (counts[4], convention, coding))
+    if convention == "merit" and counts[6] != counts[3]:
+        # MERIT Hydro writes a river mouth (0) where the land ends: a direction pointing into nodata or off the grid
+        # is then a missing tile or a grid cut through its basins, and the C code refuses it
+        # (fd1.0 verify_dir_merit_convention).  Until 0.7.8 such a pixel was made a river mouth without a word
+        # beyond the report's count
+        raise FlowDivideError("%d direction codes point into nodata or off the grid; in the MERIT convention a river mouth (0) "
+                              "is written there, so the grid is not what it claims (a missing tile, or a window cut through "
+                              "basins).  For a window cut out of a MERIT grid, give the coding as --convention custom with "
+                              "MERIT's codes: those pixels then become river mouths" % int(counts[6] - counts[3]))
     if counts[0] != counts[5] + counts[6] - counts[3] or counts[1] != counts[7] or counts[2] != counts[8]:
         raise FlowDivideError("the recode counts do not add up: %s" % report)
     # the output read back and counted again (a check, timed on its own)
@@ -1419,8 +1500,8 @@ def fd1_1_upstream_area(dir_path, aca_path, str_path, grid, tile=WORK_TILE_DEFAU
     # the threshold in float32 and in the raster's unit, compared with the area as float32, as FD3
     # compares them; a double threshold against the float32 area comes out otherwise at 1.00000001 km2
     threshold_m2 = np.float32(channel_threshold_km2 * 1e6)
-    aca_temporary = aca_path + ".partial.tif"
-    str_temporary = str_path + ".partial.tif"
+    aca_temporary = fd_tables.free_name(aca_path + ".partial.tif")
+    str_temporary = fd_tables.free_name(str_path + ".partial.tif")
     with rasterio.open(dir_path) as dir_dataset, \
             rasterio.open(aca_temporary, "w", **raster_profile(grid, "int64", 0)) as aca_out, \
             rasterio.open(str_temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)) as str_out:
@@ -1554,9 +1635,9 @@ def fd1_1_flow_accumulation(dir_path, acc_path, aca_path, str_path, grid, tile=W
     # the threshold in float32 and in the raster's unit, compared with the area as float32, as FD3
     # compares them; a double threshold against the float32 area comes out otherwise at 1.00000001 km2
     threshold_m2 = np.float32(channel_threshold_km2 * 1e6)
-    acc_temporary = acc_path + ".partial.tif"
-    aca_temporary = aca_path + ".partial.tif"
-    str_temporary = str_path + ".partial.tif"
+    acc_temporary = fd_tables.free_name(acc_path + ".partial.tif")
+    aca_temporary = fd_tables.free_name(aca_path + ".partial.tif")
+    str_temporary = fd_tables.free_name(str_path + ".partial.tif")
     with rasterio.open(dir_path) as dir_dataset, \
             rasterio.open(acc_temporary, "w", **raster_profile(grid, "int64", 0)) as acc_out, \
             rasterio.open(aca_temporary, "w", **raster_profile(grid, "int64", 0)) as aca_out, \
@@ -1600,7 +1681,7 @@ def fd1_1_channel_mask_from_area(aca_path, str_path, grid, channel_threshold_km2
     started = time.time()
     if strip_rows is None:
         strip_rows = strip_rows_for(grid.ncol)
-    temporary = str_path + ".partial.tif"
+    temporary = fd_tables.free_name(str_path + ".partial.tif")
     channel_pixels = 0
     with rasterio.open(aca_path) as aca_dataset:
         # on the grid, not only of its size: the origin, the pixel and the CRS (an ACA one pixel to the east would
@@ -1790,7 +1871,9 @@ def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cu
         # the bounds: the pixel area at 85 degrees and at the equator, 1e-4 either side.  A basin of one pixel
         # is held to its own row just below; tighter bounds at the grid's own latitude edges would refuse a
         # one-pixel basin the 0.5 % of the MERIT grid lets through
-        lowest = pixel_area_m2(85.0, grid.pixel_width, grid.pixel_height, grid.earth_model) / 1e6 * (1.0 - 1.0e-4)
+        # a grid that reaches past 85 degrees (0.7.9): its own outermost row instead, so that a basin there passes
+        outermost = max(85.0, abs(grid.latitude_of_row(0)), abs(grid.latitude_of_row(grid.nrow - 1)))
+        lowest = pixel_area_m2(outermost, grid.pixel_width, grid.pixel_height, grid.earth_model) / 1e6 * (1.0 - 1.0e-4)
         highest = pixel_area_m2(0.0, grid.pixel_width, grid.pixel_height, grid.earth_model) / 1e6 * (1.0 + 1.0e-4)
     else:
         lowest = abs(grid.pixel_width * grid.pixel_height) / 1e6 * 0.999
@@ -2124,7 +2207,7 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
     col_max = np.full(basin_count + 1, -1, np.int32)
     col_min_shift = np.full(basin_count + 1, np.iinfo(np.int32).max, np.int32)
     col_max_shift = np.full(basin_count + 1, -1, np.int32)
-    temporary = bsn_path + ".partial.tif"
+    temporary = fd_tables.free_name(bsn_path + ".partial.tif")
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "uint32", 0)) as bsn_out:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
@@ -2176,8 +2259,7 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
     table["bbox_maxlon"] = maxlon
     table["bbox_maxlat"] = maxlat
     # the basin table stops counting as done before the new raster replaces the old one
-    if os.path.exists(basin_table_path + ".done"):
-        os.remove(basin_table_path + ".done")
+    fd_tables.set_aside(basin_table_path + ".done")
     publish(temporary, bsn_path)
     fd_tables.write_done_marker(bsn_path, "%d basins, every basin's pixel count equals the upstream count at its outlet" % basin_count)
     fd_tables.write_basin_table(table, basin_table_path, "fd1.3", "the box of every basin and the coordinates of fd1.3")
@@ -2334,7 +2416,7 @@ def fd1_4_rasterise_level3(dir_path, l3_path, grid, layers, strip_rows=None, tag
     must lie on DIR's grid.  `strip_rows` is the height of the strips the written file is read back in."""
     from osgeo import gdal
     started = time.time()
-    temporary = l3_path + ".partial.tif"
+    temporary = fd_tables.free_name(l3_path + ".partial.tif")
     gdal_failures = []
 
     def count_gdal_failures(error_class, error_number, message):
@@ -2823,7 +2905,7 @@ def write_level3_groupings(grid, group_windows, group_columns, basins, group_of_
     # the vote table: the evidence of the Level-03 code of every basin
     vote_path = os.path.join(root, "global", "table", "level3_vote_fine_%s.csv" % run)
     vote = pd.DataFrame(vote_columns)[["basin_id", "level3_code", "level3_from_neighbour", "level3_vote_grid_count", "level3_coded_grid_count"]]
-    temporary = "%s.tmp.%d" % (vote_path, os.getpid())
+    temporary = fd_tables.free_name("%s.tmp.%d" % (vote_path, os.getpid()))
     vote.to_csv(temporary, sep=" ", index=False, lineterminator="\n")
     fd_tables.publish_with_marker(temporary, vote_path, "%d basins, %d of them given their code by the neighbour rule"
                                   % (len(vote), int((vote["level3_from_neighbour"] != 0).sum())))
@@ -2838,8 +2920,7 @@ def write_level3_groupings(grid, group_windows, group_columns, basins, group_of_
         table[column] = fd_tables.UNSET_ID
     for level, groups in ((2, level2), (1, level1)):
         check_groups_against_basins(groups, table["level%d_id" % level].to_numpy(np.int64), land)
-    if os.path.exists(basin_table_path + ".done"):
-        os.remove(basin_table_path + ".done")
+    fd_tables.set_aside(basin_table_path + ".done")
     summary = ("%d Level-03 groups on whole blocks, %d Level-02 and %d Level-01 groups folded from them; every basin in "
                "exactly one group of each level" % (len(level3), len(level2), len(level1)))
     for grouping, groups in (("l3", level3), ("l2", level2), ("l1", level1)):
@@ -3964,8 +4045,7 @@ def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid,
     group_table_path = fd_tables.group_table_path(root, run, grouping)
     basin_map_path = fd_tables.group_basin_map_path(root, run, grouping)
     for path in (group_table_path, basin_map_path):
-        if os.path.exists(path + ".done"):
-            os.remove(path + ".done")
+        fd_tables.set_aside(path + ".done")
     fd_tables.write_basin_map(basin_map_path, np.concatenate([[0], group_of_basin + 1]), run, "group", grouping)
     fd_tables.write_group_table(group_table, group_table_path, "fd1.4 Hilbert: %d groups hold %d basins" % (group_count, basin_count))
     over = int((group_table["window_grid_count"] > capacity_pixels).sum())
@@ -4428,7 +4508,7 @@ def _label_basin_pieces(dir_path, bsn_path, grid, basin_id, rectangle, piece_out
     profile = {"driver": "GTiff", "dtype": "uint16", "count": 1, "width": window_ncol, "height": window_nrow, "crs": grid.crs,
                "transform": piece_transform, "nodata": 0, "tiled": True, "blockxsize": RASTER_BLOCK, "blockysize": RASTER_BLOCK,
                "compress": "DEFLATE", "BIGTIFF": "YES", "NUM_THREADS": GDAL_WRITE_THREADS}
-    temporary = out_piece_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_piece_path + ".partial.tif")
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(bsn_path) as bsn_dataset, rasterio.open(temporary, "w", **profile) as piece_out:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
@@ -4600,8 +4680,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
     # the old markers go before the new raster is published: a rerun that fails after this leaves no marker on a
     # raster whose table is not written
     for path in (piece_table_path, piece_raster_path):
-        if os.path.exists(path + ".done"):
-            os.remove(path + ".done")
+        fd_tables.set_aside(path + ".done")
     publish(piece_raster_path + ".partial.tif", piece_raster_path)
     # [c] the used pieces: the shallowest that fit, in hierarchical code order (1, 2, 31, 32, .., 4, ..); a
     #     piece of the deepest level is used whatever its window, and counted
@@ -5932,7 +6011,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                     raise FlowDivideError("basin %d piece %d: the pixel its outlet flows into (row %d, column %d) is not its "
                                           "parent's in the piece raster" % (cut_id, code, int(row["parent_inlet_row"]),
                                                                             int(row["parent_inlet_col"])))
-        rgn_temporary = outputs["rgn"] + ".partial.tif"
+        rgn_temporary = fd_tables.free_name(outputs["rgn"] + ".partial.tif")
         with rasterio.open(bsn_path) as bsn_dataset, rasterio.open(rgn_temporary, "w", **raster_profile(grid, "uint32", 0)) as rgn_out:
             check_raster_on_the_grid(bsn_dataset, grid, bsn_path)
             if bsn_dataset.dtypes[0] != "uint32":         # no negative id can come out of it
@@ -6123,8 +6202,7 @@ def fd1_7_global_basin_id(runs, global_table_path, tag="fd1.7"):
     global_id = np.zeros(area.size, np.int64)
     _merge_the_runs(area, grid_count, starts, counts, global_id)
     # the global table of an earlier run stops counting as done before any run's table changes
-    if os.path.exists(global_table_path + ".done"):
-        os.remove(global_table_path + ".done")
+    fd_tables.set_aside(global_table_path + ".done")
     written = []
     for (run, _, path), table, start, count in zip(runs, tables, starts, counts):
         table = table.copy()

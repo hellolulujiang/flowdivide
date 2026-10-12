@@ -78,6 +78,7 @@ import rasterio
 from numba import njit
 from rasterio.windows import Window
 
+import fd_tables
 from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, FlowDivideError, Grid, log, publish,
                            raster_profile, read_halo_tile, tile_exits_and_drains, tile_inlets, tile_topological_order,
                            write_json, _accumulate_over_exit_graph_area_only, _link_exits_to_inlets,
@@ -455,8 +456,8 @@ def upa_on_tiles(dir_path, out_path, channel_path, grid, tiles, channel_threshol
     # the threshold in float32 and in the raster's unit, compared with the area as float32, as FD3 does
     # compares them; a double threshold against the float32 area comes out otherwise at 1.00000001 km2
     threshold_m2 = np.float32(channel_threshold_km2 * 1e6)
-    temporary = out_path + ".partial.tif"
-    channel_temporary = channel_path + ".partial.tif" if channel_path else None
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
+    channel_temporary = fd_tables.free_name(channel_path + ".partial.tif") if channel_path else None
     with contextlib.ExitStack() as open_files:
         dir_dataset = open_files.enter_context(rasterio.open(dir_path))
         out_dataset = open_files.enter_context(rasterio.open(temporary, "w", **raster_profile(grid, "int64", 0)))
@@ -542,7 +543,7 @@ def ldn_on_tiles(dir_path, out_path, grid, tiles, tag="tiles.ldn", nodata=-9999.
     if not acyclic:
         raise FlowDivideError("the exit graph of the tiles holds a cycle: the flow directions are not a forest")
     exit_distance = _distance_of_exits_to_terminal(exit_order, next_exit, inlet_of_exit, records.exit_step_across, records.inlet_distance_to_drain)
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     seconds_reading = seconds_computing = seconds_writing = 0.0
     # both datasets closed on an error too
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "float32", nodata)) as out_dataset:
@@ -679,8 +680,8 @@ def lup_on_tiles(dir_path, out_path, grid, tiles, source_path=None, tag="tiles.l
         raise FlowDivideError("the exit graph of the tiles holds a cycle: the flow directions are not a forest")
     arriving_value, arriving_source = _maximum_over_exit_graph(exit_order, next_exit, inlet_of_exit, records.exit_step_across,
                                                                records.inlet_distance_to_drain, records.exit_value, records.exit_source)
-    temporary = out_path + ".partial.tif"
-    source_temporary = (source_path + ".partial.tif") if source_path else None
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
+    source_temporary = fd_tables.free_name(source_path + ".partial.tif") if source_path else None
     # the source raster in the same with, so that it is closed on an error too
     with contextlib.ExitStack() as stack:
         source_dataset = stack.enter_context(rasterio.open(source_temporary, "w", **raster_profile(grid, "int64", -1))) if source_path else None
@@ -923,7 +924,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
             to_sweep = to_sweep_next
             log(tag, "sweep %d: %d tiles computed, %d marked for the next" % (sweeps, sweeping.size, int(to_sweep.sum())))
     # the last sweep with the orders as they stand, written out
-    temporary = out_path + ".partial.tif"
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
     with rasterio.open(dir_path) as dir_dataset, rasterio.open(channel_path) as channel_dataset, \
             rasterio.open(temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)) as out_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
@@ -973,21 +974,26 @@ def main():
     parser.add_argument("--channel-threshold-km2", type=float, default=1.0, help="upa: a channel pixel drains at least this")
     parser.add_argument("--periodic", action="store_true", help="the grid spans 360 degrees of longitude")
     arguments = parser.parse_args()
+    if arguments.kernel == "ord" and not arguments.channel:
+        raise SystemExit("ord needs --channel: the Strahler order is the order of a network")
     grid = Grid(arguments.dir, periodic=arguments.periodic)
     tiles, pixels_per_tile = tiles_of_distribution(grid, arguments.tile_degrees, arguments.tile_metres)
     log("tiles", "%d tiles of %d x %d pixels over a grid of %d x %d" % (len(tiles), pixels_per_tile, pixels_per_tile, grid.nrow, grid.ncol))
-    if arguments.kernel == "upa":
-        # no second output: the upstream area alone, which is what Figure 7 charges this kernel with
-        report = upa_on_tiles(arguments.dir, arguments.out, arguments.second_out, grid, tiles,
-                              channel_threshold_km2=arguments.channel_threshold_km2)
-    elif arguments.kernel == "ldn":
-        report = ldn_on_tiles(arguments.dir, arguments.out, grid, tiles)
-    elif arguments.kernel == "lup":
-        report = lup_on_tiles(arguments.dir, arguments.out, grid, tiles, source_path=arguments.source)
-    else:
-        if not arguments.channel:
-            raise SystemExit("ord needs --channel: the Strahler order is the order of a network")
-        report = ord_on_tiles(arguments.dir, arguments.channel, arguments.out, grid, tiles)
+    import fd3_attributes          # the lock the attribute runs hold on their output: one run at a time writes an output
+    with contextlib.ExitStack() as held:
+        for path in (arguments.out, arguments.second_out, arguments.source):
+            if path:
+                held.enter_context(fd3_attributes._the_only_run_writing(path))
+        if arguments.kernel == "upa":
+            # no second output: the upstream area alone, which is what Figure 7 charges this kernel with
+            report = upa_on_tiles(arguments.dir, arguments.out, arguments.second_out, grid, tiles,
+                                  channel_threshold_km2=arguments.channel_threshold_km2)
+        elif arguments.kernel == "ldn":
+            report = ldn_on_tiles(arguments.dir, arguments.out, grid, tiles)
+        elif arguments.kernel == "lup":
+            report = lup_on_tiles(arguments.dir, arguments.out, grid, tiles, source_path=arguments.source)
+        else:
+            report = ord_on_tiles(arguments.dir, arguments.channel, arguments.out, grid, tiles)
     print(report)
 
 
