@@ -1,6 +1,6 @@
 """Figure 8: the Python package at work.
     (a) one run as a reader types it, from the page the package prints at the start of a run;
-    (b) the Mississippi (North America, HydroSHEDS v2 at 1 arc-second) cut into regions of 160 deg2;
+    (b) the Mississippi (North America, HydroSHEDS v2.0 at 1 arc-second) cut into regions of 160 deg2;
     (c) the hours of the three stages on the three grids.
 Reads from data/ the files written by data_08_package_run.py, the grid sizes of (c) included;
 writes fig_08_package_run.png into ../figures.
@@ -33,7 +33,7 @@ from fd1_partition import read_table
 
 FIGURE_DIRECTORY = paths.FIGURE_DIRECTORY
 DATA = paths.DATA_DIRECTORY
-DATASETS = [("south-america", "South America\nHydroSHEDS v2, 30 m"), ("north-america", "North America\nHydroSHEDS v2, 30 m"), ("merit-global", "The globe\nMERIT Hydro, 90 m")]
+DATASETS = [("south-america", "South America\nHydroSHEDS v2.0, 30 m"), ("north-america", "North America\nHydroSHEDS v2.0, 30 m"), ("merit-global", "The globe\nMERIT Hydro, 90 m")]
 
 
 def grid_size_label(dataset):
@@ -133,10 +133,11 @@ def strip_lines(dataset):
     out.append(("option", "    --acc <upstream pixel count> \\", "read, not computed; the area is the grid's own"))
     out.append(("option", "    --steps fd1,fd2,fd3 \\", "the partition, the views, the attributes"))
     out.append(("option", "    --attributes %s \\" % ",".join(codes), "the six, on the largest capacity, %s" % names[0]))
-    out.append(("option", "    --keep bsn,rgn,pieces \\", "the partition kept; the channel mask str is not"))
+    out.append(("option", "    --keep bsn,rgn,pieces \\", "the partition kept; the channel mask is not"))
     out.append(("option", "    --out-root <directory>", "the products go under <directory>/%s/" % dataset))
     out.append(("option", "  # set by the built-in grid:", ""))
-    out.append(("option", "  #   convention %s; groups" % convention, "units of whole basins: %s" % (layers[0] if len(layers) == 1 else re.sub(r"_[a-z]{2}_", "_*_", layers[0]))))
+    out.append(("option", "  #   convention %s; groups" % convention, ("HydroBASINS Level-03 units, of whole basins" if all(re.match(r"hybas_.*lev03", layer) for layer in layers)
+                                                                          else "units of whole basins: %s" % layers[0])))
     out.append(("option", "  #   capacities %s" % ",".join("%s:%s" % (n, d) for n, d in zip(names, depths)), "%s deg²; the cut %s deep" % (", ".join(degrees), ", ".join(depths))))
     out.append(("option", "  #   channel threshold", "%s km²" % km2))
     widest_text = max(len(text) for kind, text, note in out)

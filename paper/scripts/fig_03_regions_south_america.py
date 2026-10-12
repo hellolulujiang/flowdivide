@@ -194,10 +194,10 @@ def draw_basin_panel(axis, basin_raster, title_text, label_letter, over_the_cap_
         axis.text(at[0], at[1] - 1.9, GREAT_RIVER_NAME[basin_id], fontsize=style.SIZE_LABEL,
                   ha=OVER_CAP_NAME_ALIGN.get(basin_id, "center"), va="top", color="#12161c", zorder=6,
                   bbox=dict(boxstyle="round,pad=0.12", facecolor="white", edgecolor="none", alpha=0.75))
-    # colour bar in the empty ocean at the lower left
-    bar_axis = axis.inset_axes([0.07, 0.075, 0.34, 0.028])
-    colour_bar = axis.figure.colorbar(image, cax=bar_axis, orientation="horizontal", ticks=[-1, 1, 3, 5, 7])
-    colour_bar.ax.set_xticklabels(["\u22640.1", "10", "10\u00b3", "10\u2075", "10\u2077"],
+    # colour bar in the empty ocean at the lower right
+    bar_axis = axis.inset_axes([0.60, 0.075, 0.34, 0.028])
+    colour_bar = axis.figure.colorbar(image, cax=bar_axis, orientation="horizontal", ticks=[-1, 3, 5, 7])
+    colour_bar.ax.set_xticklabels(["\u22640.1", "10\u00b3", "10\u2075", "10\u2077"],
                                   fontfamily="DejaVu Sans")
     colour_bar.ax.tick_params(labelsize=style.SIZE_LABEL, length=1.8, pad=1.2, width=0.5)
     colour_bar.outline.set_linewidth(0.5)
@@ -446,7 +446,7 @@ def main():
                                             if basin_id < len(lookup))
         forced = sum(1 for region_id, values in region_table.items()
                      if values[1] > CAP_PIXELS and region_id in regions_of_an_oversized_basin)
-        style.panel_foot(axis, "%d basin groups, %d over the capacity (hatched);\n%d of them by a basin over on its own"
+        style.panel_foot(axis, "%d basin groups, %d over the capacity (hatched);\n%d of them because one basin alone exceeds it"
                          % (len(region_table), over_the_cap_in_table, forced), y=stats_offset)
         axis.set_xlim(VIEW_LON_MIN, VIEW_LON_MAX)
         axis.set_ylim(VIEW_LAT_MIN, VIEW_LAT_MAX)

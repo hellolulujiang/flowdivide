@@ -209,7 +209,7 @@ def main():
         outlet["basin_area_km2"], format(len(basin_segments), ","),
         int(basin["strahler_order"].max())), y=-0.065)
     style.panel_foot(axes[1, 1], "%s channel heads" % format(int(basin["shreve_magnitude"].max()), ","), y=-0.065)
-    style.panel_foot(axes[1, 2], "largest order %d" % int(basin["hack_order"].max()), y=-0.065)
+    style.panel_foot(axes[1, 2], "1 = the main stem", y=-0.065)
 
     colour_bar(axes[1, 0], ScalarMappable(norm=basin_strahler_norm, cmap=basin_strahler_map), "Strahler order",
                list(range(1, top_strahler + 1)), [str(t) for t in range(1, top_strahler + 1)])

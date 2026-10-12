@@ -129,7 +129,7 @@ def main():
 
     image = axes[0].imshow(ldn_km, cmap=colour_map, vmin=0, vmax=6000, extent=MOSAIC, interpolation="nearest",
                            origin="upper")
-    colour_bar(axes[0], image, "distance to the outlet (km)", [0, 3000, 6000], ["0", "3000", "6000"])
+    colour_bar(axes[0], image, "distance to the outlet (km)", [0, 3000, 6000], ["0", "3000", "\u22656000"])
     style.panel_heading(axes[0], "(a)", "Distance to the outlet")
     longest_km = max(path["properties"]["longest_flow_path_m"] for path in paths) / 1000.0
     style.panel_foot(axes[0], "along the flow path, up to {:,.0f} km".format(round(longest_km, -2)), y=-0.31)
@@ -138,7 +138,7 @@ def main():
     terrain.set_bad(OCEAN)
     image = axes[1].imshow(lup_km, cmap=terrain, vmin=low, vmax=high, extent=MOSAIC, interpolation="nearest",
                            origin="upper")
-    colour_bar(axes[1], image, "upstream flow length (km)", [0, 200, 400], ["0", "200", "400"])
+    colour_bar(axes[1], image, "upstream flow length (km)", [0, 200, 400], ["0", "200", "\u2265400"])
     style.panel_heading(axes[1], "(b)", "Upstream flow length")
     style.panel_foot(axes[1], "longest path from a divide to the pixel", y=-0.31)
     print("LUP colour range %.1f to %.1f km" % (low, high))

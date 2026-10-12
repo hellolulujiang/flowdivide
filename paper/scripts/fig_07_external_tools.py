@@ -168,7 +168,7 @@ WHY_NOT = {
     ("whitebox", "ldn"): "map units (degrees) only, no metres",
     ("cho", "lup"): "map units (degrees) only, no metres",
     ("pyflwdir", "lup"): "no upstream flow length in the library",
-    ("whitebox", "lup"): "its only one takes elevation, not flow directions",
+    ("whitebox", "lup"): "its only tool for this takes elevation, not flow directions",
     ("cho", "ldn"): "no distance to the outlet among the add-ons",
     ("cho", "ord"): "no stream order among the add-ons",
     ("grass", "upa"): "r.stream.* has no accumulation; r.watershed takes elevation",
