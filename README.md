@@ -64,14 +64,15 @@ Version 1.0.0 is the version described in
 > Jiang, L., Chen, W. FlowDivide: a standard workflow for hydrographic attributes from flow-direction grids that
 > outgrow a computer's memory. Submitted to *Environmental Modelling & Software*.
 
-The scripts that draw its figures are in [`paper/`](paper/); the data they read are at
-<https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
+Version 1.1.0 gives the same results; it closes two ways a run could stand still with GDAL 3.6 (see the
+[changelog](CHANGELOG.md)). The scripts that draw the figures are in [`paper/`](paper/), and the repository as it was
+at submission is the tag `paper-v1.0`; the data they read are at <https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
 
 ## Tests
 
     python test_region_numbering.py
 
-Twelve tests need no data; the rest run on a basin cut from a finished run
+Thirteen tests need no data; the rest run on a basin cut from a finished run
 (see the [user guide](docs/user-guide.md#tests)).
 
 ## Acknowledgements

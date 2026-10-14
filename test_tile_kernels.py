@@ -18,8 +18,8 @@ as a large one; the timing runs of Figure 7 are a different thing.
 
 What this test does not do: the whole-domain reference here shares the step lengths and the
 pixel areas of fd1_partition with the code it checks, so it is independent of the traversal and the cut but not
-of the geometry -- three_ways.py, which rounds every step to a whole centimetre, is the second reference and is
-independent of both; and there is no case yet for a periodic grid, for a tie between two equally long paths
+of the geometry -- three_ways.py, which rounds every step to a whole centimetre, is the second reference: its traversal
+is its own, its step lengths and pixel areas are those of fd1_partition too; and there is no case yet for a periodic grid, for a tie between two equally long paths
 across a tile edge, or for a tile with no exits.
 
 --tile-degrees is 1 by default, not 10: on a basin of a few degrees the 10-degree tiles of HydroSHEDS would
@@ -254,7 +254,7 @@ def main():
     # order written where there is no channel would show
     results.append(compare("ord", ord_tiles, reference["ord"], land, tolerance=0.0))
     log("the Strahler order took %d sweeps over %d tiles" % (report["sweeps"], report["tiles"]))
-    # the second reference, written by other hands: three_ways.py over the whole domain, in whole centimetres
+    # the second reference, written separately: three_ways.py over the whole domain, in whole centimetres
     # and whole square metres.  Its rounding is its own: each step is rounded to a whole centimetre, up to
     # 0.5 cm a step, and a path of L metres has at most L / (the shortest step of this grid) steps, so the two
     # answers may drift by 0.005 / shortest_step of L (the number comes from the grid, not from an assumed

@@ -1,5 +1,49 @@
 # Changelog
 
+## 1.1.0 (2026-10-13)
+
+No result changes: on the Sri Lanka sample (a run where basins are cut and the six attributes are
+computed, a run with the default capacities and the views) every raster and table equals 1.0.0 byte for byte, and
+the polygon files equal it in rows, columns and geometry (their metadata names the version). On MERIT Hydro
+worldwide, FD1 gives the partition published at <https://fullhydro.org> (FullDivide v1.1): the basin and region
+masks pixel for pixel, and the region table, the three basin-group tables and the region and groups of every basin
+cell for cell. What changes is that two ways a run could stand still with GDAL 3.6 are closed.
+
+- **What stood still.** GDAL 3.6 can decode a read of several tiles on its own threads. One of them that needs room
+  in the block cache pushes out a tile that was written and not yet compressed, waits for a free thread to compress
+  it, and holds the lock the other decoding threads wait for: the run stops without an error and uses no processor.
+  It takes a raster that is written piece by piece, reads between the pieces, and a raster larger than the cache.
+- **fd1.4 burns the Level-03 polygons on one thread.** Its raster was created with `NUM_THREADS=ALL_CPUS`, whatever
+  the environment said, and GDAL reads the raster back, chunk by chunk, for every layer after the first. Of the
+  built-in grids, North America burns two layers and MERIT Hydro nine; South America burns one. With two layers a
+  synthetic grid of 6016 x 8192 pixels under a cache of 16 MB stood still in three runs of six with GDAL 3.6.2;
+  with one layer, in none of eight. The raster is now created with `NUM_THREADS=1`, and `GDAL_NUM_THREADS` is 1 for
+  the burning thread from before the layers are opened until the output is released; twelve runs of twelve with two
+  layers ended. The pixels are the same; the file's bytes are not (the tiles lie in another order), and this one
+  raster is now compressed on one thread.
+- **The GeoTIFFs whose pixels the package reads are decoded on the calling thread, whatever `GDAL_NUM_THREADS`
+  says.** A run
+  for which no setting asks GDAL for threads, which is how the package is documented and was timed, already read
+  so, and nothing changes for it. With `GDAL_NUM_THREADS=8`, strips written in turn with reads of another raster
+  stood still in six synthetic runs of six. Every open to read or to update, in the five modules, now goes through
+  `fd1_partition.open_raster`, which opens a GeoTIFF (told by its driver, not its name) with the open option
+  `NUM_THREADS=1`; GDAL takes an open option before the environment and before its configuration, so the functions
+  are covered however they are called (the command line, the tile kernels, a script of one's own). What this costs
+  a run that had asked for threads: its reads are no faster than without, and the rasters FD3 opens again to update
+  (the longest flow path, a registered attribute) are compressed on one thread, as they are without. The rasters
+  the package creates are compressed on every core as before (`FLOWDIVIDE_GDAL_NUM_THREADS`), fd1.4's excepted.
+  Not covered: an input that is not a GeoTIFF (a VRT over tiles), overviews kept in a file of their own (`.ovr`),
+  and a dataset a caller opens and hands to a function of the package.
+- `earth_distance_m` holds the haversine term at 1 when rounding carries it above, as the C code does. It can only
+  happen for two points opposite each other on the earth, or within rounding of it, and the distance was then not
+  a number; every distance that was a number is the number it was.
+- Tests: `test_gdal_threads.py` (the burn of two layers; strips written in turn with reads through `open_raster`
+  of a GeoTIFF whose name does not say so, with eight threads asked for in the environment; a raster updated in
+  place; the option `open_raster` passes for each mode; that no module opens a raster to read in another way). The
+  scenarios that could stand still each run in a process of their own with a time limit. With the reads opened as
+  in 1.0.0 the strips stood still in four runs of four.
+- The user guide says how GDAL's threads are used.
+
 ## 1.0.0 (2026-10-12)
 
 The version the paper describes. On every grid 0.7.9 could run it computes what 0.7.9 computes: on the Sri Lanka
@@ -27,20 +71,20 @@ nothing.
   `pyproject.toml` says the same.
 - Documentation: the README names the paper; `DATA_NOTICE.md` says that the partitions published at fullhydro.org
   are independent datasets, not official MERIT Hydro products and not part of the HydroSHEDS family of products;
-  the user guide says which C implementation the package follows; HydroSHEDS v2.0 where the data are named.
+  the user guide says how the package differs from the C implementation; HydroSHEDS v2.0 where the data are named.
 
 Renumbered on 2026-10-06: the versions first named 1.0.0 to 1.0.4 are 0.7.0 to 0.7.4, so that 1.0.0 names the version the paper describes. The version published on GitHub on 2026-09-28 as 1.0.0 is 0.7.0.
 
 ## 0.7.9 (2026-10-11)
 
-Checked against the C implementation (FullHydro C code v10.35). Nothing the six attributes or the
+Checked against the C implementation. Nothing the six attributes or the
 partition give changes on the grids of the paper: on the Sri Lanka sample (MERIT codes given as a custom coding,
 capacity 4deg2, 11 regions) every raster and table equals 0.7.8 bit for bit, and the polygon files equal it in
 geometry and columns (their metadata names the new version and vector rule).
 
 - Nothing a run replaces is deleted. An output, its marker, a dropped variable, the scratch of the held blocks and
   what a stopped run left under a temporary name are
-  moved into `_tmp_/<date>_<time>_<process>/` beside them, as the C programs have done since v10.34. Publishing no
+  moved into `_tmp_/<date>_<time>_<process>/` beside them, as the C programs do. Publishing no
   longer removes the old file first: a temporary that is missing leaves the old file where it is and stops the step.
 - A step is written by one run at a time: a second run on the same outputs is refused (an exclusive lock on the step's
   marker), so two runs no longer share or remove each other's temporary files.
@@ -58,12 +102,10 @@ geometry and columns (their metadata names the new version and vector rule).
   grid stopped with "less than one block").
 - FD2: the smallest basin of a view is a quarter of the cell's width times its height (until 0.7.8 the width squared);
   the outline of an object across the 180th meridian is traced with the object in one piece and cut at the meridian,
-  as in C v10.35.
+  as in the C implementation.
 - FD3: at every cut the piece table is checked against the flow directions: the child's outlet must flow into the
   inlet pixel the table names, and that pixel must belong to the parent (the C programs' checks). A region window of
   more than 2^31 - 1 pixels with its ring is refused, as in the C programs (its pixels are named by 32-bit indices).
-- `measure_island_continents.py` takes its two files as arguments and the HydroBASINS directory from
-  `FLOWDIVIDE_HYBAS`.
 - Documentation: the README's command for a grid of one's own adds `--steps fd3` for the attributes and says the finest
   grid is 1 m; the user guide says when the polygon files carry a CRS, how the numbers of `three_ways.py` differ from
   the production ones, and what the C programs do that the package does not.
@@ -83,7 +125,7 @@ geometry and columns (their metadata names the new version and vector rule).
   (it was opened for writing as it was); a move that must not replace a file is a hard link or, where none can be
   made, the system's exclusive rename, and is refused where there is neither (it fell back on a check and an ordinary
   rename); a raster's `.msk` and `.ovr` go aside with it like its `.aux.xml`, before it and also when it is gone; a
-  step's marker, the run summary, the figures' manifest and the two measuring scripts' reports are published like the
+  step's marker, the run summary, the figures' manifest and the measuring script's report are published like the
   other files. The timings table is written once when the run ends (every step's rewrite went into `_tmp_/`).
   **A finished run is no longer made again where no basin had to be cut**: the list of the basins cut is then an
   empty file, which the plan took for one that was not written whole, so that the cut, the regions and every
@@ -99,7 +141,6 @@ geometry and columns (their metadata names the new version and vector rule).
 
 ## 0.7.8 (2026-10-07)
 
-After the final review of 0.7.7 and the reviews of its fixes.
 On the two HydroSHEDS grids nothing the six attributes give changes. On a periodic grid only the longest flow path of
 a cut basin can change, when its members lie in regions whose windows are unrolled whole turns apart and two members'
 heads are exactly equally far in the same row (the lfp tie below; the basin need not cross the antimeridian). On the
@@ -107,9 +148,8 @@ MERIT partitions on disk no region that holds a piece of a cut basin is unrolled
 45, all within columns 18,219 to 385,836 of 432,000; 1400deg2 cuts no basin), so their lfp does not change.
 
 - A periodic region whose window, with a column of margin on each side, would hold a column twice (a region all the
-  way round the grid, or all but one column) is refused, as in 0.7.7, with a message that says why and what to do. The
-  first 0.7.8 computed a region of all but one column in a window that held the free column once; a later check showed why
-  that cannot be right: the tables do not say which column is free (FD1 may give such a region a box over every
+  way round the grid, or all but one column) is refused, as in 0.7.7, with a message that says why and what to do. A
+  window that holds the free column once cannot serve a region of all but one column: the tables do not say which column is free (FD1 may give such a region a box over every
   column, and the small basins' boxes are not kept), and with one copy of the free column the column of a child's
   outlet there, which decides a tie of the Hack order's main stem, depends on where the window starts. The user guide
   states the limit. On MERIT the widest region spans 62.3 degrees (1400deg2), so the paper's runs never meet it.
@@ -127,7 +167,7 @@ MERIT partitions on disk no region that holds a piece of a cut basin is unrolled
   its parent's inlet are neighbours, so its columns are shifted by the whole turns that bring the two within a column
   -- from the outlet member down the tree, which lays the basin out as one connected run, the order one window holding
   the whole basin gives its columns; inside one member the distance's sweep already breaks the tie in that order. The
-  basin table's box is not used: FD1 may give a basin a box over every column (a first fix used it). On a grid that is not periodic nothing changes. `flowdivide.py` gives lfp's step its own rules version
+  basin table's box is not used: FD1 may give a basin a box over every column. On a grid that is not periodic nothing changes. `flowdivide.py` gives lfp's step its own rules version
   (`LFP_RULES_VERSION` 2, in lfp's signature only), so that an lfp made before reruns and the other five attributes keep
   their markers (checked: with an older lfp marker only lfp runs again).
 - lfp's two path buffers start at 4 million points and double for a longer path, instead of being reserved at the
@@ -194,7 +234,7 @@ its tables are deleted, when an attribute starts, and after every region. On Nor
 
 ## 0.7.5 (2026-10-06)
 
-After a review of 0.7.4; the rasters and tables do not change.
+The rasters and tables do not change.
 `fd_tables.read_basin_table_columns` counts the values of every line itself: read in chunks, pandas took a line with
 one value too many that opens a chunk as a line with an index and dropped the value without a word; such a table is
 now refused with pandas' own message, as the whole reader refuses it, and a table with faults in several columns is
@@ -232,7 +272,7 @@ Track native DIR files and tile-directory membership in cache identities. Valida
 
 ## 0.7.2 (2026-10-02)
 
-Inherits all 0.7.1 half-open rectangle and table-reader corrections from the local release tree.
+Includes the half-open rectangles and the corrections of the table readers of 0.7.1.
 
 * FD3 checks the accumulated affine-coordinate displacement across the whole raster, within 0.01 pixel,
   for the channel mask and upstream area. Non-finite transforms are refused. `FD3_RULES_VERSION` is 6,
@@ -245,15 +285,14 @@ Inherits all 0.7.1 half-open rectangle and table-reader corrections from the loc
 
 ## 0.7.1 (2026-09-29)
 
-Every rectangle is now left closed and right open, as in the FullHydro C code v10.00 and in the FlowTopo materials:
+Every rectangle is now left closed and right open, as in the C implementation:
 `row_max`, `col_max`, `basin_row_max`, `basin_col_max`, `bbox_row_max`, `bbox_col_max`, `window_row_max`,
 `window_col_max`, `cell_row_max` and `cell_col_max` are one past the last pixel (or block, or cell), so
 `nrow = row_max - row_min` and a loop runs `row_min <= row < row_max`. Tables written by 0.7.0 are refused
-by the readers (their `nrow` no longer matches); convert them with `convert_tables_to_half_open_bounds.py`
-of the C code v10.00 (not in this repository) or run the partition again. The rasters do not change.  `RULES_VERSION` is 2, so every marker
+by the readers (their `nrow` no longer matches); run the partition again. The rasters do not change.  `RULES_VERSION` is 2, so every marker
 of a 0.7.0 run is stale and a run into an old tree makes everything again.
 
-After a review on 2026-09-30: the region rows write `nrow = row_max - row_min`; the piece rasters are
+The region rows write `nrow = row_max - row_min`; the piece rasters are
 checked against a right-open window; a rectangle ending at the last column is not across the antimeridian
 (`col_max > ncol` is); the centre of a rectangle is `(min + max - 1) // 2` wherever a rectangle is placed by
 its centre, so no grouping or split moves; the last block of a rectangle is `(max - 1) // block`; the group

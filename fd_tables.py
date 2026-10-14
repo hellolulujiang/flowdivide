@@ -57,7 +57,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -122,7 +122,7 @@ _SET_ASIDE_STAMP = [None]
 
 
 def rename_exclusive(source, destination):
-    """The system's rename that never replaces a file, as the C's pipeline_rename_exclusive: renamex_np with
+    """The system's rename that never replaces a file, as in the C implementation: renamex_np with
     RENAME_EXCL on macOS, renameat2 with RENAME_NOREPLACE on Linux.  True when moved, False when the name is taken;
     TableError where the system or the file system has no such rename: refused rather than risk replacing a file, as
     the C code refuses."""
@@ -169,9 +169,9 @@ GDAL_SIDE_FILES = (".aux.xml", ".msk", ".ovr")     # statistics and metadata, an
 def set_aside(path):
     """A file a step is about to replace (an output of an earlier run, or its .done marker) is moved into
     _tmp_/<date>_<time>_<process>/ beside it, under its own name, and stays there: nothing a run replaces is
-    deleted or written over, as in the C code since v10.34.  A second file of one name in one run gets a number.
+    deleted or written over, as in the C implementation.  A second file of one name in one run gets a number.
     GDAL's side files <path>.aux.xml, .msk and .ovr go first, and whether or not the file itself is there, as the C
-    moves them (io_geotiff.c): left behind, GDAL would lay the old statistics, mask or overviews over the new file,
+    implementation moves them: left behind, GDAL would lay the old statistics, mask or overviews over the new file,
     also after a run that stopped between the two moves.  Returns where the file went, or None when there was none."""
     for suffix in GDAL_SIDE_FILES:
         _set_one_aside(path + suffix)
@@ -464,7 +464,7 @@ def _check_basin_rows(table, source):
     if has_area.any() and not has_area.all():
         raise TableError("%s gives an area for some basins and none for others" % source)
     if has_area.all():
-        # the order of the areas as the table writes them, six decimals: MERIT BasinFull v1.0
+        # the order of the areas as the table writes them, six decimals: MERIT-FullBasin v1.0
         # numbered its basins by that value, and its ids rise in the raw Float32 upa at 4,031,320 rows and at none
         # once rounded.  Only the pairs that rise as read are formatted again
         rising = np.flatnonzero(np.diff(area) > 0)

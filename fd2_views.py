@@ -34,7 +34,7 @@ their rows of the tables, and coloured so that no two neighbours share a number:
                    and the place of the object, then what the view adds (the cell count, cells_per_degree,
                    the rectangle of its cells, color_id); everything else is in the fine table at the row
                    the identifier names.  Written as GeoParquet (the default: ISO WKB, zstd, the "geo"
-                   entry of GeoParquet 1.1 without a crs entry, so OGC:CRS84), as GeoPackage, or both,
+                   entry of GeoParquet 1.1, without a crs entry -- so OGC:CRS84 -- on a WGS84 longitude-latitude grid), as GeoPackage, or both,
                    with the same rows and columns (--vector).
     colouring      color_id, an integer such that two objects that touch on the coarse mask (corners
                    included) never share it: the greedy colouring of the adjacency graph in the
@@ -62,7 +62,7 @@ import rasterio
 from numba import njit
 from rasterio.windows import Window
 
-from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, checking, timing, log, publish, read_block, read_table, write_json, write_table, ensure_directory,
+from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, checking, timing, log, open_raster, publish, read_block, read_table, write_json, write_table, ensure_directory,
                            basin_rectangles, group_windows_in_pixels)
 import fd_tables
 
@@ -75,7 +75,8 @@ VIEW_RULE_TAG = ("v9.63: the view holds the basins of at least its minimum area,
                  "largest of them (the smallest id) holding a quarter of that land; the region view follows the basin view")   # written into every view
 # the rule of the polygons and the boundary lines, written last among the
 # metadata items of every vector file (the polygons given to users must be OGC-valid)
-# (the C code's text, word for word: v10.35 outlines a basin astride the 180th meridian in one piece, 0.7.9 here)
+# (word for word the text the published files carry; a basin astride the 180th meridian is outlined in one piece
+# since 0.7.9)
 VECTOR_RULE_TAG = ("v10.35: the polygons are GDAL Polygonize's with 4-connected cells, OGC-valid (two cells that meet only at a corner are "
                    "two polygons of the MultiPolygon); the boundary lines are the outer rings of the 8-connected polygons, those of a "
                    "basin astride the 180th meridian made with the basin in one piece and cut at the meridian")
@@ -85,7 +86,7 @@ VIEW_ADDED_COLUMNS = ["coarse_grid_count", "cells_per_degree", "cell_row_min", "
 # the columns of the fine table that a view carries, by the identifier of its table (a vector
 # file keeps only the columns it needs, the table keeps everything): the identifier, the size and the place of the object; a name the
 # table does not have (level2_code in a Level-03 table, level1_code in either) is passed over; the boundary file
-# keeps the identifier alone
+# keeps the identifier, coarse_grid_count and cells_per_degree
 VIEW_TABLE_COLUMNS = {
     "basin_id": ["basin_id", "basin_area_km2", "outlet_lon", "outlet_lat"],
     "region_id": ["region_id", "cut_basin_id", "topological_level", "region_grid_count"],
@@ -393,7 +394,7 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
     for factor in factors:
         common = common * factor // math.gcd(common, factor)
     with contextlib.ExitStack() as stack:
-        fine = stack.enter_context(rasterio.open(fine_path))
+        fine = stack.enter_context(open_raster(fine_path))
         # the masks are unsigned; a signed one could hand the kernels a negative id, which Numba would take as an
         # index without a bounds check
         if fine.dtypes[0] not in ("uint8", "uint16", "uint32"):
@@ -418,7 +419,7 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                 raise FlowDivideError("the view holds %d basins, the fold covers %d ids" % (in_the_view, object_count_limit))
         basin_fine = None
         if rule == "region" and lookup is None:
-            basin_fine = stack.enter_context(rasterio.open(basin_fine_path))
+            basin_fine = stack.enter_context(open_raster(basin_fine_path))
             # the basin mask on the grid of the fine mask, and in its CRS
             if (basin_fine.width, basin_fine.height) != (fine_ncol, fine_nrow) or basin_fine.transform != fine.transform or \
                     basin_fine.crs != fine.crs:
@@ -435,7 +436,7 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                        "blockysize": RASTER_BLOCK, "compress": "DEFLATE", "predictor": 2, "BIGTIFF": "YES", "NUM_THREADS": GDAL_WRITE_THREADS}
             basin_view = None
             if rule == "region":
-                basin_view = stack.enter_context(rasterio.open(basin_view_path))
+                basin_view = stack.enter_context(open_raster(basin_view_path))
                 if (basin_view.width, basin_view.height) != (coarse_ncol, coarse_nrow) or basin_view.transform != transform or \
                         basin_view.crs != fine.crs:
                     raise FlowDivideError("the basin view %s is not the fold of %s at factor %d" % (basin_view_path, fine_path, factor))
@@ -552,7 +553,7 @@ def _adjacent_pairs_of_strip(strip, next_row, has_next_row, periodic, pair_a, pa
 def adjacent_pairs(coarse_path, periodic=False, strip_rows=None):
     """the pairs of objects that touch anywhere on the coarse mask, each once, as an (n, 2) array of ids"""
     pairs = []
-    with rasterio.open(coarse_path) as coarse:
+    with open_raster(coarse_path) as coarse:
         nrow = coarse.height
         ncol = coarse.width
         if strip_rows is None:
@@ -734,7 +735,7 @@ def _multipolygon_as_gdal_gives_it(polygons, cell_count, cell_area):
 
 def _ring_lines_across_the_seam(points, east_x, turn, tolerance):
     """One ring of an object's outline in a frame unrolled across the 180th meridian, as lines on the grid's own
-    longitudes (the C code's ring_lines_across_the_seam, v10.35): a point east of the grid's east edge (east_x) is
+    longitudes (as the C implementation draws them): a point east of the grid's east edge (east_x) is
     moved a turn west, and the ring is cut where it crosses that edge (a side along a row passes it at a grid line;
     the crossing point ends one line at east_x and starts the next at east_x less a turn).  A point on the edge is
     taken on its east_x side.  The ring's last line runs into its first when the ring was cut.  points: the ring's
@@ -776,7 +777,7 @@ def _ring_lines_across_the_seam(points, east_x, turn, tolerance):
 
 def outline_across_the_seam(rows_of_the_object, transform, row0, object_id=0):
     """The boundary lines of an object that holds cells in the first and the last column of a grid round the earth
-    (the C code's outline_across_the_seam, v10.35).
+    (as the C implementation outlines it).
 
     rows_of_the_object: the object's rows over the whole width of the grid, 1 where a cell is the object's.  The
     widest run of columns without a cell of it (going round) is found, and the columns are taken from the first
@@ -1054,7 +1055,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
         raise FlowDivideError("%s holds objects beyond the %d rows of this view: the mask was not made by the rule of this version" % (coarse_path, rows_in_the_view))
     # the objects list checked against the mask itself: every id with a cell is listed, with its count.  A list
     # that had lost a row would draw that object as an empty geometry of 0 cells and publish it
-    with rasterio.open(coarse_path) as coarse_dataset:
+    with open_raster(coarse_path) as coarse_dataset:
         counted = np.zeros(max(rows_in_the_view, int(present_ids.max()) if present_ids.size else 0) + 1, np.int64)
         for strip_row0 in range(0, coarse_dataset.height, 4096):
             strip_count = min(4096, coarse_dataset.height - strip_row0)
@@ -1081,7 +1082,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
     log(tag, "%s: %d objects with cells of the %d rows, %d neighbouring pairs, degeneracy %d, %d colours" % (coarse_path, present_ids.size, rows_in_the_view, pairs.shape[0], degeneracy, largest_colour))
     kept = columns_the_view_keeps(table, id_column)
     boundary_kept = columns_the_view_keeps(table, id_column, identifier_only=True)
-    with rasterio.open(coarse_path) as coarse:
+    with open_raster(coarse_path) as coarse:
         transform = coarse.transform
         crs = coarse.crs
         in_memory = coarse.width * coarse.height * 4 <= memory_limit_bytes
@@ -1118,7 +1119,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
                 # rest at a corner only is not a ring of its own (it would show as a dot inside the Mississippi)
                 if periodic and col0 == 0 and col1 == coarse.width:
                     # cells in the first and the last column of a grid round the earth: the object lies astride the
-                    # 180th meridian and is outlined in one piece (0.7.9, as the C code since v10.35)
+                    # 180th meridian and is outlined in one piece (0.7.9, as in the C implementation)
                     boundary_geometries.append(MultiLineString([LineString(line) for line in
                                                                 outline_across_the_seam(mask, transform, row0, object_id)]))
                 else:
@@ -1322,7 +1323,7 @@ def _tick_values(low, high, at_most=5):
 
 
 def _extent_of(path):
-    with rasterio.open(path) as dataset:
+    with open_raster(path) as dataset:
         t = dataset.transform
         return (t.c, t.c + dataset.width * t.a, t.f + dataset.height * t.e, t.f)
 
@@ -1331,7 +1332,7 @@ def _read_view(path, view=None, max_pixels=4000):
     """a coarse raster (or its part inside the view in degrees) with its extent, read at most max_pixels
     wide or high: a larger one is read decimated (every k-th cell), which is all a printed panel can show"""
     from rasterio.enums import Resampling
-    with rasterio.open(path) as dataset:
+    with open_raster(path) as dataset:
         t = dataset.transform
         if view is None:
             col0, row0, col1, row1 = 0, 0, dataset.width, dataset.height

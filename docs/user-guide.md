@@ -38,7 +38,7 @@ of this repository; download them from their producers and use them under their 
     export FLOWDIVIDE_MERIT=/data/merit/dir_global_90m.tif
     export FLOWDIVIDE_MERIT_ACC=/data/merit/upg_global_90m.tif     # MERIT Hydro's upstream pixel count
     export FLOWDIVIDE_MERIT_ACA=/data/merit/upa_global_90m.tif     # MERIT Hydro's upstream area
-    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/outlets.csv      # the outlet table of MERIT BasinFull, whose basin ids a re-run carries over
+    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/outlets.csv      # the outlet table of MERIT-FullBasin, whose basin ids a re-run carries over
     export FLOWDIVIDE_HYBAS=/data/hybas/L3                         # hybas_<xx>_lev03_v1c.shp (or --hybas-root)
 
 There are no default paths: a run of a built-in grid whose inputs are not set stops and names the
@@ -85,7 +85,7 @@ on the machine), measured with 0.7.7, whose FD3 this version keeps:
 
 | Capacity | Peak | Seconds | 0.7.6 |
 |---|---|---|---|
-| 2^31 (160 deg²) | 22.3 GB | 2,765 | not measured; the code of the paper's runs (0.6) was stopped for memory on a 64 GB machine |
+| 2^31 (160 deg²) | 22.3 GB | 2,765 | not measured; the code of the paper's runs (the pre-release 0.6) was stopped for memory on a 64 GB machine |
 | 2^30 (80 deg²) | 14.2 GB | 2,404 | 23.3 GB, 2,699 s |
 | 2^29 (40 deg²) | 8.8 GB | 2,544 | 16.0 GB, 2,627 s |
 
@@ -107,6 +107,19 @@ at 1,400 deg²).
 
 The HydroSHEDS ACC mosaic of a built-in grid can be replaced by a count made from the flow directions
 (`--acc`); the upstream area stays the provider's.
+
+### GDAL's threads
+
+The package compresses the rasters it creates on every core (`FLOWDIVIDE_GDAL_NUM_THREADS` sets another number) and
+decodes the GeoTIFFs whose pixels it reads on the thread that asks for them: it opens each with GDAL's open option
+`NUM_THREADS=1`, so `GDAL_NUM_THREADS` does not reach those reads, on the command line or in a script of one's own.
+The reason is GDAL 3.6: when it decodes on its own threads while a raster is being written piece by piece, a
+decoding thread that needs room in the block cache can wait for ever for a compression, and the run stands still
+without an error. For the same reason fd1.4 creates the Level-03 raster on one thread; GDAL reads it back for every
+layer after the first. Neither changes a pixel. Three things the option does not reach: an input that is not a
+GeoTIFF (a VRT over tiles, say), overviews kept in a file of their own (`.ovr`), and a dataset that a script of
+one's own opens and hands to a function of the package (open it with `fd1_partition.open_raster`). With the first
+two, leave GDAL without a setting for threads, in the environment and in its configuration.
 
 ## Any baseline hydrography
 
@@ -281,8 +294,9 @@ basin held in memory (about 49 bytes per channel pixel; the Amazon's 140 million
 some 7 GB), and a stem with fewer than four channel tributaries — or whose fourth could be outranked
 by a tributary below the threshold — is walked again over every pixel through a block cache; the pieces come out the same.
 
-In stage 3, a block of the output raster that several regions' windows reach is held in memory, in the
-raster's own type, until the last of those regions has been visited, and the arrays of a region's window
+In stage 3, a block of the output raster that several regions' windows reach is held, in the raster's own
+type, until the last of those regions has been visited (in memory up to `FLOWDIVIDE_HELD_MEMORY_MB`, on disk
+beyond it), and the arrays of a region's window
 are released before the next window is read. The log of each region gives the blocks held in memory.
 
 Known costs of this version: the per-basin arrays of the vote and of the views are dense (about 2.4 GB
@@ -341,9 +355,9 @@ can run all three ways on; the results are in `compare_python.txt` of the case d
 
 ## What the C programs do that the package does not
 
-The partitions published at <https://fullhydro.org> were computed by a C implementation of the same workflow (the
-FullHydro C code, not part of this repository). The package follows its version 10.35, with these differences, none
-of which changes a published partition or attribute:
+The partitions published at <https://fullhydro.org> were computed by a C implementation of the same workflow, which is
+not part of this repository. The package follows it, with these differences, none of which
+changes a published partition or attribute:
 
 - **Earth model.** The C programs can measure on a sphere as well as on the WGS84 ellipsoid; the package measures
   on the WGS84 ellipsoid (and on MERIT Hydro's own areas for that grid).
@@ -354,6 +368,9 @@ of which changes a published partition or attribute:
 - **`--merge balanced`.** When two parts can join, the package takes the join with the most land, the C code the
   join with the largest window. The published partitions do not use this policy (HydroSHEDS: none; MERIT Hydro:
   level2).
+- **GDAL's threads.** The C programs read most rasters on GDAL's threads and hand every written piece to the
+  compression as soon as it is written (64-bit integer rasters, the merge of MERIT Hydro's tiles and fd1.4 are on
+  one thread); the package reads the GeoTIFFs it opens on the calling thread ([GDAL's threads](#gdals-threads)).
 - **The size of a region.** As in the C code, a region's window with its ring of one pixel must fit a 32-bit index
   (2³¹ − 1 pixels); a larger window is refused when the attributes are computed. The package refuses it for the
   longest flow path as well; the C program of the longest flow path alone takes a larger window.
@@ -374,11 +391,12 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_fd3_seam_and_reuse.py             # a basin across the seam of a periodic grid; a partition reused
     python test_fd2_outline_across_the_seam.py    # the outline of an object across the 180th meridian (0.7.9)
     python test_fine_grids_and_run_lock.py        # very fine geographic grids; the lock of a run (0.7.9)
+    python test_gdal_threads.py                   # the burn of two layers and writes between reads on GDAL's threads (1.1.0)
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first twelve need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first thirteen need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their

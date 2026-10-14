@@ -16,9 +16,10 @@ is computed once per region, exactly, with one value crossing each cut:
     Since 0.7.7 the window holds the flow directions (and the channel mask) only, and everything else
     is held for the region's own pixels (section [2c]), as in the C programs;
 
-    every member (a whole basin, or a piece of a cut basin) is walked from its outlet upstream, depth
-    first, with an explicit stack; the walk never enters a child piece (its outlet pixel is blocked),
-    but reads the child's outlet as one more donor, and the value that crosses the cut is the value
+    every member (a whole basin, or a piece of a cut basin) is taken from its outlet upstream: the five
+    swept attributes number its pixels in a visiting order and sweep the rule over them (sections [2b] and
+    [2c]), the longest flow path walks its paths; neither enters a child piece (its outlet pixel is
+    blocked), but reads the child's outlet as one more donor, and the value that crosses the cut is the value
     written at that pixel by the region visited before;
 
     the swept attributes put only the region's own pixels into the output blocks, and the longest flow
@@ -68,7 +69,7 @@ from numba import njit
 from rasterio.windows import Window
 
 import fd_tables
-from fd1_partition import (DROW, DCOL, IS_LAND, IS_TERMINAL, MERIT_NODATA, FlowDivideError, Grid, RASTER_BLOCK, check_merit_flow_directions, earth_distance_m, log, publish,
+from fd1_partition import (DROW, DCOL, IS_LAND, IS_TERMINAL, MERIT_NODATA, FlowDivideError, Grid, RASTER_BLOCK, check_merit_flow_directions, earth_distance_m, log, open_raster, publish,
                            raster_profile, read_block, read_table, timing, write_block, write_json, write_table, ensure_directory)
 
 PATH_FRAMES = 1 << 22         # the points lfp's path buffers start with (doubled for a longer path)
@@ -289,9 +290,11 @@ class Partition:
         raster_min_basin_area_km2: the basins of at least this area are computed into the
         raster, those of at least min_basin_area_km2 are listed in the tables.  The distance to the outlet and the
         upstream flow length cover every basin however small (0), their tables the basins of 1 km2 and more; the other
-        classes take None, the same area for both.  A basin below min_basin_area_km2 is never cut (a basin is cut only
-        when its window exceeds the capacity), so it is one whole member in one region: such basins are kept as arrays
-        gathered by region (small_*), not as Member objects, because North America holds some thirty million of them."""
+        classes take None, the same area for both.  A basin is cut only when its window exceeds the capacity, whatever
+        its area, so a basin below min_basin_area_km2 is nearly always one whole member in one region: such basins
+        are kept as arrays gathered by region (small_*), not as Member objects, because North America holds some
+        thirty million of them; one that is cut (possible when min_basin_area_km2 is set above a cut basin's area)
+        stays an object."""
         self.grid = grid
         # every check of the basin table, but only the columns read here kept in memory
         basins = fd_tables.read_basin_table_columns(basin_table_path, PARTITION_BASIN_COLUMNS)
@@ -379,8 +382,8 @@ class Partition:
                 steps += 1
                 if steps > len(self.members):
                     raise FlowDivideError("the pieces of basin %d flow into each other in a cycle" % member.basin_id)
-        # a cut basin has one piece without a parent, and it ends at the basin's outlet (the C's
-        # main_hydrosheds30m_fd3_3_derive_lfp_from_regions.c refuses a chain whose root's outlet is not the basin's): a
+        # a cut basin has one piece without a parent, and it ends at the basin's outlet (the C implementation
+        # refuses a chain whose root's outlet is not the basin's): a
         # root piece that ended a pixel short gave a longest flow path a pixel short, within its length's tolerance
         for basin_id, basin in self.basins.items():
             if int(region_of_basin[basin_id]) != 0:
@@ -803,7 +806,7 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
 #  The six provided attributes no longer build the order over the whole window.  The window holds the
 #  flow directions (one byte a pixel), the channel mask when the class lives on the network (one byte),
 #  and, while the structure is built, the number of every pixel of this region (int32): four arrays
-#  over the window shrank to one, as in the C code (its FD3, compact_the_pixels_of_the_region).
+#  over the window shrank to one, as in the C code.
 #  Everything else is held for the pixels of the region only, in the order they are numbered:
 #      pixel_of_compact       int32, the window pixel
 #      member_of_compact      int32, the member (its index among the region's outlets)
@@ -1312,7 +1315,8 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     member_rows = []
     states = {}                      # member_id -> the value that crosses its cut, in full precision
     # which visit writes each block of the raster last: a block no later region will touch goes out as
-    # soon as this region has filled it, the others are held in memory until their last region has
+    # soon as this region has filled it, the others are held (in memory up to the budget of
+    # the held blocks, on disk beyond it) until their last region has
     last_writer = np.full(((grid.nrow + RASTER_BLOCK - 1) // RASTER_BLOCK,
                            (grid.ncol + RASTER_BLOCK - 1) // RASTER_BLOCK), -1, np.int32)
     for visit, region_id in enumerate(regions_in_order):
@@ -1339,14 +1343,14 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     # read by row and column
     opened = []
     try:
-        dir_dataset = rasterio.open(dir_path)
+        dir_dataset = open_raster(dir_path)
         opened.append(dir_dataset)
         out_dataset = rasterio.open(temporary, "w", **dict(profile, BIGTIFF="YES"))
         opened.append(out_dataset)
-        channel_dataset = rasterio.open(channel_path) if spec["channel"] else None
+        channel_dataset = open_raster(channel_path) if spec["channel"] else None
         if channel_dataset is not None:
             opened.append(channel_dataset)
-        area_dataset = rasterio.open(area_path) if spec["area"] else None
+        area_dataset = open_raster(area_path) if spec["area"] else None
         if area_dataset is not None:
             opened.append(area_dataset)
         _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dataset, area_dataset)
@@ -1822,7 +1826,7 @@ class RegionWindow:
         self.ncol = rectangle[3] - rectangle[2]
         self.grid = grid
         # a pixel of the window is named by a 32-bit index in the sweeps (downstream, order, member, the compact
-        # numbering), so the window must fit one, as in the C code (fd3 "more than an int32 can name"); until 0.7.8
+        # numbering), so the window must fit one, as in the C code; until 0.7.8
         # a window past 2^31 - 1 pixels, from a capacity above 2^31, would have run on and wrapped the indices
         if self.nrow * self.ncol > 2 ** 31 - 1:
             raise FlowDivideError("the window %s holds %d pixels, more than a 32-bit index can name; the attributes "
@@ -1929,8 +1933,8 @@ class RegionWindow:
         """The region's pixels written into a raster that is still being created, so that nothing is ever
         read back: in create mode GDAL compresses a block inside the write call, while in update mode it
         keeps the block dirty until the close, which on basin 4 cost 59 to 79 s a region set.
-        A block a later region will also write is held whole in memory until that region has put its
-        pixels in; `last_writer` says which visit writes each block last.  With mine None the whole window
+        A block a later region will also write is held whole (in memory up to the budget of `held`, on disk
+        beyond it) until that region has put its pixels in; `last_writer` says which visit writes each block last.  With mine None the whole window
         goes back in one call, which is what the drivers that own their whole window do."""
         if mine is None:
             values = self.out
@@ -2220,7 +2224,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # while the distance table it reuses listed the right members)
     outlet_cells = np.unique(np.asarray([m.outlet_row * grid.ncol + m.outlet_col % grid.ncol
                                          for m in partition.members.values()], np.int64))
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "r+") as out_dataset:
+    with open_raster(dir_path) as dir_dataset, open_raster(temporary, "r+") as out_dataset:
         for visit, region_id in enumerate(order):
             # .get: a partition read for the distance or the upstream flow length (raster_min_basin_area_km2=0) also
             # lists regions of small basins only, which hold no member and no path
@@ -2293,7 +2297,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
         head_lon, head_lat = _table_lon_lat(grid, head["head_row"], head_col)
         rows.append({"basin_id": basin_id, "outlet_row": basin["outlet_row"], "outlet_col": basin["outlet_col"],
                      "outlet_lon": outlet_lon, "outlet_lat": outlet_lat,
-                     # the length the distance walk found (largest_distance_m); the
+                     # the length the distance walk found; the
                      # painted length is only checked against it above (the two sum in other orders)
                      "basin_area_km2": basin["area_km2"], "longest_flow_path_m": head["length_m"], "path_grid_count": count, "head_row": head["head_row"], "head_col": head_col,
                      "head_lon": head_lon, "head_lat": head_lat})
@@ -2425,9 +2429,9 @@ def _derive_user_attribute(code, partition, dir_path, out_path, table_path, chan
     with rasterio.open(temporary, "w", **raster_profile(grid, spec["dtype"], spec["nodata"])):
         pass
     rows = []
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "r+") as out_dataset, \
-            (rasterio.open(channel_path) if spec["channel"] else _nothing()) as channel_dataset, \
-            (rasterio.open(area_path) if spec["area"] else _nothing()) as area_dataset:
+    with open_raster(dir_path) as dir_dataset, open_raster(temporary, "r+") as out_dataset, \
+            (open_raster(channel_path) if spec["channel"] else _nothing()) as channel_dataset, \
+            (open_raster(area_path) if spec["area"] else _nothing()) as area_dataset:
         # the same grid checks as the provided attributes (an ACA one pixel east would reach the registered kernel
         # pixel for pixel)
         _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dataset, area_dataset)

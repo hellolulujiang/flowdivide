@@ -207,7 +207,7 @@ def main():
     axes[2].set_yticklabels([])
 
     if os.environ.get("FLOWDIVIDE_NO_SAVE"):
-        return                            # the overlap lint runs the script and only inspects the figure
+        return                            # the figure drawn and not saved, to check its layout
     out_path = style.figure_path(FIGURE_DIRECTORY, "fig_05_regions_three_capacities")
     figure.savefig(out_path, dpi=400, bbox_inches="tight", pad_inches=0.02)
     print(out_path)

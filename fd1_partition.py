@@ -76,7 +76,7 @@ MERIT_CODE_OF_DIRECTION = {"E": 1, "SE": 2, "S": 4, "SW": 8, "W": 16, "NW": 32, 
 # out of the grid).  A coding not listed here is given on the command line as --direction-codes with
 # --sink-code, --nodata-code and --mouth-code.
 DIRECTION_CONVENTIONS = {
-    # MERIT Hydro, and the ESRI order every raster GIS writes: 1 E, 2 SE, 4 S ... 128 NE
+    # MERIT Hydro, and the ESRI order: 1 E, 2 SE, 4 S ... 128 NE
     "merit": {"codes": dict(MERIT_CODE_OF_DIRECTION), "sink": MERIT_SINK, "nodata": MERIT_NODATA, "mouth": MERIT_MOUTH},
     "esri": {"codes": dict(MERIT_CODE_OF_DIRECTION), "sink": None, "nodata": 255, "mouth": 0},
     # HydroSHEDS v2: the same eight codes, but 0 is an inland sink, 255 is no data and a coastal outlet
@@ -93,7 +93,7 @@ DIRECTION_CONVENTIONS = {
 
 def direction_convention(name, codes=None, sink=None, nodata=None, mouth=None):
     """The coding of a flow-direction grid: a name of DIRECTION_CONVENTIONS, or "custom" with codes given
-    as "E=1,SE=2,..." (the eight directions E SE S SW W NW N NE, every code a byte).  sink, nodata and
+    as "E=1,SE=2,..." (the eight directions E SE S SW W NW N NE, every code an integer from 0 to 65535).  sink, nodata and
     mouth override the named coding's values, so a producer who writes the ESRI codes with a nodata of
     247 and no sink needs no new name in this file.  Returns a dict with the eight codes, sink, nodata
     and mouth, every value an int or None."""
@@ -204,6 +204,35 @@ def log(tag, message):
     print("[%s] %s  %s" % (tag, time.strftime("%H:%M:%S"), message), flush=True)
 
 
+def open_raster(path, mode="r"):
+    """the raster at `path` opened to be read ("r") or to be read and written in place ("r+").  A GeoTIFF, whatever
+    its name, is opened with the open option NUM_THREADS=1 (1.1.0): GDAL then decodes its tiles on the thread that
+    asks for them, whatever GDAL_NUM_THREADS says in the environment or in GDAL's configuration (an open option is
+    looked at first).  Every raster whose pixels the package itself reads or updates is opened here (the look at
+    the driver below and the three places of fd1.4 that ask GDAL for a raster's size and georeference read no
+    pixel); a dataset a caller hands to a function of the package (read_block, the windows of FD3) is the caller's,
+    and should be opened here too.
+    The steps write a compressed raster piece by piece and read other rasters between the pieces.  When a setting
+    asks GDAL for more than one thread, GDAL 3.6 decodes a read of several tiles on its own threads; one of them that
+    needs room in the block cache pushes out a written tile, waits for a free thread to compress it and holds the
+    lock the other decoding threads wait for, and the run stands still without an error (six runs of six on a
+    synthetic raster with GDAL 3.6.2 and GDAL_NUM_THREADS=8, none without the variable).  Where no setting asks for
+    threads GDAL reads on the calling thread already, and nothing changes for such a run.  A raster the package
+    creates ("w") is still given GDAL_WRITE_THREADS for its compression; one it opens again to update ("r+")
+    compresses on the calling thread, as it did where no setting asked for threads.
+    Not covered: a raster in another format (the VRT driver does not take the option, and opens its sources itself)
+    and the overviews of a GeoTIFF kept in a file of their own (.ovr), which GDAL opens without the option.  With
+    such inputs, leave GDAL without a setting for threads."""
+    try:
+        with rasterio.open(path) as looked_at:      # which driver takes it: the name does not say
+            is_geotiff = looked_at.driver == "GTiff"
+    except rasterio.errors.RasterioIOError:
+        is_geotiff = False                          # not there, or no raster: the open below says so, as in 1.0.0
+    if is_geotiff:
+        return rasterio.open(path, mode, NUM_THREADS=1)
+    return rasterio.open(path, mode)
+
+
 def ensure_directory(path):
     os.makedirs(path, exist_ok=True)
     return path
@@ -265,7 +294,8 @@ def pixel_area_m2_at_latitude_merit(lat_deg, pixel_width_deg, pixel_height_deg):
 
 
 # The earth models the package computes pixel areas under.  Only the area differs: lengths and distances
-# (lfp, lup, the perimeter) stay on the exact ellipsoid in both.
+# (ldn, lup, lfp) are measured the same way under both (earth_distance_m: the haversine on the authalic sphere,
+# scaled to the ellipsoid at the mid-latitude).
 #   "wgs84-zone"  the exact area of the pixel on the WGS84 ellipsoid: the most correct number, and what
 #                 every product of ours is published with
 #   "merit"       MERIT Hydro's own, above: kept for comparing our upstream area with MERIT's upa
@@ -300,6 +330,13 @@ def earth_distance_m(lat1, lon1, lat2, lon2):
     la1 = lat1 * to_rad
     la2 = lat2 * to_rad
     a = math.sin(dlat / 2.0) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(dlon / 2.0) ** 2
+    # rounding must not carry a above 1 (1.1.0, as in the C implementation): for two points opposite each other, or
+    # within rounding of it, a can come out one unit in the last place above 1, and the root of 1 - a, and with it the
+    # distance, was then not a number.  A value up to 1 is left as it is, so every distance that was a number is the
+    # number it was; the package measures between neighbouring pixels, which are that far apart on no grid finer than
+    # half the globe a pixel
+    if a > 1.0:
+        a = 1.0
     d_sphere = R_AUTHALIC * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
     if d_sphere <= 0.0:
         return d_sphere
@@ -326,7 +363,7 @@ class Grid:
 
     def __init__(self, path, periodic=False, block_pixels=None, earth_model=EARTH_MODEL_WGS84_ZONE):
         self.path = path                  # the flow directions the grid was read from (regions_final reads them)
-        with rasterio.open(path) as dataset:
+        with open_raster(path) as dataset:
             self.nrow = dataset.height
             self.ncol = dataset.width
             self.transform = dataset.transform
@@ -637,8 +674,8 @@ def publish(temporary_path, final_path):
     if not os.path.exists(temporary_path):
         raise FlowDivideError("%s was not written: %s keeps what it holds" % (temporary_path, final_path))
     fd_tables.set_aside(final_path)
-    # a move that never replaces a file: one that appeared in the meantime stops the step (the C's
-    # pipeline_rename_exclusive)
+    # a move that never replaces a file: one that appeared in the meantime stops the step (as in the C
+    # implementation)
     if not fd_tables.move_without_replacing(temporary_path, final_path):
         raise FlowDivideError("%s appeared while it was being made; the new file is left at %s" % (final_path, temporary_path))
 
@@ -866,7 +903,7 @@ def refuse_tiles_that_overlap(tile_paths):
     extents = []
     pixel_width = pixel_height = None
     for path in tile_paths:
-        with rasterio.open(path) as dataset:
+        with open_raster(path) as dataset:
             if pixel_width is None:
                 pixel_width = dataset.transform.a
                 pixel_height = dataset.transform.e
@@ -895,7 +932,7 @@ def assemble_tiles(tile_paths, out_path, nodata_value, tag="fd1.0"):
     crs = None
     tile_dtype = None
     for path in tile_paths:
-        with rasterio.open(path) as dataset:
+        with open_raster(path) as dataset:
             if dataset.transform.b != 0.0 or dataset.transform.d != 0.0 or dataset.transform.e >= 0.0 or dataset.transform.a <= 0.0:
                 raise FlowDivideError("the tile %s is rotated or not north-up; only north-up tiles are assembled" % path)
             # any integer type fd1.0 takes, kept as it is and recoded after, as for a single file: tiles held to
@@ -934,7 +971,7 @@ def assemble_tiles(tile_paths, out_path, nodata_value, tag="fd1.0"):
     with rasterio.open(temporary, "w", **profile) as out:
         # the file starts as all nodata; every tile is copied in strips onto its place in the lattice
         for path in tile_paths:
-            with rasterio.open(path) as dataset:
+            with open_raster(path) as dataset:
                 col0 = int(round((dataset.transform.c - x_left) / pixel_width))
                 row0 = int(round((dataset.transform.f - y_top) / pixel_height))
                 if abs((dataset.transform.c - x_left) / pixel_width - col0) > 1e-6 or abs((dataset.transform.f - y_top) / pixel_height - row0) > 1e-6:
@@ -962,7 +999,7 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
     merit_code_of_byte = merit_code_table_of(coding)
     native_nodata = coding["nodata"]
     grid = Grid(native_path, periodic=periodic)
-    with rasterio.open(native_path) as source:
+    with open_raster(native_path) as source:
         # any integer raster: a coding in degrees does not fit a byte, and GRASS writes its directions in a CELL
         # raster, and any baseline hydrography is supported
         if source.dtypes[0] not in ("uint8", "int8", "uint16", "int16", "uint32", "int32", "int64", "uint64"):
@@ -972,7 +1009,7 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
     profile = raster_profile(grid, "uint8", MERIT_NODATA, predictor=False)
     temporary = fd_tables.free_name(out_path + ".partial.tif")
     counts = np.zeros(9, np.int64)
-    with rasterio.open(native_path) as source, rasterio.open(temporary, "w", **profile) as out:
+    with open_raster(native_path) as source, rasterio.open(temporary, "w", **profile) as out:
         for row0 in range(0, grid.nrow, strip_rows):
             nrow = min(strip_rows, grid.nrow - row0)
             halo = read_halo_tile(source, row0, nrow, 0, grid.ncol, periodic, native_nodata, dtype=np.int32)
@@ -989,8 +1026,8 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
         raise FlowDivideError("%d pixels carry a value that is no direction, no outlet and no nodata under the %s convention (%s)" % (counts[4], convention, coding))
     if convention == "merit" and counts[6] != counts[3]:
         # MERIT Hydro writes a river mouth (0) where the land ends: a direction pointing into nodata or off the grid
-        # is then a missing tile or a grid cut through its basins, and the C code refuses it
-        # (fd1.0 verify_dir_merit_convention).  Until 0.7.8 such a pixel was made a river mouth without a word
+        # is then a missing tile or a grid cut through its basins, and the C implementation refuses it
+        # (its check of fd1.0).  Until 0.7.8 such a pixel was made a river mouth without a word
         # beyond the report's count
         raise FlowDivideError("%d direction codes point into nodata or off the grid; in the MERIT convention a river mouth (0) "
                               "is written there, so the grid is not what it claims (a missing tile, or a window cut through "
@@ -1000,7 +1037,7 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
         raise FlowDivideError("the recode counts do not add up: %s" % report)
     # the output read back and counted again (a check, timed on its own)
     read_back = np.zeros(5, np.int64)
-    with checking(), rasterio.open(temporary) as check:
+    with checking(), open_raster(temporary) as check:
         for row0 in range(0, grid.nrow, strip_rows):
             nrow = min(strip_rows, grid.nrow - row0)
             _count_merit_strip(check.read(1, window=Window(0, row0, grid.ncol, nrow)), read_back)
@@ -1438,12 +1475,12 @@ def _pass_two_accumulate_area_only(halo_dir, order, inlet_local, arriving_area, 
 
 def fd1_1_upstream_area(dir_path, aca_path, str_path, grid, tile=WORK_TILE_DEFAULT, channel_threshold_km2=1.0, tag="fd1.1_aca"):
     """the upstream area alone (Int64 square metres, nodata 0) and the channel mask, on the grid of DIR:
-    the accumulation class of Table 1/3 as one standalone, separately timed kernel (for Figure 8's
+    the accumulation class of Table 1/3 as one standalone, separately timed kernel (for Figure 7's
     four featured kernels: accumulation, labelling, maximum, stream order).  Everything
     but the upstream pixel count of fd1_1_flow_accumulation, so that this kernel's own time is not the
     combined acc+aca+str pass but the accumulation alone; the tiling, the exit graph and the topological
     order inside a tile are shared in spirit with fd1_1_flow_accumulation but written out again here
-    rather than parameterised over what to accumulate (no shared kernel, project style)."""
+    rather than parameterised over what to accumulate (no shared kernel)."""
     started = time.time()
     check_work_tile(tile)
     tiles = tiles_of_grid(grid, tile)
@@ -1452,7 +1489,7 @@ def fd1_1_upstream_area(dir_path, aca_path, str_path, grid, tile=WORK_TILE_DEFAU
     off_grid_total = 0
     into_nodata_total = 0
     # pass 1
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -1502,7 +1539,7 @@ def fd1_1_upstream_area(dir_path, aca_path, str_path, grid, tile=WORK_TILE_DEFAU
     threshold_m2 = np.float32(channel_threshold_km2 * 1e6)
     aca_temporary = fd_tables.free_name(aca_path + ".partial.tif")
     str_temporary = fd_tables.free_name(str_path + ".partial.tif")
-    with rasterio.open(dir_path) as dir_dataset, \
+    with open_raster(dir_path) as dir_dataset, \
             rasterio.open(aca_temporary, "w", **raster_profile(grid, "int64", 0)) as aca_out, \
             rasterio.open(str_temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)) as str_out:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
@@ -1585,7 +1622,7 @@ def fd1_1_flow_accumulation(dir_path, acc_path, aca_path, str_path, grid, tile=W
     off_grid_total = 0
     into_nodata_total = 0
     # pass 1
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -1638,7 +1675,7 @@ def fd1_1_flow_accumulation(dir_path, acc_path, aca_path, str_path, grid, tile=W
     acc_temporary = fd_tables.free_name(acc_path + ".partial.tif")
     aca_temporary = fd_tables.free_name(aca_path + ".partial.tif")
     str_temporary = fd_tables.free_name(str_path + ".partial.tif")
-    with rasterio.open(dir_path) as dir_dataset, \
+    with open_raster(dir_path) as dir_dataset, \
             rasterio.open(acc_temporary, "w", **raster_profile(grid, "int64", 0)) as acc_out, \
             rasterio.open(aca_temporary, "w", **raster_profile(grid, "int64", 0)) as aca_out, \
             rasterio.open(str_temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)) as str_out:
@@ -1683,7 +1720,7 @@ def fd1_1_channel_mask_from_area(aca_path, str_path, grid, channel_threshold_km2
         strip_rows = strip_rows_for(grid.ncol)
     temporary = fd_tables.free_name(str_path + ".partial.tif")
     channel_pixels = 0
-    with rasterio.open(aca_path) as aca_dataset:
+    with open_raster(aca_path) as aca_dataset:
         # on the grid, not only of its size: the origin, the pixel and the CRS (an ACA one pixel to the east would
         # give a channel mask one pixel off)
         check_raster_on_the_grid(aca_dataset, grid, aca_path)
@@ -1804,7 +1841,7 @@ def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cu
     rows_list = []
     cols_list = []
     kinds_list = []
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for row0 in range(0, grid.nrow, strip_rows):
             nrow = min(strip_rows, grid.nrow - row0)
             strip = dir_dataset.read(1, window=Window(0, row0, grid.ncol, nrow))
@@ -1834,7 +1871,7 @@ def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cu
     run_ends = np.append(run_starts[1:], outlet_count)
     count_read_at_outlet = np.zeros(outlet_count, np.float64)    # as the raster holds it
     area_at_outlet = np.zeros(outlet_count, np.float64)
-    with rasterio.open(acc_path) as acc_dataset, rasterio.open(aca_path) as aca_dataset:
+    with open_raster(acc_path) as acc_dataset, open_raster(aca_path) as aca_dataset:
         check_raster_on_the_grid(acc_dataset, grid, acc_path)
         check_raster_on_the_grid(aca_dataset, grid, aca_path)
         blocks_read = 0
@@ -2160,7 +2197,7 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
     records = TilePassRecords()
     empty_mask = np.zeros((1, 1), np.uint32)
     # pass A
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -2208,7 +2245,7 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
     col_min_shift = np.full(basin_count + 1, np.iinfo(np.int32).max, np.int32)
     col_max_shift = np.full(basin_count + 1, -1, np.int32)
     temporary = fd_tables.free_name(bsn_path + ".partial.tif")
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "uint32", 0)) as bsn_out:
+    with open_raster(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "uint32", 0)) as bsn_out:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -2328,12 +2365,22 @@ def _burn_level3_layers(dir_path, temporary, layers, tag):
     """the empty output on the grid of DIR
     (DIR's size, geotransform and spatial reference, 512 x 512 tiles, UInt16, nodata 0), and every layer burned
     into it in the order given.  The output and the polygon files are closed on the way out, the output first.
-    Returns the codes the layers hold and their polygon count."""
+    Returns the codes the layers hold and their polygon count.
+    The output is created on one thread, and GDAL_NUM_THREADS is 1 for this thread from the creation to the close
+    (1.1.0, as in the C implementation).  GDAL burns layer after layer and reads the output back chunk by chunk
+    for each; created with NUM_THREADS=ALL_CPUS, as until 1.0.0, GDAL 3.6 decoded those chunks on its own threads,
+    and with a second layer and an output larger than GDAL's block cache one of them waited for a compression that
+    no thread was free to do: the burn stood still without an error (three runs of six on a synthetic grid with
+    GDAL 3.6.2).  The pixels burned are the same.  The output has no threads of its own from its creation, so it
+    does not matter whether it is closed before or after the thread's setting is put back (an exception GDAL raises
+    can hold it open until the exception is gone)."""
     from osgeo import gdal
     codes_seen = set()
     polygon_count = 0
     sources = []
     output = None
+    threads_before = gdal.GetThreadLocalConfigOption("GDAL_NUM_THREADS", None)
+    gdal.SetThreadLocalConfigOption("GDAL_NUM_THREADS", "1")
     try:
         for path, query in layers:
             source, layer, layer_polygons = _open_level3_layer(path, query, codes_seen, tag)
@@ -2356,7 +2403,7 @@ def _burn_level3_layers(dir_path, temporary, layers, tag):
         output = gdal.GetDriverByName("GTiff").Create(
             temporary, ncol, nrow, 1, gdal.GDT_UInt16,
             options=["TILED=YES", "BLOCKXSIZE=512", "BLOCKYSIZE=512", "COMPRESS=DEFLATE", "PREDICTOR=2", "ZLEVEL=6",
-                     "BIGTIFF=YES", "SPARSE_OK=TRUE", "NUM_THREADS=ALL_CPUS"])
+                     "BIGTIFF=YES", "SPARSE_OK=TRUE", "NUM_THREADS=1"])
         if output is None:
             raise FlowDivideError("cannot create %s" % temporary)
         if (output.SetGeoTransform(geotransform) != 0 or output.SetProjection(projection) != 0 or
@@ -2368,6 +2415,7 @@ def _burn_level3_layers(dir_path, temporary, layers, tag):
                 raise FlowDivideError("the burn of %s failed" % path)
     finally:
         output = None                                   # the close writes the tiles out
+        gdal.SetThreadLocalConfigOption("GDAL_NUM_THREADS", threads_before)     # None: no setting of this thread's own
         source = layer = None                           # the loop's names hold the last file too
         sources = None
     return codes_seen, polygon_count
@@ -2441,7 +2489,7 @@ def fd1_4_rasterise_level3(dir_path, l3_path, grid, layers, strip_rows=None, tag
     if strip_rows is None:
         strip_rows = max(RASTER_BLOCK, min(4096, 500000000 // grid.ncol))
     counts = {}
-    with rasterio.open(temporary) as written:
+    with open_raster(temporary) as written:
         for row0 in range(0, grid.nrow, strip_rows):
             nrow = min(strip_rows, grid.nrow - row0)
             burned = written.read(1, window=Window(0, row0, grid.ncol, nrow))
@@ -2751,7 +2799,7 @@ def _resolve_doubtful_basins_by_longest_shared_boundary(bsn_path, grid, level3, 
     largest_id = np.zeros(slots, np.int64)
     largest_pixels = np.zeros(slots, np.int64)
     row_above = np.zeros(grid.ncol, np.uint32)
-    with rasterio.open(bsn_path) as bsn_dataset:
+    with open_raster(bsn_path) as bsn_dataset:
         for row0 in range(0, grid.nrow, strip_rows):
             nrow = min(strip_rows, grid.nrow - row0)
             strip = bsn_dataset.read(1, window=Window(0, row0, grid.ncol, nrow))
@@ -2800,8 +2848,8 @@ def group_windows_in_pixels(groups, grid, block=None):
 
 
 def _fill_group_window_columns(table, grid, block):
-    """window_nrow .. window_maxlat of a group table whose window_* block columns are set
-    fill_the_window_columns_of_a_group makes them"""
+    """window_nrow .. window_maxlat of a group table whose window_* block columns are set,
+    as the C implementation fills them"""
     table["window_nrow"] = (table["window_row_max"] - table["window_row_min"]) * block
     table["window_ncol"] = (table["window_col_max"] - table["window_col_min"]) * block
     table["window_grid_count"] = table["window_nrow"] * table["window_ncol"]
@@ -2998,7 +3046,7 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
     rectangle_of_basin = np.zeros((basin_count + 1, 4), np.int32)     # 16 B a basin; rows and unrolled columns fit int32
     rectangle_of_basin[1:] = basin_rectangles(basins)
     outside_rectangle = np.zeros(1, np.int64)
-    with rasterio.open(bsn_path) as bsn_dataset, rasterio.open(l3_path) as l3_dataset:
+    with open_raster(bsn_path) as bsn_dataset, open_raster(l3_path) as l3_dataset:
         # the two rasters on the grid of the run, checked before they are read: the same size, the
         # geotransforms within 1e-12 term by term, the same CRS; and the basin mask unsigned 32-bit, so that no id
         # read from it is negative
@@ -3041,7 +3089,7 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
         flagged_index = np.full(basin_count + 1, -1, np.int64)
         flagged_index[flagged] = np.arange(flagged.size)
         exact = np.zeros((flagged.size, 65536), np.int64)
-        with rasterio.open(bsn_path) as bsn_dataset, rasterio.open(l3_path) as l3_dataset:
+        with open_raster(bsn_path) as bsn_dataset, open_raster(l3_path) as l3_dataset:
             for row0 in range(0, grid.nrow, strip_rows):
                 nrow = min(strip_rows, grid.nrow - row0)
                 window = Window(0, row0, grid.ncol, nrow)
@@ -3847,7 +3895,7 @@ def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid,
     outlet_row = basins["outlet_row"].to_numpy(np.int64)
     outlet_col = basins["outlet_col"].to_numpy(np.int64)
     # [0] where every basin's land is, from the coarse basin view
-    with rasterio.open(coarse_basin_view_path) as view:
+    with open_raster(coarse_basin_view_path) as view:
         factor = int(round(view.transform.a / abs(grid.pixel_width)))            # fine pixels to a coarse cell
         if factor < 1 or block % factor != 0 or view.width != -(-grid.ncol // factor) or view.height != -(-grid.nrow // factor):
             raise FlowDivideError("the coarse basin view %s does not fold this grid by a whole number of cells to the block" % coarse_basin_view_path)
@@ -4213,9 +4261,9 @@ class PixelReader:
 
     def __init__(self, dir_path, acc_path, grid, blocks_kept=256):
         from collections import OrderedDict
-        self.dir_dataset = rasterio.open(dir_path)
+        self.dir_dataset = open_raster(dir_path)
         try:
-            self.acc_dataset = rasterio.open(acc_path)
+            self.acc_dataset = open_raster(acc_path)
         except Exception:
             self.dir_dataset.close()                # not left open when the second open fails
             raise
@@ -4458,7 +4506,7 @@ def _label_basin_pieces(dir_path, bsn_path, grid, basin_id, rectangle, piece_out
     row_min, row_max, col_min, col_max = rectangle
     tiles = tiles_of_grid(grid, tile, row_min, row_max, col_min, col_max)
     records = TilePassRecords()
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(bsn_path) as bsn_dataset:
+    with open_raster(dir_path) as dir_dataset, open_raster(bsn_path) as bsn_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             mask = read_block(bsn_dataset, row0, nrow, col0, ncol, grid.periodic, 0)
@@ -4509,7 +4557,7 @@ def _label_basin_pieces(dir_path, bsn_path, grid, basin_id, rectangle, piece_out
                "transform": piece_transform, "nodata": 0, "tiled": True, "blockxsize": RASTER_BLOCK, "blockysize": RASTER_BLOCK,
                "compress": "DEFLATE", "BIGTIFF": "YES", "NUM_THREADS": GDAL_WRITE_THREADS}
     temporary = fd_tables.free_name(out_piece_path + ".partial.tif")
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(bsn_path) as bsn_dataset, rasterio.open(temporary, "w", **profile) as piece_out:
+    with open_raster(dir_path) as dir_dataset, open_raster(bsn_path) as bsn_dataset, rasterio.open(temporary, "w", **profile) as piece_out:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             mask = read_block(bsn_dataset, row0, nrow, col0, ncol, grid.periodic, 0)
@@ -4564,7 +4612,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
     cols = []
     codes = []
     accs = []
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(bsn_path) as bsn_dataset, rasterio.open(str_path) as str_dataset, rasterio.open(acc_path) as acc_dataset:
+    with open_raster(dir_path) as dir_dataset, open_raster(bsn_path) as bsn_dataset, open_raster(str_path) as str_dataset, open_raster(acc_path) as acc_dataset:
         # the flow directions too, on the grid and uint8, before any code of them is looked up: the network indexes
         # its direction tables with them (a UInt16 256 would read past a table of 256)
         for dataset, path in ((dir_dataset, dir_path), (bsn_dataset, bsn_path), (str_dataset, str_path), (acc_dataset, acc_path)):
@@ -4757,7 +4805,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
     #     disk, -1 otherwise
     aca_at_outlet = {}
     if aca_path is not None and os.path.exists(aca_path):
-        with rasterio.open(aca_path) as aca_dataset:
+        with open_raster(aca_path) as aca_dataset:
             check_raster_on_the_grid(aca_dataset, grid, aca_path)
             for piece in basin.pieces:
                 aca_at_outlet[piece.id] = float(aca_dataset.read(1, window=Window(piece.outlet_col % grid.ncol, piece.outlet_row, 1, 1))[0, 0]) * aca_to_km2
@@ -5275,8 +5323,8 @@ def _renumber_the_regions_for_publication(regions, merges, grid, tag):
 
 def _regions_of_the_level2_units(grid, regions, capacity_pixels, tag):
     """A region is a HydroBASINS Level-02 unit when its whole-degree window fits the capacity; a unit that
-    does not fit is divided along its own Level-03 units, the largest unit first and each one put in the
-    first part that still holds it, so that a part is filled as far as it goes.  The groups that carry no
+    does not fit is divided along its own Level-03 units, taken in code order, a new part started as soon as the
+    window no longer fits, so that every part is a run of consecutive Level-03 codes.  The groups that carry no
     code (the islands, and on a periodic grid the groups the antimeridian cuts) and the regions of the
     pieces of a cut basin are left as they are.
 
@@ -5376,7 +5424,7 @@ def _regions_of_the_level2_units(grid, regions, capacity_pixels, tag):
             plan_the_part(part)
     # the joins in a fixed order, so that the merge records come out the same on every run (the windows and
     # the land they record depend on what the keeper had taken in before).  Every join is planned first, then
-    # each round takes the first region of its list still to be joined (choose_planned_pair); its list holds the
+    # the joins are made in the order of the region joined: its build phase, then its place in the list, which holds the
     # regions made in the walk over the groups (a unit that is one region as it is) before those made after it (the
     # parts of a divided unit, the whole basins of a unit that holds a cut basin), each in the order of the groups --
     # which is (build_phase, the order this list was built in).  Joining unit by unit gives the same regions in the
@@ -5394,13 +5442,13 @@ def _merge_regions_under_the_capacity(grid, regions, capacity_pixels, policy, la
     joined window costs the fewest pixels over the two windows added up, only windows that touch or
     contain one another, never a region of pieces (within_parent: only two regions of one Level-02
     unit).  Policy "balanced": the smallest region that has a partner joins the partner in its Level-02
-    unit that fills the capacity furthest, a join adding no more empty window than the smaller of
-    the two windows holds; when nothing can grow inside its unit any more, a region under a quarter of
+    unit that MERGE_RULE ranks first (by default the one that brings the most land), a join adding no
+    more empty window than the smaller of the two windows holds; when nothing can grow inside its unit any more, a region under a quarter of
     the capacity may join a touching coded region of another unit.  Returns the merge records.
 
     Filling comes first, evenness second. The
-    filling is the partner chosen: of the partners a region may take, the one whose joined window comes
-    closest to the capacity from below. The evenness is the order: the smallest region goes first, so the
+    filling is the partner chosen: of the partners a region may take, the one MERGE_RULE ranks first (by
+    default the most land in the joined region, the window only the constraint). The evenness is the order: the smallest region goes first, so the
     small ones are taken in rather than one region growing until it fills the capacity by itself. Choosing
     the partner with the SMALLEST joined window instead leaves the regions small and their number large
     (the globe at 1400 square degrees: 107 regions, 82 of them coded)."""
@@ -5650,7 +5698,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
     counted from the largest number fd1.4 gave; every flow between regions goes to a larger number.
     Those are the ids the step builds and checks with.  What the files carry is the short numbering of
     _renumber_the_regions_for_publication when the partition allows it: 11, 12, .. 91 for a whole
-    Level-02 unit, 351, 352, .. for the parts of a divided one, 10001, 10002 astride the antimeridian and
+    Level-02 unit, four digits for the parts of a divided one (9112, 9134, ..), 10001, 10002 astride the antimeridian and
     20501, 20101, .. for the islands (20000 + the Level-01 region * 100 + the number within it).
     level1: the level-1 number of the island and seam regions; the smallest code's first digit when None."""
     started = time.time()
@@ -5893,7 +5941,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
     # the piece tables checked: a cut basin has one piece that flows into no other, its outlet is the basin's, and the outlet of
     # every other piece flows, by the flow directions, into the parent inlet its row gives
     offsets = {1: (0, 1), 2: (1, 1), 4: (1, 0), 8: (1, -1), 16: (0, -1), 32: (-1, -1), 64: (-1, 0), 128: (-1, 1)}
-    with rasterio.open(grid.path) as dir_dataset:
+    with open_raster(grid.path) as dir_dataset:
         for cut_id in cut_set:
             table = cut_tables[cut_id]
             used_rows = {int(row["piece"]): row for _, row in table[table["used"] == 1].iterrows()}
@@ -5964,7 +6012,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                 member_of_code[code] = piece_member_of_code[cut_id][used_ancestor]
             basin_row = basins.iloc[cut_id - 1]
             window = grid.window_of_rectangle(int(basin_row["basin_row_min"]), int(basin_row["basin_row_max"]), int(basin_row["basin_col_min"]), int(basin_row["basin_col_max"]))
-            piece_dataset = rasterio.open(cuts[cut_id][1])
+            piece_dataset = open_raster(cuts[cut_id][1])
             piece_rasters[cut_id] = (piece_dataset, region_id_of_code, region_index_of_code, member_of_code, window)
             # a piece raster is unsigned and on the run's grid, its window placed where the basin's rectangle says (an
             # Int32 one would hand the kernel negative codes); the origin and size are checked too: the
@@ -6012,7 +6060,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
                                           "parent's in the piece raster" % (cut_id, code, int(row["parent_inlet_row"]),
                                                                             int(row["parent_inlet_col"])))
         rgn_temporary = fd_tables.free_name(outputs["rgn"] + ".partial.tif")
-        with rasterio.open(bsn_path) as bsn_dataset, rasterio.open(rgn_temporary, "w", **raster_profile(grid, "uint32", 0)) as rgn_out:
+        with open_raster(bsn_path) as bsn_dataset, rasterio.open(rgn_temporary, "w", **raster_profile(grid, "uint32", 0)) as rgn_out:
             check_raster_on_the_grid(bsn_dataset, grid, bsn_path)
             if bsn_dataset.dtypes[0] != "uint32":         # no negative id can come out of it
                 raise FlowDivideError("the basin mask %s is %s, not uint32" % (bsn_path, bsn_dataset.dtypes[0]))
@@ -6153,7 +6201,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
 def _merge_the_runs(area, grid_count, run_start, run_count_of, global_id):
     """the global ids of the basins of several runs laid end to end (run r at run_start[r] .. +run_count_of[r]): the
     runs' own orders merged, the larger area first, then the larger pixel count, then the earlier run, as
-    number_the_basins_globally orders them, one comparison at a time"""
+    the C implementation orders them, one comparison at a time"""
     runs = run_start.size
     next_of = np.zeros(runs, np.int64)
     total = 0

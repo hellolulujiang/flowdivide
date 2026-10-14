@@ -3,7 +3,7 @@
     python3 test_fd2_outline_across_the_seam.py
 
 On a grid round the earth a basin with cells in the first and the last column is outlined in one piece and its lines
-are cut at the meridian (fd2_views.outline_across_the_seam, the C code's since v10.35).  Checked on made-up masks of
+are cut at the meridian (fd2_views.outline_across_the_seam, as in the C implementation).  Checked on made-up masks of
 10 columns of 36 degrees and 6 rows of 30:
 
 1. a block of 4 x 3 cells across the meridian with a hole of two cells across it: 14 cell sides in two lines, every

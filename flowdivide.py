@@ -121,12 +121,12 @@ HYBAS_ROOT_DEFAULT = os.environ.get("FLOWDIVIDE_HYBAS", "")
 HYDROSHEDS_RAW_DEFAULT = os.environ.get("FLOWDIVIDE_HYDROSHEDS", "")
 MERIT_RAW_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT", "")
 # MERIT Hydro's own upstream count and upstream area, which the MERIT 90 m products are built on: the same
-# two files the published products were made from.  The published BasinFull v1.0 and v1.1 took their basin areas
+# two files the published products were made from.  The published MERIT-FullBasin v1.0 and v1.1 took their basin areas
 # and their basin numbers from these rasters, and a re-run must carry the same numbers, so this line reads
 # them instead of computing its own area.
 MERIT_ACC_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT_ACC", "")
 MERIT_ACA_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT_ACA", "")
-# The outlet table of MERIT BasinFull v1.0 / v1.1, whose basin ids a re-run carries over pixel by pixel.
+# The outlet table of MERIT-FullBasin v1.0 / v1.1, whose basin ids a re-run carries over pixel by pixel.
 # Why carried over and not worked out again: no rule computed from today's rasters
 # reproduces those ids (ordering one band of rows by MERIT's own Float32 upstream area agrees with the
 # published numbers on 85.9% of neighbouring pairs, and the pairs that disagree are one or two Float32
@@ -176,7 +176,7 @@ def footprint_pixels(dir_argument, probe):
     left = bottom = float("inf")
     right = top = float("-inf")
     for path in sorted(glob.glob(os.path.join(dir_argument, "*.tif"))):
-        with rasterio.open(path) as tile:
+        with fd1.open_raster(path) as tile:
             left, bottom = min(left, tile.bounds.left), min(bottom, tile.bounds.bottom)
             right, top = max(right, tile.bounds.right), max(top, tile.bounds.top)
     return int(round((right - left) / abs(probe.pixel_width))) * int(round((top - bottom) / abs(probe.pixel_height)))
@@ -1351,7 +1351,7 @@ class Chain:
             left = bottom = float("inf")
             right = top = float("-inf")
             for path in candidates:
-                with fd1.rasterio.open(path) as tile:
+                with fd1.open_raster(path) as tile:
                     left, bottom = min(left, tile.bounds.left), min(bottom, tile.bounds.bottom)
                     right, top = max(right, tile.bounds.right), max(top, tile.bounds.top)
             self.native_pixels = int(round((right - left) / abs(layout.grid.pixel_width)) * round((top - bottom) / abs(layout.grid.pixel_height))) * (2 if len(candidates) > 1 else 1)
@@ -1365,7 +1365,7 @@ class Chain:
                 left = bottom = float("inf")
                 right = top = float("-inf")
                 for path in candidates:
-                    with fd1.rasterio.open(path) as tile:
+                    with fd1.open_raster(path) as tile:
                         left, bottom = min(left, tile.bounds.left), min(bottom, tile.bounds.bottom)
                         right, top = max(right, tile.bounds.right), max(top, tile.bounds.top)
                 self.grid.ncol = int(round((right - left) / abs(self.grid.pixel_width)))
@@ -1466,7 +1466,7 @@ class Chain:
                 label = self.partition_label(name)
                 cut_files, cut_products = self.cut_step_files(blocks, grouping)
                 # the earth model is in these arguments because the cut reads the pixel area too: it turns
-                # the channel threshold into a pixel count (fd1_partition.BasinCut.channel_pixels_max)
+                # the channel threshold into a pixel count (fd1_partition.BasinToCut.channel_pixels_max)
                 # So is the margin of that count (fd1_partition.CHANNEL_BOUND_MARGIN), so that a cut made under
                 # another bound, which a provider's smaller pixel could slip past, is made again and not taken
                 # as done
@@ -1691,7 +1691,7 @@ class Chain:
     def vector_rules_text(self):
         """the rules of the polygons, as the steps that write them name them: on a grid periodic in longitude the
         outline of an object across the 180th meridian is traced with the object in one piece and cut at the meridian
-        (C v10.35, 0.7.9), so the polygons of 0.7.8 there are made again; elsewhere the outlines did not change and
+        (0.7.9), so the polygons of 0.7.8 there are made again; elsewhere the outlines did not change and
         the signature is 0.7.8's"""
         return "vector_rules=%d%s" % (FD2_VECTOR_RULES_VERSION, " outline_across_the_seam=v10.35" if self.grid.periodic else "")
 
@@ -1771,7 +1771,7 @@ class Chain:
             return
         if not os.path.exists(piece_raster):
             raise FlowDivideError("the piece raster of basin %d at %s was dropped; run fd1 again to make it" % (basin_id, name))
-        with rasterio.open(piece_raster) as pieces:
+        with fd1.open_raster(piece_raster) as pieces:
             sampled = pieces.read(1)[::PREVIEW_STEP, ::PREVIEW_STEP].astype(np.uint16)
             profile = {"driver": "GTiff", "dtype": "uint16", "count": 1, "width": sampled.shape[1], "height": sampled.shape[0], "crs": pieces.crs,
                        "transform": pieces.transform * rasterio.Affine.scale(PREVIEW_STEP), "nodata": 0, "tiled": True, "blockxsize": fd1.RASTER_BLOCK,

@@ -79,7 +79,7 @@ from numba import njit
 from rasterio.windows import Window
 
 import fd_tables
-from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, FlowDivideError, Grid, log, publish,
+from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, FlowDivideError, Grid, log, open_raster, publish,
                            raster_profile, read_halo_tile, tile_exits_and_drains, tile_inlets, tile_topological_order,
                            write_json, _accumulate_over_exit_graph_area_only, _link_exits_to_inlets,
                            _pass_one_local_totals_area_only, _pass_two_accumulate_area_only)
@@ -294,7 +294,7 @@ def _pass_one_over_tiles(dir_path, grid, tiles, tag, want_local_maximum=False):
     land_total = 0
     off_grid_total = 0
     into_nodata_total = 0
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -410,7 +410,7 @@ def upa_on_tiles(dir_path, out_path, channel_path, grid, tiles, channel_threshol
     land_total = 0
     off_grid_total = 0
     into_nodata_total = 0
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -459,7 +459,7 @@ def upa_on_tiles(dir_path, out_path, channel_path, grid, tiles, channel_threshol
     temporary = fd_tables.free_name(out_path + ".partial.tif")
     channel_temporary = fd_tables.free_name(channel_path + ".partial.tif") if channel_path else None
     with contextlib.ExitStack() as open_files:
-        dir_dataset = open_files.enter_context(rasterio.open(dir_path))
+        dir_dataset = open_files.enter_context(open_raster(dir_path))
         out_dataset = open_files.enter_context(rasterio.open(temporary, "w", **raster_profile(grid, "int64", 0)))
         channel_dataset = (open_files.enter_context(
             rasterio.open(channel_temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)))
@@ -546,7 +546,7 @@ def ldn_on_tiles(dir_path, out_path, grid, tiles, tag="tiles.ldn", nodata=-9999.
     temporary = fd_tables.free_name(out_path + ".partial.tif")
     seconds_reading = seconds_computing = seconds_writing = 0.0
     # both datasets closed on an error too
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "float32", nodata)) as out_dataset:
+    with open_raster(dir_path) as dir_dataset, rasterio.open(temporary, "w", **raster_profile(grid, "float32", nodata)) as out_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             clock = time.time()
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
@@ -685,7 +685,7 @@ def lup_on_tiles(dir_path, out_path, grid, tiles, source_path=None, tag="tiles.l
     # the source raster in the same with, so that it is closed on an error too
     with contextlib.ExitStack() as stack:
         source_dataset = stack.enter_context(rasterio.open(source_temporary, "w", **raster_profile(grid, "int64", -1))) if source_path else None
-        dir_dataset = stack.enter_context(rasterio.open(dir_path))
+        dir_dataset = stack.enter_context(open_raster(dir_path))
         out_dataset = stack.enter_context(rasterio.open(temporary, "w", **raster_profile(grid, "float32", nodata)))
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
@@ -797,7 +797,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
     swept until no order arriving at an inlet changes any more, and the number of sweeps is reported."""
     started = time.time()
     tile_count = len(tiles)
-    with rasterio.open(channel_path) as channel_dataset:
+    with open_raster(channel_path) as channel_dataset:
         # the channel mask on the grid of the flow directions, and in the grid's CRS
         if channel_dataset.height != grid.nrow or channel_dataset.width != grid.ncol or channel_dataset.transform != grid.transform or \
                 channel_dataset.crs != grid.crs:
@@ -808,7 +808,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
     land_total = 0
     off_grid_total = 0
     into_nodata_total = 0
-    with rasterio.open(dir_path) as dir_dataset:
+    with open_raster(dir_path) as dir_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)
             order, land_count, taken = tile_topological_order(halo)
@@ -868,7 +868,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
     arriving_second = np.zeros(records.inlet_global.size, np.uint8)
     to_sweep = np.ones(tile_count, np.bool_)
     sweeps = 0
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(channel_path) as channel_dataset:
+    with open_raster(dir_path) as dir_dataset, open_raster(channel_path) as channel_dataset:
         while to_sweep.any():
             sweeps += 1
             # A sweep either changes an order at an exit or is the last one.  An order only ever rises and no
@@ -925,7 +925,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
             log(tag, "sweep %d: %d tiles computed, %d marked for the next" % (sweeps, sweeping.size, int(to_sweep.sum())))
     # the last sweep with the orders as they stand, written out
     temporary = fd_tables.free_name(out_path + ".partial.tif")
-    with rasterio.open(dir_path) as dir_dataset, rasterio.open(channel_path) as channel_dataset, \
+    with open_raster(dir_path) as dir_dataset, open_raster(channel_path) as channel_dataset, \
             rasterio.open(temporary, "w", **raster_profile(grid, "uint8", 0, predictor=False)) as out_dataset:
         for tile_index, (row0, nrow, col0, ncol) in enumerate(tiles):
             halo = read_halo_tile(dir_dataset, row0, nrow, col0, ncol, grid.periodic, MERIT_NODATA)

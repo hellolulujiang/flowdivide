@@ -5,8 +5,8 @@
                                   [--ldn-members <the member table of an ldn run>]
 
 <dataset root> holds global/table/basin_table_fine_<run>.csv, global/fineresolution/dir/dir_<run>_<tag>_merit.tif and
-partitions/<capacity directory>/global/table/{region_fine,piece_fine,basin_region}_<run>.csv, the layout the C chain
-(the FullHydro C code, v10) and this package both write.  Nothing is written under the dataset root: the attribute's raster and its
+partitions/<capacity directory>/global/table/{region_fine,piece_fine,basin_region}_<run>.csv, the layout the C
+implementation and this package both write.  Nothing is written under the dataset root: the attribute's raster and its
 tables go to <out directory>, which must be new or empty, and so does <attribute>_memory.txt with the peak resident set of the whole process (the
 tables read, every region, the tables written), the seconds and the held blocks.  The FD3 log lines give the peak so
 far after the tables and after every region.

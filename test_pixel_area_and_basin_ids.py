@@ -1,7 +1,7 @@
 """Checked without any product data:
 
   the pixel area under each earth model   the four reference values of MERIT's own formula (CaMa-Flood's
-                                          rgetara), and the ordering of the three models
+                                          rgetara), and the ordering of the two models
   the basin ids carried over               the rule that gives every outlet the id a published table gives
                                           its pixel, and each of its refusals
 

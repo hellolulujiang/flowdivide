@@ -481,7 +481,7 @@ def main():
         separate_the_labels(figure, axis, label_records_of_axis.get(id(axis), []))
 
     if os.environ.get("FLOWDIVIDE_NO_SAVE"):
-        return                            # the overlap lint runs the script and only inspects the figure
+        return                            # the figure drawn and not saved, to check its layout
     stem = "fig_03_regions_%s" % continent.replace("-", "_")
     out_path = style.figure_path(FIGURE_DIRECTORY, stem)
     figure.savefig(out_path, dpi=400, bbox_inches="tight", pad_inches=0.02)

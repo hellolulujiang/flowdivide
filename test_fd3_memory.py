@@ -274,7 +274,7 @@ def test_read_basin_table_columns():
 # =============================================================================
 
 @njit(cache=False)
-def donor_as_in_1_0_3(order, downstream, member, channel_window, area_window, ncol, best_donor, best_area):
+def donor_as_in_0_7_3(order, downstream, member, channel_window, area_window, ncol, best_donor, best_area):
     """sweep_main_stem_donor of 0.7.3, word for word"""
     for position in range(order.size):
         pixel = order[position]
@@ -323,7 +323,7 @@ def test_main_stem_donor():
         area = rng.choice(np.array([1.5, 2.25, 7.0, 7.0, 11.125], np.float32), (nrow, ncol))   # ties on purpose
         old_donor = np.full(pixel_count, -1, np.int64)
         old_area = np.zeros(pixel_count, np.float32)
-        donor_as_in_1_0_3(order, downstream, member, channel, area, ncol, old_donor, old_area)
+        donor_as_in_0_7_3(order, downstream, member, channel, area, ncol, old_donor, old_area)
         status, count, count_in_order, _, pixel_of_compact, _, downstream_of_compact, _ = fd3.compact_the_pixels_of_the_region(
             directions, channel, True, outlets, np.arange(outlets.size, dtype=np.int64), np.zeros(0, np.int64), pixel_count)
         new_donor = np.full(count, -1, np.int32)
