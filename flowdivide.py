@@ -15,8 +15,10 @@ coding: the codings of MERIT Hydro, ESRI, HydroSHEDS, TauDEM, GRASS and the degr
 any other is given as --convention custom --direction-codes E=1,SE=2,... with --sink-code, --nodata-code
 and --mouth-code.  The basin groups come from --group-vectors, or are made here along a Hilbert curve.
 
-The inputs are the flow directions and the Level-03 vectors, nothing else.  The chain, in the order of
-the paper:
+The inputs are the flow directions and, for the given groups, the Level-03 vectors; on a grid of your own the
+upstream pixel count and area are computed from the directions (fd1.1) unless --acc and --aca give them.  The
+built-in grids also read their provider's upstream count and area (ACC and ACA), and MERIT Hydro the table of its
+published basin ids.  The chain, in the order of the paper:
 
     FD1  fd1.0 recode -> fd1.4 the Level-03 vectors burned -> fd1.1 accumulation -> fd1.2 outlets
          -> fd1.3 delineation -> fd2.1 the basin views (the automatic grouping reads one)
@@ -209,7 +211,8 @@ def views_by_cell_size(grid, factors=VIEW_FACTORS_DEFAULT, pixels=None, prune=Tr
     default views), a view whose smallest basin (FD2's threshold) is larger than any basin of the grid could be
     (pixels: all its tiles together) is left out: no basin would be in it and the run would stop there, so no grid
     that ran before loses a view.  The finest is kept, made finer until its threshold is below that area.  Views
-    asked for by name (prune=False) are taken as they are"""
+    given with --view-factors (prune=False) are neither left out nor made finer; each is still lowered to a divisor
+    of the block (250 is 240 on a block of 3600 pixels), and two that come out the same are kept once"""
     pixels = grid.nrow * grid.ncol if pixels is None else pixels
     largest = largest_basin_area_km2(grid, pixels, slack=True)
     covered = largest_basin_area_km2(grid, pixels)
@@ -455,11 +458,7 @@ def capacity_blocks_of(name, block_pixels):
         power = int(name[2:])
         if not 20 <= power <= 40:
             raise FlowDivideError("the capacity must be 2^k with k from 20 to 40, got %s" % name)
-        top = ((1 << 31) - 1) // (block_pixels * block_pixels)
-        unit = 1
-        while top // unit >= 100:
-            unit *= 10
-        top = (top // unit) * unit
+        top = fd1.top_tier_blocks(block_pixels)
         blocks = top >> (31 - power) if power <= 31 else top << (power - 31)
         if blocks < 1:
             raise FlowDivideError("%s is less than one block of %d x %d pixels" % (name, block_pixels, block_pixels))
@@ -1865,14 +1864,14 @@ def parse_arguments(argv):
     partition.add_argument("--groups", default=None, choices=GROUPINGS + ["given"], help="the basin groups the partition is built on: given (the groups of --group-vectors, HydroBASINS Level-03 for the built-in grids; also spelled l3, which is the word in the file names) or hilbert (the automatic groups, the default when no vectors are given)")
     partition.add_argument("--levels", default=None, help="how deep the Pfafstetter cut goes at every capacity: 2, 3, 4, or auto (default: the dataset's depth per capacity, 3, 3, 4)")
     partition.add_argument("--channel-threshold-km2", type=float, default=None, help="a channel pixel has at least this upstream area (default: the grid's own, 1 on the two HydroSHEDS grids and on a grid of your own, 10 on MERIT)")
-    partition.add_argument("--min-basin-area-km2", type=float, default=1.0, help="the attributes are computed for the basins of at least this area (default 1)")
+    partition.add_argument("--min-basin-area-km2", type=float, default=1.0, help="shv, hck, ord and lfp are computed for the basins of at least this area, and every table lists those; the rasters of ldn and lup cover every basin (default 1)")
     partition.add_argument("--tile", type=int, default=fd1.WORK_TILE_DEFAULT, help="the square work tile of fd1.1, fd1.3 and fd1.5 in pixels, a multiple of 512 (default %d)" % fd1.WORK_TILE_DEFAULT)
     keep = run.add_argument_group("the keep option")
     keep.add_argument("--keep", default=None, help="the variables kept on disk, comma-separated among %s; every other one is moved into _tmp_/ beside it as soon as the last step that reads it is done (nothing is deleted: the space is freed when _tmp_/ is emptied by hand) (dir, the tables and the polygon files are always kept).  The other way round is --drop" % ",".join(DROPPABLE))
     keep.add_argument("--drop", default="", help="the variables moved into _tmp_/ beside them as soon as nothing left in the run reads them, comma-separated among %s (the other way round is --keep)" % ",".join(DROPPABLE))
     views = run.add_argument_group("the views and the figures")
     views.add_argument("--vector", default="geoparquet", choices=["geoparquet", "gpkg", "both"], help="the format of the polygon files: geoparquet (the default; GeoParquet 1.1, zstd), gpkg (GeoPackage), or both, with the same rows and columns")
-    views.add_argument("--colours", type=int, default=fd2.COLOURS_AT_LEAST, help="the colouring uses at least this many colour numbers, so that a colour does not come back two objects apart (default %d)" % fd2.COLOURS_AT_LEAST)
+    views.add_argument("--colours", type=int, default=fd2.COLOURS_AT_LEAST, help="the colouring opens at least this many colour numbers, so that a colour comes back two objects apart only when no open one is free; neighbours always differ (default %d)" % fd2.COLOURS_AT_LEAST)
     views.add_argument("--no-open", action="store_true", help="do not open the figures when they are drawn")
     own = run.add_argument_group("a grid of your own")
     own.add_argument("--dir", default=None, help="the native flow directions, one file or a directory of tiles")
@@ -1888,7 +1887,7 @@ def parse_arguments(argv):
     own.add_argument("--aca", default=None, help="an upstream area raster on the grid of --dir, given with --acc (none: fd1.1 computes it)")
     own.add_argument("--aca-unit", default="km2", choices=["km2", "m2"], help="the unit of --aca (default km2, as HydroSHEDS and MERIT Hydro ship it)")
     own.add_argument("--periodic", action="store_true", help="the grid spans 360 degrees of longitude")
-    own.add_argument("--view-factors", default=None, help="the views: pixels to a cell, comma-separated, each lowered to a divisor of the block (default: the paper's four views on a grid of a whole number of pixels to the degree, else 10,50,250; either without a view whose smallest basin is larger than the whole grid, the finest made finer if it must be; views given here are taken as they are)")
+    own.add_argument("--view-factors", default=None, help="the views: pixels to a cell, comma-separated, each lowered to a divisor of the block (default: the paper's four views on a grid of a whole number of pixels to the degree, else 10,50,250; either without a view whose smallest basin is larger than the whole grid, the finest made finer if it must be; views given here are neither left out nor made finer, but each is still lowered to a divisor of the block and a repeat is kept once)")
     own.add_argument("--block", type=int, default=None, help="the block of the windows, in pixels (default one degree)")
     own.add_argument("--capacities", default="2^31:3,2^30:3,2^29:4", help="the capacities and the depth of the cut at each, name:levels pairs, the largest first (a name is 2^k or a number of blocks such as 160deg2)")
     own.add_argument("--merge", default="none", choices=["none", "within_parent", "any", "balanced", "level2"], help="the merge policy of fd1.5 for the groups under the capacity (level2: a region is a Level-02 unit, a unit that does not fit is divided along its Level-03 units)")

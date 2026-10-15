@@ -7,7 +7,8 @@ the user.  This file is the first of the three stages:
 
     FD1.0  assembly and recoding      one continental file, the MERIT code convention
     FD1.1  flow accumulation          upstream pixel count and upstream area, on work tiles
-    FD1.2  outlet indexing            every river mouth and inland sink, the basins numbered by area
+    FD1.2  outlet indexing            every river mouth and inland sink, the basins numbered by area (on
+                                      MERIT Hydro, by its published ids)
     FD1.3  watershed delineation      the basin of every pixel, the basin rectangles
     FD1.4  basin grouping             the HydroBASINS Level-03 unit of every basin, whole basins
                                       gathered into basin groups; and the automatic groups along a
@@ -34,7 +35,6 @@ Conventions used throughout the three stage files:
     tables            space-separated text with one header line, the columns of the
                       paper, read and written with pandas (read_table, write_table)
 """
-import csv
 import json
 import math
 import os
@@ -57,6 +57,9 @@ MERIT_MOUTH = 0            # a river mouth: the water reaches the sea here
 MERIT_SINK = 255           # an inland sink: the water ends in a closed depression here
 # the largest accumulation a raster can carry before it is nodata or garbage
 ACCUMULATION_MAX = 9.0e18
+# the largest Hack or Strahler order fd3 writes: the rasters are one byte a pixel and the C code stops at 254 (1.1.1;
+# 255 until 1.1.0)
+ORDER_CAP = 254
 MERIT_NODATA = 247         # no data: sea, or outside the continent
 HYDROSHEDS_SINK = 0        # HydroSHEDS v2 marks an inland sink with 0 ...
 HYDROSHEDS_NODATA = 255    # ... and nodata with 255; a coastal outlet keeps its direction code
@@ -95,8 +98,9 @@ def direction_convention(name, codes=None, sink=None, nodata=None, mouth=None):
     """The coding of a flow-direction grid: a name of DIRECTION_CONVENTIONS, or "custom" with codes given
     as "E=1,SE=2,..." (the eight directions E SE S SW W NW N NE, every code an integer from 0 to 65535).  sink, nodata and
     mouth override the named coding's values, so a producer who writes the ESRI codes with a nodata of
-    247 and no sink needs no new name in this file.  Returns a dict with the eight codes, sink, nodata
-    and mouth, every value an int or None."""
+    247 and no sink needs no new name in this file.  Returns a dict: "codes", the eight directions (E .. NE) to
+    their codes, and "sink", "nodata" and "mouth", each an int or None (nodata is never None: a coding without
+    one is refused)."""
     if name == "custom":
         if not codes:
             raise FlowDivideError("the custom convention needs --direction-codes, e.g. E=1,SE=2,S=4,SW=8,W=16,NW=32,N=64,NE=128")
@@ -837,7 +841,8 @@ def tiles_of_grid(grid, tile, row_min=0, row_max=None, col_min=0, col_max=None):
 @njit(cache=True)
 def _recode_strip(halo, out, merit_code_of_byte, counts):
     """The rows 1 .. nrow of `halo` recoded into `out` under the three rules.  merit_code_of_byte is the
-    256-entry table of merit_code_table_of: the native coding's eight direction codes to the MERIT codes,
+    table of merit_code_table_of, max(largest code + 1, 256) entries (361 for a coding in degrees): the native
+    coding's eight direction codes to the MERIT codes,
     its sink to 255, its mouth to 0, its nodata to 247, everything else to 254, a value this package does
     not know.  Whatever the producer's coding, only this table changes, so that any baseline
     hydrography is supported.  counts: [direction in, sink in, nodata in, mouth in, unknown in, direction
@@ -993,7 +998,9 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
     "custom" with direction_codes ("E=1,SE=2,..."); sink_code, nodata_code and mouth_code override the
     named coding's values.  A pixel whose direction points into nodata or off the grid becomes a river
     mouth; under the merit convention, whose own mouths are written, it is refused instead (the grid is then
-    verified and copied, as the C code does).  Writes <out_path> and <out_path>.report.json."""
+    verified and copied, as the C code does).  Any integer raster is read, and the convention's nodata is taken
+    whatever the file's own nodata says; the C check of a MERIT grid takes a Byte raster whose nodata is 247 only.
+    Both write a Byte raster with nodata 247.  Writes <out_path> and <out_path>.report.json."""
     started = time.time()
     coding = direction_convention(convention, codes=direction_codes, sink=sink_code, nodata=nodata_code, mouth=mouth_code)
     merit_code_of_byte = merit_code_table_of(coding)
@@ -1827,8 +1834,9 @@ def check_raster_on_the_grid(dataset, grid, path):
 def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cut_cap_pixels=2 ** 31 - 1, aca_to_km2=1e-6, strip_rows=2048, tag="fd1.2", basin_order="area-then-count", basin_id_table=None, global_id_is_basin_id=False,
                            single_pixel_tolerance=1.0e-3):
     """the basin table begins (fd_tables.BASIN_TABLE_COLUMNS): basin_id, outlet_row, outlet_col,
-    outlet_flag (0 exorheic, 1 endorheic), basin_grid_count and basin_area_km2 of every outlet, sorted by area, the
-    largest first (basin_order: one of BASIN_ORDER_RULES); every other column unset for the later steps, and
+    outlet_flag (0 exorheic, 1 endorheic), basin_grid_count and basin_area_km2 of every outlet, numbered by
+    basin_order (BASIN_ORDER_RULES): by today's area, the largest first, or by the ids of a published table (MERIT
+    Hydro: the order of its areas to six decimals, not of today's); every other column unset for the later steps, and
     global_basin_id = basin_id when the grid is the globe (global_id_is_basin_id, MERIT).  acc_path may be the
     upstream count of fd1.1 or a provider's (both count the pixel itself); aca_path the upstream area of fd1.1 (square
     metres, aca_to_km2 = 1e-6) or a provider's (square kilometres: aca_to_km2 = 1).  cut_cap_pixels is only reported:
@@ -1942,7 +1950,7 @@ def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cu
         if off:
             raise FlowDivideError("%d of the %d basins of one pixel carry an upstream area more than %g off the area of a pixel of "
                                   "their row; the area raster does not line up with the grid" % (off, one_pixel.size, tolerance))
-    # the basins numbered by area, the largest first
+    # the basins numbered: by area, the largest first, or by the ids of a published table
     pixel_index = outlet_row * grid.ncol + outlet_col
     if basin_order == "from-a-published-table":
         order = _basin_ids_from_a_published_table(basin_id_table, pixel_index, grid, tag)
@@ -2978,19 +2986,52 @@ def write_level3_groupings(grid, group_windows, group_columns, basins, group_of_
     return level3
 
 
+def top_tier_blocks(block_pixels):
+    """the whole blocks of the top tier, 2^31: (2^31 - 1) / block^2 rounded down to two significant digits (160
+    blocks of 3600 pixels, 1400 of 1200)"""
+    top = ((1 << 31) - 1) // (block_pixels * block_pixels)
+    unit = 1
+    while top // unit >= 100:
+        unit *= 10
+    return (top // unit) * unit
+
+
+def level3_top_tier_key(region_map_key):
+    """the key of the Level-03 partition of 2^31 on the block that region_map_key names; region_map_key must be a
+    whole key as fd_tables.region_map_key writes it (capacity_px, block_px, groups), on a block of which 2^31 holds
+    at least one, or it is refused"""
+    parts = str(region_map_key).split(",")
+    fields = dict(part.split("=", 1) for part in parts if "=" in part)
+    try:
+        capacity_pixels, block_pixels, grouping = int(fields["capacity_px"]), int(fields["block_px"]), fields["groups"]
+        well_formed = len(parts) == 3 and fd_tables.region_map_key(capacity_pixels, block_pixels, grouping) == region_map_key
+    except (KeyError, ValueError, fd_tables.TableError):
+        well_formed = False
+    if not well_formed:
+        raise FlowDivideError("'%s' is not the key of a region map" % region_map_key)
+    if block_pixels <= 0 or top_tier_blocks(block_pixels) < 1:
+        raise FlowDivideError("'%s' names a block of %d pixels, of which 2^31 holds none" % (region_map_key, block_pixels))
+    return fd_tables.region_map_key(top_tier_blocks(block_pixels) * block_pixels * block_pixels, block_pixels, "l3")
+
+
 def fd1_6_basin_table(basin_table_path, basin_region_path, region_table_path, piece_table_path, region_map_key, tag="fd1.6"):
     """The last columns of the basin table, in place:
 
       region_id            the region of the partition whose windows fit 2^31 pixels (160 square degrees on the 30 m
                            grid, 1400 on MERIT) that holds the basin: the value of the basin-to-region map, or, for a
                            basin the capacity cut, the region of its outlet piece
-      basin_id_in_level1   1 .. n within the basin's Level-01, Level-02, Level-03 group and region, in basin_id order,
-      basin_id_in_level2   so also largest first; a cut basin counts in the region of its outlet
+      basin_id_in_level1   1 .. n within the basin's Level-01, Level-02, Level-03 group and region, in ascending
+      basin_id_in_level2   basin_id (the largest first under the area rule; on MERIT Hydro the order of the published
+                           ids); a cut basin counts in the region of its outlet
       basin_id_in_level3
       basin_id_in_region
 
-    region_map_key: fd_tables.region_map_key of the partition, which the map must carry."""
+    region_map_key: fd_tables.region_map_key of the partition, which the map must carry: the Level-03 partition of 2^31
+    and no other, as in the C code (1.1.1; until 1.1.0 the command line held to it and this function took any key)."""
     started = time.time()
+    if region_map_key != level3_top_tier_key(region_map_key):
+        raise FlowDivideError("region_id is written for the Level-03 partition of 2^31 (%s), not for %s"
+                              % (level3_top_tier_key(region_map_key), region_map_key))
     basins = fd_tables.read_basin_table(basin_table_path)
     basin_count = len(basins)
     root, run = fd_tables.root_and_run_of_basin_table(basin_table_path)
@@ -3869,7 +3910,8 @@ def _move_cells_to_a_group_beside_them(piece_cell, piece_group, piece_rect, piec
 def fd1_4_group_by_hilbert_curve(basin_table_path, coarse_basin_view_path, grid, capacity_pixels, grouping="hilbert", tag="fd1.4"):
     """the automatic groups of whole basins ([0] to [D] above) at one capacity, written in two
     tables (group_hilbert_fine, basin_group_hilbert_fine): the group id stands in the
-    level3_code column as well, and the vote columns are zero"""
+    level_code column as well, coded_basin_count equals basin_count, and neighbour_basin_count and level3_count
+    are 0"""
     started = time.time()
     basins = fd_tables.read_basin_table(basin_table_path)
     basin_count = len(basins)
@@ -4253,6 +4295,23 @@ class Piece:
         return self.parent.code if self.parent is not None else 0
 
 
+def acc_count(value):
+    """an upstream pixel count as the C programs read one and fd1.2 rounds one: the value v as a double,
+    floor(v + 0.5) when 1 <= v < ACCUMULATION_MAX (9e18), otherwise 0 (0, a fraction below 1, a nodata, a NaN).  A
+    whole count up to 2^52 comes through unchanged; above it the + 0.5 can round up by one, as in the C programs.
+    1.1.1: until 1.1.0 fd1.5 cut the fraction off (1.6 read 1), which a raster of whole counts never showed"""
+    value = float(value)
+    return int(math.floor(value + 0.5)) if 1.0 <= value < ACCUMULATION_MAX else 0
+
+
+def acc_counts(values):
+    """acc_count over an array: int64.  Every type is read as a double first, as the C programs read it (a whole
+    count up to 2^52, which every grid's is, comes through unchanged)"""
+    values = np.asarray(values).astype(np.float64)
+    good = (values >= 1.0) & (values < ACCUMULATION_MAX)
+    return np.floor(np.where(good, values, 0.0) + 0.5).astype(np.int64)
+
+
 class PixelReader:
     """DIR and ACC pixels read on demand through a small cache of raster blocks, for the walks that
     leave the channel network: a stem with fewer than four channel tributaries is walked over every
@@ -4308,7 +4367,7 @@ class PixelReader:
         if located is None:
             return 0
         pair, local_row, local_col = located
-        return int(pair[1][local_row, local_col])
+        return acc_count(pair[1][local_row, local_col])
 
     def inflows(self, row, col):
         """the neighbours whose flow direction points at (row, col), in the row-major order of the
@@ -4633,7 +4692,7 @@ def fd1_5_pfafstetter_cut(dir_path, bsn_path, str_path, acc_path, basin_row, gri
             rows.append((local_row + row0).astype(np.int32))
             cols.append((local_col + col0).astype(np.int32))
             codes.append(dir_tile[local_row, local_col])
-            accs.append(acc_tile[local_row, local_col].astype(np.int64))
+            accs.append(acc_counts(acc_tile[local_row, local_col]))
             del bsn_tile, dir_tile, acc_tile, selected
     if rows:
         network = ChannelNetwork(np.concatenate(rows), np.concatenate(cols), np.concatenate(codes), np.concatenate(accs), grid)
@@ -5334,7 +5393,6 @@ def _regions_of_the_level2_units(grid, regions, capacity_pixels, tag):
     them two at a time stopped at 79, because a join had to stay inside one Level-02 unit."""
     merges = []
     alive = [True] * len(regions)
-    windows = {}
 
     def window_of(indices):
         rectangle = regions[indices[0]].rectangle

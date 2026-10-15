@@ -1,7 +1,8 @@
 """fd_tables.py -- the tables of FlowDivide, one layout for both grids.
 
-Every FlowDivide table is written by one writer here and read by one reader here, with its header, its columns and
-its number formats, so that a table written and read back gives the same text.  A table of another layout is refused, not read:
+Every table of the partition listed below (the basin, group, region and piece tables and the basin maps) is written by
+one writer here and read by one reader here, with its header, its columns and its number formats, so that a table
+written and read back gives the same text; the tables of FD3 have their own in fd3_attributes.  A table of another layout is refused, not read:
 the FlowDivide results are read by FlowDivide only, and a run is made again rather than an old layout kept.
 
 THE WORDS: a count of grid cells is <what>_grid_count in every column name, whatever the resolution.  A BASIN is the whole drainage area of one outlet; a GROUP a set of whole basins read together (a
@@ -17,7 +18,9 @@ THE FILES OF ONE RUN (<run> the continent, or "global" for MERIT; <root> the run
     <partition root>global/table/basin_region_<run>.csv the region of every basin, a basin map
 
 THE BASIN TABLE, AND WHICH STEP FILLS WHICH COLUMN (the table is rewritten in place by each step):
-    basin_id                               fd1.2  1 .. N by drainage area, largest first; the row number
+    basin_id                               fd1.2  1 .. N, the largest drainage area first (the area-then-count
+                                                  rule), or a published table's ids (MERIT Hydro, in the order of
+                                                  its areas to six decimals); the row number
     global_basin_id                        fd1.2 on MERIT (= basin_id), fd1.7 on the 30 m grid (0 until then)
     level1_id .. level3_id                 fd1.4  the group ids (a HydroBASINS code, or an island or seam group's id)
     basin_id_in_level1 .. _in_region       fd1.6  the place of the basin in its group, 1 .. n in basin_id order
@@ -25,9 +28,11 @@ THE BASIN TABLE, AND WHICH STEP FILLS WHICH COLUMN (the table is rewritten in pl
     outlet_row outlet_col outlet_flag      fd1.2
     basin_grid_count basin_area_km2        fd1.2
     outlet_lon outlet_lat, the boxes       fd1.3
-A column not filled yet holds 0 (an id or a place), -1 (a row or a column; then basin_nrow and basin_ncol are 0) or
--9999 (a longitude or latitude).  Every table is written under a temporary name, renamed when whole, and given a .done
-marker; the basin table's marker says "basins=<n> stage=<step>", which its reader checks.
+A column not filled yet holds 0 (an id or a place), -1 (a row or a column; then basin_nrow and basin_ncol are 0),
+-1.0 (basin_area_km2, NO_AREA) or -9999 (a longitude or latitude).  Every table here is written under a temporary
+name, renamed when whole, and given a .done marker; the basin table's marker says "basins=<n> stage=<step>", which its
+reader checks.  Of FD3's outputs only the longest flow path's raster and table get .done markers (the others are
+marked by the run's step marker in _logs/); the C programs mark every attribute's raster and basin table.
 
 Function index:
     [1] Markers and publication: write_done_marker, read_marker_checks, file_is_complete, publish_with_marker
@@ -57,7 +62,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -390,7 +395,8 @@ def _raise_column_fault(faults, columns, path):
 
 def _check_column_types(frame, path, float_columns, text_columns):
     """what the reader refuses: an integer column holding a fraction or a word, a number
-    column holding inf or nan, and an id or a code outside 0 .. 2^32 - 1 (it would wrap when taken as unsigned)"""
+    column holding inf or nan, an id outside 0 .. 2^32 - 1 (unsigned 32-bit) and a code outside 0 .. 2^31 - 1
+    (signed 32-bit)"""
     _raise_column_fault(_column_faults(frame, float_columns, text_columns), list(frame.columns), path)
 
 

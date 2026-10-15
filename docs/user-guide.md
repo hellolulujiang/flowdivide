@@ -135,7 +135,7 @@ Any flow-direction grid runs the same way, at any resolution, projected or geogr
 | the raster type | any integer raster (the degrees do not fit a byte, and GRASS writes a CELL raster) |
 | the resolution and the projection | read from the grid; a geographic grid's blocks are one degree, a projected grid's about 100 km (10 km when the pixels are finer than 10 m), and `--block` sets another |
 | the basin groups | `--group-vectors <polygons>` (repeat for several; `:<pandas query>` filters one), any file whose units are whole basins; without it the basins are grouped along a Hilbert curve (`--groups hilbert`) |
-| the views | named by their cell size on a grid this package has no fixed names for: 100 m, 500 m, 2.5 km on a 10 m grid; 10 s, 50 s, 240 s on a 1 arc-second grid. A default view a quarter of whose cell is more pixels than the whole grid is left out, the finest made finer if it must be; `--view-factors 10,50` sets the views (pixels to a cell), taken as they are |
+| the views | named by their cell size on a grid this package has no fixed names for: 100 m, 500 m, 2.5 km on a 10 m grid; 10 s, 50 s, 240 s on a 1 arc-second grid. A default view a quarter of whose cell is more pixels than the whole grid is left out, the finest made finer if it must be; `--view-factors 10,50` sets the views (pixels to a cell): none is left out or made finer, but each is lowered to a divisor of the block (250 is 240 on a block of 3600 pixels) and a repeat is kept once |
 
 [![](media/basin_groups_south_america.png)](media/basin_groups_south_america.png)
 
@@ -200,19 +200,20 @@ dropped variable of FD1 stops and names the file.
 The package deletes nothing and writes over nothing. Whatever a run replaces -- an output it makes again, the
 marker of that output, the basin table of an earlier stage of FD1 (one copy a run), a dropped variable, what a
 stopped run left under a temporary name -- is moved into `_tmp_/<date>_<time>_<process>/` beside it. Those
-directories free no disk space until they are emptied by hand.
+directories free no disk space until they are emptied by hand. The one thing a run writes again is its own scratch
+while it runs: a block of FD3 held on disk is written again in place when it goes to disk a second time.
 
 | variable | file | what | read by |
 |---|---|---|---|
 | `dir` | `dir_<c>_<tag>_merit.tif` | the recoded flow directions | everything (never dropped) |
 | `acc` | `upg_<c>_<tag>.tif` | upstream pixel count | fd1.2, fd1.5 (the cut) |
-| `aca` | `upa_<c>_<tag>.tif` | upstream area, m² | fd1.2, fd1.5 (the areas of the pieces), fd3 hck |
+| `aca` | `upa_<c>_<tag>.tif` | upstream area: m² when fd1.1 makes it; the built-in grids read their provider's area, in km², from the provider's own file, and a raster given with `--aca` keeps its path and its unit (`--aca-unit`) | fd1.2, fd1.5 (the areas of the pieces), fd3 hck |
 | `str` | `str_<c>_<tag>.tif` | channel mask (upstream area ≥ 1 km², 10 km² on MERIT) | fd1.5 (the cut), fd3 shv hck ord |
 | `l3` | `l3_<c>_<tag>.tif` | the Level-03 codes burned onto the grid | fd1.4 |
 | `bsn` | `bsn_<c>_<tag>.tif` | the basin of every pixel | fd1.4, fd1.5, fd2, figures |
 | `rgn` | `rgn_<c>_<tag>.tif` | the region of every pixel | fd2, figures |
 | `pieces` | `pfafstetter_pieces_<c>_basin<id>_<tag>.tif` | the piece rasters of the cut basins | fd1.5, fd2 (the piece view), figures |
-| `shv ldn hck lup lfp ord` | `<var>_<c>_<tag>.tif` | the attributes (`shv` UInt32 nodata 0, `ldn` Float32 nodata −1, `hck` and `ord` Byte nodata 0, `lup` Float32 nodata −9999, `lfp` UInt32 nodata 0 — the C's values, so a raster of either program reads in the tools of the other) | products (lfp reads the member table of ldn) |
+| `shv ldn hck lup lfp ord` | `<var>_<c>_<tag>.tif` | the attributes (`shv` UInt32 nodata 0, `ldn` Float32 nodata −1, `hck` and `ord` Byte nodata 0 and at most 254, `lup` Float32 nodata −9999, `lfp` UInt32 nodata 0 — the C's values, so a raster of either program reads in the tools of the other; the tiled kernels of `tile_kernels.py` write the same, their distance with nodata −1 since 1.1.1) | products (lfp reads the member table of ldn) |
 
     python flowdivide.py run south-america --out-root /data/flowdivide --drop l3,acc,aca
 
@@ -244,7 +245,13 @@ pieces above; every region window is within the capacity and the region graph ha
 region and every piece holds in the mask what its members say; the colouring is read back from the
 file; the magnitude at every outlet equals the number of sources; the longest flow path measures
 what the distance walk found. A check that fails stops the step and nothing is published under its
-final name. The time of the read-back checks is recorded apart from the time of the work.
+final name, with one exception, so that a failed cut can be looked at. fd1.5 publishes a cut basin's piece raster
+under its final name first; then it checks the region graph for a cycle and the upstream-area raster, when there is
+one (on the grid, a finite positive area at every piece outlet); then it writes the piece, main-stem and code tables
+under their final names; and only then it checks that the cut is deep enough and makes at most 99 regions. The
+markers of the piece raster and the piece table, which the next steps ask for, are written only when every check
+has passed. The time of the read-back checks is recorded apart from the
+time of the work.
 
 The inputs of a step are checked before anything is indexed with them:
 flow directions in the MERIT coding are uint8 and hold only the eight directions, 0, 255 and 247; the
@@ -371,6 +378,10 @@ changes a published partition or attribute:
 - **GDAL's threads.** The C programs read most rasters on GDAL's threads and hand every written piece to the
   compression as soon as it is written (64-bit integer rasters, the merge of MERIT Hydro's tiles and fd1.4 are on
   one thread); the package reads the GeoTIFFs it opens on the calling thread ([GDAL's threads](#gdals-threads)).
+- **What FD1.0 and FD2 take.** FD1.0 reads the flow directions from any integer raster and takes the convention's
+  nodata whatever the file's own nodata says; the C check of a MERIT grid takes a Byte raster whose nodata is 247.
+  FD2 takes a grid that is not a whole number of cells of a view: the last row and column of cells are partial and
+  judged as if the missing pixels were water; the C program refuses such a grid.
 - **The size of a region.** As in the C code, a region's window with its ring of one pixel must fit a 32-bit index
   (2³¹ − 1 pixels); a larger window is refused when the attributes are computed. The package refuses it for the
   longest flow path as well; the C program of the longest flow path alone takes a larger window.
@@ -392,11 +403,12 @@ The tests are scripts; each prints its checks and leaves with exit status 0 when
     python test_fd2_outline_across_the_seam.py    # the outline of an object across the 180th meridian (0.7.9)
     python test_fine_grids_and_run_lock.py        # very fine geographic grids; the lock of a run (0.7.9)
     python test_gdal_threads.py                   # the burn of two layers and writes between reads on GDAL's threads (1.1.0)
+    python test_caps_and_counts.py                # the limits shared with the C programs (1.1.1)
     python test_three_ways_on_one_basin.py all <case directory>
     python test_tile_kernels.py <case directory>
     python test_fd3_sweeps.py <case directory>
 
-The first thirteen need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
+The first fourteen need no data. `test_level_fold.py` also folds the Level-03 tables of a finished run
 when `FLOWDIVIDE_DATA_ROOT` names the directory that holds them (`HydroSHEDS_v2_30m/<continent>/` and
 `MERIT_Hydro_90m/global/`). Without it, that part is skipped. The last three run on a case
 directory that `test_three_ways_on_one_basin.py prepare` cuts from a finished run; they write their

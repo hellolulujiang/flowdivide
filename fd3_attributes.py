@@ -3,8 +3,9 @@
 Every basic hydrographic attribute is a recurrence along the flow directions, and there are four
 kinds: an accumulation adds a value downstream (the Shreve magnitude), a label copies a value upstream
 from the outlet (the distance to the outlet, the Hack order), a maximum carries the largest value
-downstream (the upstream flow length, the longest flow path), and the Strahler order takes the largest
-order among the inflows plus one when two share it.  On the partition of stage 1 every one of them
+downstream (the upstream flow length), and the Strahler order takes the largest order among the inflows
+plus one when two share it.  The longest flow path is of none of them: its head is the farthest pixel the
+distance to the outlet finds, and the path is painted from the head down, the regions visited downstream first.  On the partition of stage 1 every one of them
 is computed once per region, exactly, with one value crossing each cut:
 
     the regions are visited in an order in which every region a region needs comes first: the regions
@@ -29,22 +30,27 @@ is computed once per region, exactly, with one value crossing each cut:
 GDAL's block cache is held to 512 MiB while an attribute is computed (GDAL_CACHE_BYTES_DEFAULT; --gdal-cache-mb
 of flowdivide.py or FLOWDIVIDE_GDAL_CACHE_MB set another bound).
 
-Six attributes are provided, and a user adds one by writing its rule as a Numba kernel of the same
-shape as the six below (see the end of this file).
+Six attributes are provided, and a user adds one by writing its rule as a Numba kernel with the window
+contract of register_attribute (see the end of this file); the provided ones are swept over compact arrays, and
+the longest flow path has a driver of its own.
 
     shv  Shreve magnitude          UInt32   channel pixels; 1 at a source, the sum of the inflows below
-    ldn  distance to the outlet    Float32  metres along the flow path; 0 at the outlet, -1 elsewhere
+                                            (Shreve, 1966, Journal of Geology 74, 17-37)
+    ldn  distance to the outlet    Float32  metres along the flow path; 0 at the outlet, more upstream, -1
+                                            (nodata) outside the basins
     hck  Hack order                Byte     channel pixels; 1 along the main stem (the inflow with the
                                             largest upstream area keeps the order), one more on a tributary
     lup  upstream flow length      Float32  metres of the longest path from a divide down to the pixel
-    lfp  longest flow path         UInt32   the basin id on the pixels of the basin's longest path, and the
-                                            paths as lines in a GeoPackage
+    lfp  longest flow path         UInt32   the basin id on the pixels of the basin's longest path; through
+                                            derive_attribute with lines_path, the paths as lines in a GeoPackage
+                                            too (flowdivide.py gives none)
     ord  Strahler order            Byte     channel pixels
 
 A channel pixel is a pixel of the channel mask of FD1.1 (upstream area at least the threshold: by
-default 1 km2 on the HydroSHEDS grids and 10 km2 on MERIT).  The attributes
+default 1 km2 on the HydroSHEDS grids and 10 km2 on MERIT).  shv, hck, ord and lfp
 are computed for the basins of at least min_basin_area_km2 (1 km2 by default) and the pieces of the
-cut basins; every other pixel keeps the nodata value.
+cut basins; ldn and lup, as flowdivide.py runs them, for every basin however small, while their tables list the
+basins of min_basin_area_km2 and more.  Every other pixel keeps the nodata value.
 """
 import collections
 import contextlib
@@ -69,10 +75,11 @@ from numba import njit
 from rasterio.windows import Window
 
 import fd_tables
-from fd1_partition import (DROW, DCOL, IS_LAND, IS_TERMINAL, MERIT_NODATA, FlowDivideError, Grid, RASTER_BLOCK, check_merit_flow_directions, earth_distance_m, log, open_raster, publish,
-                           raster_profile, read_block, read_table, timing, write_block, write_json, write_table, ensure_directory)
+from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, ORDER_CAP, FlowDivideError, RASTER_BLOCK, check_merit_flow_directions, earth_distance_m, log, open_raster, publish,
+                           raster_profile, read_table, timing, write_block, write_json, write_table)
 
 PATH_FRAMES = 1 << 22         # the points lfp's path buffers start with (doubled for a longer path)
+LFP_LENGTH_TOLERANCE_M = 1e-3  # the painted path against the distance walk's length, as the C code
 SWEPT_ATTRIBUTES = ("shv", "ldn", "hck", "lup", "ord")   # every class but the longest flow path, which
                                                          # walks one path and not a whole member
 # the columns of the basin table the partition reads (fd_tables.read_basin_table_columns keeps only these)
@@ -1187,8 +1194,8 @@ def sweep_maximum_length(count_in_order, pixel_of_compact, member_of_compact, do
 @njit(cache=True)
 def sweep_shreve_magnitude(count_in_order, member_of_compact, downstream_of_compact, value, visited_of_member,
                            sources_of_member):
-    """The accumulation class on the channel network: a channel head counts 1 and every other channel pixel counts
-    what arrives at it.  Swept downwards, so what arrives at a pixel is complete when the pixel is reached; `value`
+    """The accumulation class on the channel network (Shreve's magnitude, 1966): a channel head counts 1 and every
+    other channel pixel counts what arrives at it.  Swept downwards, so what arrives at a pixel is complete when the pixel is reached; `value`
     carries the arriving sum until the pixel is finished and its own magnitude afterwards.  Every pixel of the order
     is a channel pixel, and so is the one it flows into (the mask is the order)."""
     for compact in range(count_in_order - 1, -1, -1):
@@ -1257,12 +1264,14 @@ def sweep_hack_order(count_in_order, pixel_of_compact, member_of_compact, downst
         if below >= 0:
             if best_donor[below] == pixel_of_compact[compact]:
                 value[compact] = value[below]
-            elif value[below] >= 255:
-                return 1                                    # an order the raster cannot carry
+            elif value[below] >= ORDER_CAP:
+                return 1                                    # an order past ORDER_CAP (254)
             else:
                 value[compact] = value[below] + 1
         if value[compact] == 0:
             return 2                                        # nothing gave this channel pixel an order
+        if value[compact] > ORDER_CAP:
+            return 1                                        # past ORDER_CAP, one carried in from the outlet too
         visited_of_member[mine] += 1
         if value[compact] > largest_of_member[mine]:
             largest_of_member[mine] = value[compact]
@@ -1283,10 +1292,10 @@ def sweep_strahler_order(count_in_order, member_of_compact, downstream_of_compac
             sources_of_member[mine] += 1
         elif largest == arriving_second[compact]:
             here = largest + 1
-            if here > 255:
-                return 1                                    # an order the raster cannot carry
         else:
             here = largest
+        if here > ORDER_CAP:
+            return 1                                        # an order past ORDER_CAP (254), one carried in too
         value[compact] = here
         visited_of_member[mine] += 1
         below = downstream_of_compact[compact]
@@ -1615,8 +1624,12 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                 for child, outlet_pixel, inlet_compact, outlet_on_network, inlet_on_network in crossing:
                     if not (outlet_on_network and inlet_on_network):   # the order the child's region reads
                         continue
-                    states[child.member_id] = int(value[inlet_compact] if best_donor[inlet_compact] == outlet_pixel
-                                                  else value[inlet_compact] + 1)
+                    across = int(value[inlet_compact] if best_donor[inlet_compact] == outlet_pixel
+                                 else value[inlet_compact] + 1)
+                    if across > ORDER_CAP:                  # 1.1.1: held here too, as in the C code
+                        raise FlowDivideError("hck: the order handed to member %d is %d, past %d"
+                                              % (child.member_id, across, ORDER_CAP))
+                    states[child.member_id] = across
                 del best_donor
             else:
                 raise FlowDivideError("the ordered sweep does not carry the attribute '%s'" % attribute)
@@ -2015,15 +2028,15 @@ def derive_attribute(attribute, partition, dir_path, out_path, table_path, membe
     <table_path> with one row per basin (the columns of the <name>_basin table) and the table
     <member_table_path> with one row per member.  channel_path is needed for shv, hck and ord,
     area_path (the upstream area) for hck.  For lfp, the per-member heads of a ldn run (ldn_member_table)
-    are used when given, otherwise the distance walk is run first without writing its raster; the
-    paths as lines go to lines_path.  gdal_cache_mb: the bound of GDAL's block cache for the run, in MiB
+    are used when given, otherwise the distance walk is run first into scratch files beside the outputs (a raster
+    as large as the distance's, its table and member table), the raster, its report and the table moved into _tmp_
+    after and the member table left; the paths as lines go to lines_path.  gdal_cache_mb: the bound of GDAL's block cache for the run, in MiB
     (gdal_cache_bytes: FLOWDIVIDE_GDAL_CACHE_MB, or 512); GDAL_CACHEMAX does not reach FD3, which sets the cache
     itself and gives it back as it was when the attribute is done."""
     if attribute not in ATTRIBUTES:
         raise FlowDivideError("unknown attribute '%s'" % attribute)
     spec = ATTRIBUTES[attribute]
     tag = tag or "fd3." + attribute
-    grid = partition.grid
     started = time.time()
     if spec["channel"] and channel_path is None:
         raise FlowDivideError("%s needs the channel mask" % attribute)
@@ -2130,13 +2143,13 @@ def _basin_table_from_members(attribute, partition, member_table):
 def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_table_path, lines_path, tag, ldn_member_table, started,
                               gdal_cache_mb=None):
     """the longest flow path of every kept basin: the head is the pixel with the largest distance to the
-    outlet (from the ldn member table, or from a distance walk run here without a raster), and the
+    outlet (from the ldn member table, or from a distance walk run here into scratch files), and the
     path is painted from the head down through the chain of members that hold it, one region at a
     time, as the basin id.  The lines go to lines_path (a GeoPackage), the segments per member to
     member_table_path."""
     grid = partition.grid
     if ldn_member_table is None or not os.path.exists(ldn_member_table):
-        log(tag, "no distance table given: the distance walk runs first, without a raster")
+        log(tag, "no distance table given: the distance walk runs first, into a scratch raster moved into _tmp_ after")
         scratch = out_path + ".ldn_scratch.tif"
         ldn_member_table = table_path + ".ldn_scratch_members.csv"
         derive_attribute("ldn", partition, dir_path, scratch, table_path + ".ldn_scratch.csv", ldn_member_table, tag=tag + ".ldn",
@@ -2211,7 +2224,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     log(tag, "%d regions to visit; the tables are read, peak memory so far %.1f GB" % (len(order), peak_memory_gb()))
     temporary = fd_tables.free_name(out_path + ".partial.tif")
     profile = raster_profile(grid, "uint32", 0)
-    with rasterio.open(temporary, "w", **profile) as created:
+    with rasterio.open(temporary, "w", **profile):
         pass
     # 4 million points to start with (64 MB for the two), doubled for a longer path; a path is never longer than its
     # member, so a buffer past the member's pixel count that is still too short means the flow does not reach the outlet
@@ -2286,7 +2299,12 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                                        grid.latitude_of_row(member.parent_inlet_row), grid.longitude_of_col(member.parent_inlet_col)) if grid.geographic \
                 else math.hypot((member.outlet_row - member.parent_inlet_row) * grid.pixel_height, (member.outlet_col - member.parent_inlet_col) * grid.pixel_width)
             member = parent
-        if not (abs(length - head["length_m"]) <= 1e-3 * max(1.0, head["length_m"])):     # a NaN or inf fails too
+        # 1 mm, as the C code (1.1.1; 1e-3 of the length until 1.1.0, 1 m in 1 km).  The two sums add the same steps
+        # in float64, the walk's from the outlet up and the path's segment by segment from the head down; each
+        # addition rounds by at most half a unit in the last place of the total, so on a path of up to 7,000 km in up
+        # to 700,000 steps each sum is within 0.33 mm of the exact length and a correct run passes; a longer path or
+        # more steps is outside that bound, and there a correct run could fail
+        if not (abs(length - head["length_m"]) <= LFP_LENGTH_TOLERANCE_M):     # a NaN or inf fails too
             raise FlowDivideError("basin %d: the painted path measures %.1f m, the distance walk found %.1f m" % (basin_id, length, head["length_m"]))
         basin = partition.basins[basin_id]
         head_col = head["head_col"] % grid.ncol if grid.periodic else head["head_col"]
@@ -2368,8 +2386,8 @@ def _write_lines(path, table, geometries, grid):
 #  [4] A rule of the user's own
 # =============================================================================
 #
-#  An attribute is added by writing one Numba kernel with the shape of the sweeps of section [2b] and
-#  registering it here.  The kernel is called once per region and receives the visiting order of the
+#  An attribute is added by writing one Numba kernel with the window contract of register_attribute below
+#  (not the compact arrays of the sweeps of section [2b]) and registering it here.  The kernel is called once per region and receives the visiting order of the
 #  window, the pixel each pixel flows into, the member each pixel belongs to (-1 for a pixel of another
 #  region), the window arrays it asked for, the row step lengths, the width of the window and an array to
 #  count the pixels it took for each member; it returns a status, 0 when it is done.  A rule handed down

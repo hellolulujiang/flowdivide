@@ -62,8 +62,8 @@ import rasterio
 from numba import njit
 from rasterio.windows import Window
 
-from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, checking, timing, log, open_raster, publish, read_block, read_table, write_json, write_table, ensure_directory,
-                           basin_rectangles, group_windows_in_pixels)
+from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, checking, timing, log, open_raster, publish, read_table, write_json, write_table, ensure_directory,
+                           basin_rectangles)
 import fd_tables
 
 FLOWDIVIDE_VERSION = fd_tables.VERSION  # named in the metadata of every vector file
@@ -96,8 +96,9 @@ VECTOR_FORMATS = ("geoparquet", "gpkg")  # --vector: one of them, or both
 GEOPARQUET_ROW_GROUP_ROWS = 65536         # the row groups of a GeoParquet file
 
 # The palettes of the figures.  Which hue a color_id number gets is a choice of the map, not of the data:
-# the colouring gives every object a number 1 .. K (at least COLOURS_AT_LEAST numbers are used, so that
-# the same colour does not come back two objects apart); "okabe-ito" is the palette of the style
+# the colouring gives every object a number 1 .. K: two neighbours never share one, and at least COLOURS_AT_LEAST
+# numbers are open, so that a number comes back two objects apart only when no open number is free (one object
+# alone takes 1); "okabe-ito" is the palette of the style
 # (the seven colours of Okabe and Ito and a purple, then the reserves), "pastel" the soft colours of the
 # figures.  The GeoPackage views carry COLOR_ID_STYLE_PALETTE as their default style (embed_color_id_style).
 PALETTES = {
@@ -1031,7 +1032,8 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
     boundaries_stem the outer rings of every polygon are written there as lines, with the identifier and the
     first two added columns only (a basin's divide as a map draws it).  The mask is held in memory when it is
     smaller than memory_limit_bytes, otherwise every object's rectangle is read from the file.  The colouring
-    uses at least colours_at_least numbers."""
+    opens at least colours_at_least numbers: neighbours always differ, and a number two objects apart is avoided
+    while an open one is free."""
     import geopandas
     from rasterio import features
     from shapely.geometry import shape, MultiLineString, LineString
@@ -1369,7 +1371,6 @@ def _draw_labelled_raster(axis, label_raster, extent, label_text_of, hatched=(),
     """every label filled with its colour, the lines between labels, hatching for some, a number at the
     middle of each label's cells; a label too small to see gets a dot (dots_for_every_label: also the
     labels that get no text).  Returns the text objects."""
-    import matplotlib.pyplot as plt
     from matplotlib.colors import ListedColormap
     label_list = sorted(int(v) for v in np.unique(label_raster) if v > 0)
     if colour_of is None:

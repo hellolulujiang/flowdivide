@@ -70,7 +70,6 @@ test_tile_kernels.py checks every answer against the whole-domain one of three_w
 import argparse
 import math
 import contextlib
-import os
 import time
 
 import numpy as np
@@ -79,7 +78,7 @@ from numba import njit
 from rasterio.windows import Window
 
 import fd_tables
-from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, FlowDivideError, Grid, log, open_raster, publish,
+from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, ORDER_CAP, FlowDivideError, Grid, log, open_raster, publish,
                            raster_profile, read_halo_tile, tile_exits_and_drains, tile_inlets, tile_topological_order,
                            write_json, _accumulate_over_exit_graph_area_only, _link_exits_to_inlets,
                            _pass_one_local_totals_area_only, _pass_two_accumulate_area_only)
@@ -152,8 +151,8 @@ def tiles_of_distribution(grid, tile_degrees=TILE_DEGREES_DEFAULT, tile_metres=T
 # =============================================================================
 
 def check_no_flow_leaves_the_grid(off_grid_total, into_nodata_total):
-    """FD1.0 turns a direction that points into nodata or off the grid into a river mouth, so a grid that is
-    ready for these kernels has none left.  A grid that still has them is in another convention, and every
+    """FD1.0 turns a direction that points into nodata or off the grid into a river mouth (under the merit
+    convention it refuses such a grid instead), so a grid that is ready for these kernels has none left.  A grid that still has them is in another convention, and every
     area and every distance below such a pixel would be wrong without a word (fd1.1 refuses the same way)."""
     if off_grid_total != 0 or into_nodata_total != 0:
         raise FlowDivideError("%d pixels flow off the grid and %d into nodata; the grid is not in the MERIT convention (run FD1.0)"
@@ -534,8 +533,9 @@ def _ldn_write_tile(halo_dir, order, drain, distance_to_drain, exit_distance_to_
         out[row, col] = value
 
 
-def ldn_on_tiles(dir_path, out_path, grid, tiles, tag="tiles.ldn", nodata=-9999.0):
-    """the distance to the outlet, one tile at a time on the producer's tiles: two passes over the grid"""
+def ldn_on_tiles(dir_path, out_path, grid, tiles, tag="tiles.ldn", nodata=-1.0):
+    """the distance to the outlet, one tile at a time on the producer's tiles: two passes over the grid.  nodata -1, as
+    fd3's distance and the C code's (1.1.1; -9999 until 1.1.0)"""
     started = time.time()
     records, land_total = _pass_one_over_tiles(dir_path, grid, tiles, tag)
     inlet_of_exit, next_exit = _exit_graph_of(records, tag)
@@ -736,7 +736,7 @@ def _strahler_order_of_tile(halo_dir, order, channel, inlet_local, arriving_larg
                             exit_pixel_of_exit, exit_order_out, value):
     """The Strahler order of every channel pixel of the tile, given the largest and second largest order
     arriving at each of its inlets.  Writes the order of every pixel into `value` (0 off the channel) and
-    the order at every exit pixel into `exit_order_out`.  Returns 1 when an order does not fit a byte, 2 when a
+    the order at every exit pixel into `exit_order_out`.  Returns 1 when an order passes ORDER_CAP (254), 2 when a
     channel pixel flows into a land pixel off the channel inside the tile, 3 when an order arrives from another tile at
     an inlet off the channel (the channel is broken there; the whole-domain FD3 stops on it too, and carrying on
     would count the pixel below the break as a source)."""
@@ -764,7 +764,7 @@ def _strahler_order_of_tile(halo_dir, order, channel, inlet_local, arriving_larg
             own = second[pixel] + 1
         else:
             own = largest[pixel]
-        if own > 255:
+        if own > ORDER_CAP:
             return 1
         value[pixel] = own
         code = halo_dir[row + 1, col + 1]
@@ -872,7 +872,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
         while to_sweep.any():
             sweeps += 1
             # A sweep either changes an order at an exit or is the last one.  An order only ever rises and no
-            # order passes 255, so the changes are at most 255 per exit and that bounds the sweeps -- not the
+            # order passes ORDER_CAP (254), so the changes are fewer than 255 per exit and that bounds the sweeps -- not the
             # number of tiles: a river that leaves a tile and comes back makes the tile graph cyclic and then
             # one sweep can settle one hop (4 x tiles + 16 is not a bound, nor is one per exit; 255 per exit
             # is).

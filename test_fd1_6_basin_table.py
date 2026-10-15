@@ -7,7 +7,8 @@ that the code holds; no number from it goes anywhere.
 The case: five basins in two Level-03 groups (611, 612) of one Level-02 unit (61), one island group (206001), and
 basin 1 cut into two pieces whose outlet piece is in region 61102.  Checked: region_id is the map's value, or the
 outlet piece's region for the cut basin; the places are 1 .. n in basin_id order within each unit; a map of another
-key, a table without its marker and a basin without a group are refused.
+key, a key other than the Level-03 partition of 2^31 (with its own map), a table without its marker and a basin
+without a group are refused.
 """
 import os
 import sys
@@ -80,6 +81,10 @@ def made_up_run(work):
     return basin_table, map_path, region_path, piece_path, key
 
 
+def run_of(basin_table):
+    return fd_tables.root_and_run_of_basin_table(basin_table)[1]
+
+
 def the_columns_are_filled():
     print("fd1.6 on five basins")
     work = tempfile.mkdtemp(prefix="flowdivide_fd1_6_")
@@ -94,6 +99,17 @@ def the_columns_are_filled():
     check("places in the region (61201 holds 2 and 5)", table["basin_id_in_region"].tolist(), [1, 1, 1, 1, 2])
     other_key = fd_tables.region_map_key(80 * 3600 * 3600, 3600, "l3")
     refused("a map of another partition", lambda: fd1.fd1_6_basin_table(basin_table, map_path, region_path, piece_path, other_key))
+    # 1.1.1: the key itself must be the Level-03 partition of 2^31, whatever map is given with it
+    hilbert_key = fd_tables.region_map_key(160 * 3600 * 3600, 3600, "hilbert")
+    fd_tables.write_basin_map(map_path + ".hilbert", np.array([0, 0, 61201, 61101, 206001, 61201], np.int64), run_of(basin_table),
+                              "region", hilbert_key)
+    refused("a key of the Hilbert groups, its map with it",
+            lambda: fd1.fd1_6_basin_table(basin_table, map_path + ".hilbert", region_path, piece_path, hilbert_key))
+    half_key = fd_tables.region_map_key(80 * 3600 * 3600, 3600, "l3")
+    fd_tables.write_basin_map(map_path + ".half", np.array([0, 0, 61201, 61101, 206001, 61201], np.int64), run_of(basin_table),
+                              "region", half_key)
+    refused("a key of 2^30, its map with it",
+            lambda: fd1.fd1_6_basin_table(basin_table, map_path + ".half", region_path, piece_path, half_key))
     os.remove(basin_table + ".done")
     refused("a basin table without its marker", lambda: fd1.fd1_6_basin_table(basin_table, map_path, region_path, piece_path, key))
 

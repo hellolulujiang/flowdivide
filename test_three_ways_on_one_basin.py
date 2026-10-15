@@ -25,7 +25,6 @@ import sys
 import time
 
 import numpy as np
-import pandas as pd
 import rasterio
 from rasterio.windows import Window
 

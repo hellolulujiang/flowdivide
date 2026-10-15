@@ -40,7 +40,6 @@ import math
 
 from numba import njit
 
-import fd1_partition as fd1
 import three_ways
 import tile_kernels
 from fd1_partition import Grid
@@ -199,7 +198,7 @@ def main():
     reference = whole_domain_answers(arguments.case, arguments.channel_threshold_km2)
     nrow, ncol = reference["nrow"], reference["ncol"]
     land = reference["flow_direction"] != three_ways.LIBRARY_NODATA
-    channel = reference["channel"] != 0
+    reference["channel"] != 0
     results = []
     # upa: the accumulation on the distribution tiles
     upa_path = os.path.join(out_directory, "upa.tif")

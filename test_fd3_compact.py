@@ -23,7 +23,7 @@ import numpy as np
 from numba import njit
 
 import fd3_attributes as fd3
-from fd1_partition import DROW, DCOL, IS_LAND
+from fd1_partition import IS_LAND
 
 FAILURES = []
 

@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.1.1 (2026-10-15)
+
+No result changes in the chain: on the Sri Lanka sample (a run where basins are cut and the six attributes are
+computed, and a run with the default capacities and the views) every raster equals 1.1.0's pixel for pixel, every
+table byte for byte, and the polygon files equal it in rows, columns and geometry (their metadata names the
+version). Four limits are now the C programs': three refuse what 1.1.0 let through, and one reads a fractional
+upstream count as fd1.2 already did, which a raster of whole counts (fd1.1's own, MERIT Hydro's) never holds. The
+distance to the outlet on regular tiles, a helper outside the chain, now writes nodata as the chain does. The
+documentation says what the code does.
+
+- **fd1.6 writes `region_id` for the Level-03 partition of 2³¹ only**, as the C program does. The command line already
+  held to it; `fd1_6_basin_table` called on its own took the key of any partition. It now refuses another key
+  (`fd1.top_tier_blocks`, `fd1.level3_top_tier_key`; `capacity_blocks_of` in `flowdivide.py` uses the same rule).
+- **fd1.5 reads an upstream count as fd1.2 and the C programs do**: the value v as a double, floor(v + 0.5) when
+  1 ≤ v < 9 × 10¹⁸, otherwise 0 (`fd1.acc_count`, `fd1.acc_counts`). Until 1.1.0 the cut dropped the fraction, so a
+  count of 1.6 read 1 there and 2 in fd1.2. A whole count up to 2⁵², which every grid's is, reads the same as before.
+- **The longest flow path is checked to 1 mm**, as in the C programs: the painted path against the length the
+  distance walk found. Until 1.1.0 the check allowed 10⁻³ of the length (1 m in 1 km). Both sums add the same steps
+  in double precision, in other orders; each addition rounds by at most half a unit in the last place of the total,
+  so on a path of up to 7,000 km in up to 700,000 steps each sum is within 0.33 mm of the exact length and a correct
+  run passes. A longer path or more steps is outside that bound, and there a correct run could fail the check.
+- **The Hack and Strahler orders stop at 254**, as in the C programs (`fd1.ORDER_CAP`); 1.1.0 allowed 255. Every
+  order a sweep writes is held to it, one copied from below or carried in at a cut too, and so is an order handed
+  across a cut to the Hack order of the region above, which was not held at all. No grid of the paper comes near it.
+- **The distance to the outlet on regular tiles (`tile_kernels.ldn_on_tiles`) writes nodata −1**, as FD3 and the C
+  programs do; until 1.1.0 it wrote −9999.
+- The documentation set right: the inputs of a run (the provider's upstream count and area of the built-in grids,
+  MERIT Hydro's table of basin ids); views given with `--view-factors` are still lowered to a divisor of the block;
+  how the basins are numbered on MERIT Hydro; what the colouring guarantees; which pixels and tables the attributes
+  cover and what the distance's nodata −1 means; that the longest flow path's own distance walk writes a scratch
+  raster; the lines of the longest flow path come from the Python API only; the columns of the Hilbert groups; the
+  ranges of ids and codes; which outputs of FD3 carry `.done` markers; what FD1.0 and FD2 take that the C programs
+  refuse; what a cut that is not deep enough leaves for inspection; the scratch a running FD3 writes again.
+- Tests: `test_caps_and_counts.py` (the upstream count, the top tier, the order limit, the tiled distance's nodata);
+  `test_fd1_6_basin_table.py` also refuses the keys of other partitions. Unused imports and variables removed.
+- Two sentences of earlier entries were not so. 1.0.0: views given with `--view-factors` are not "taken as they are";
+  each is lowered to a divisor of the block and a repeat is kept once. 0.7.9: the package writes over nothing but its
+  own scratch while it runs (a block of FD3 held on disk is written again in place when it goes to disk a second time).
+
 ## 1.1.0 (2026-10-13)
 
 No result changes: on the Sri Lanka sample (a run where basins are cut and the six attributes are
