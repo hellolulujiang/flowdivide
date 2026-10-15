@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.2 (2026-10-15)
+
+No result changes for the built-in grids, whose only filter (`PFAF_ID != 353`, North America) was read right.
+
+- **A filter of `--group-vectors` is read as OGR reads it** (`fd1.ogr_attribute_filter`): an SQL condition on the
+  attribute table; outside quotes, pandas' `==` and `!=` are taken as `=` and `<>` and a list in square brackets is
+  refused, and a quoted string or name is kept as it is. Until 1.1.1 only `!=` was converted, everywhere, and OGR reads `PFAF_ID == 353` and `PFAF_ID IN [611, 612]` without an error as conditions
+  that keep every polygon, so a filter written as the user guide said (a pandas query) could group the basins on
+  every polygon of the file.
+- The documentation set right: a grid needs a coordinate reference system, north up, in degrees or metres; a
+  polygon file of `--group-vectors` needs a coordinate reference system and a field `PFAF_ID` of three-digit codes;
+  the default block on a projected or a very fine grid; on the built-in MERIT Hydro grid the basin views are rasters
+  only; `--sink-code` (a direction pointing into nodata is a river mouth, not a sink); `--group-vectors` is optional
+  for a grid of your own.
+- Tests: `test_caps_and_counts.py` also reads a filter as OGR does.
+
 ## 1.1.1 (2026-10-15)
 
 No result changes in the chain: on the Sri Lanka sample (a run where basins are cut and the six attributes are

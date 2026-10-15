@@ -38,6 +38,7 @@ Conventions used throughout the three stage files:
 import json
 import math
 import os
+import re
 import struct
 import time
 
@@ -2333,6 +2334,22 @@ def fd1_3_watershed_delineation(dir_path, basin_table_path, bsn_path, grid, tile
 LEVEL3_CODE_LIMIT = 1000                                # a Level-03 code has three digits, 100 .. 999
 
 
+def ogr_attribute_filter(query):
+    """a filter of --group-vectors as GDAL's OGR takes it: an SQL condition on the attribute table (PFAF_ID < 400,
+    PFAF_ID IN (611, 612), PFAF_ID <> 353), None for none.  Outside quotes, pandas' == and != are taken as = and <>
+    and a list in square brackets is refused; a string ('...', '' for a quote in it) and a quoted name ("...") are
+    kept as they are.  1.1.2: until 1.1.1 only != was converted, everywhere, and OGR reads PFAF_ID == 353 and
+    PFAF_ID IN [611, 612] without an error as conditions that keep every polygon"""
+    if not query:
+        return None
+    parts = re.split(r"""('(?:[^']|'')*'|"[^"]*")""", query)
+    for k in range(0, len(parts), 2):                       # the even parts lie outside quotes
+        if "[" in parts[k] or "]" in parts[k]:
+            raise FlowDivideError("the filter '%s' holds a list in square brackets; write it IN (a, b)" % query)
+        parts[k] = parts[k].replace("==", "=").replace("!=", "<>")
+    return "".join(parts)
+
+
 def _open_level3_layer(path, query, codes_seen, tag):
     """one polygon file opened read-only, its filter set and the codes it will burn added to codes_seen: a file without a layer, a spatial reference or the field PFAF_ID, a filter GDAL does
     not accept and a code outside 100 .. 999 are refused (going on after a refused filter would burn every
@@ -2352,7 +2369,7 @@ def _open_level3_layer(path, query, codes_seen, tag):
     field_index = layer.GetLayerDefn().GetFieldIndex("PFAF_ID")
     if field_index < 0:
         raise FlowDivideError("%s has no field PFAF_ID" % path)
-    condition = query.replace("!=", "<>") if query else None      # the dataset's pandas query as an OGR condition
+    condition = ogr_attribute_filter(query)
     if condition and layer.SetAttributeFilter(condition) != 0:
         raise FlowDivideError("the filter '%s' is not accepted on %s" % (condition, path))
     polygon_count = 0
@@ -2462,7 +2479,7 @@ def _written_level3_on_the_grid(dir_path, temporary):
 def fd1_4_rasterise_level3(dir_path, l3_path, grid, layers, strip_rows=None, tag="fd1.4"):
     """the Level-03 polygons burned onto the grid of DIR: every pixel gets the PFAF_ID of the polygon
     that holds its centre, 0 where none does.  `layers` is a list of (shapefile path, attribute filter
-    or None); the filter is a pandas query string on the attribute table, e.g. "PFAF_ID != 353".
+    or None); the filter is an OGR SQL condition on the attribute table (ogr_attribute_filter), e.g. "PFAF_ID != 353".
     Burned as the script that made the raster first burned them: GDAL's RasterizeLayer on the whole output, a GTiff of 512 x 512
     tiles on the grid of DIR, the layers in the order given, GDAL's cache left at its default.  GDAL
     burns a large output in chunks of rows, and the chunks follow the tiles and the cache;

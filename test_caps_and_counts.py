@@ -1,6 +1,6 @@
 """The limits the package shares with the C code, on made-up values: the upstream count read from a raster (whole
 counts, halves up), the top tier of the capacities, the highest stream order (254) and the tiled distance's nodata
-(-1).  Synthetic: it checks that the code holds; no number from it goes anywhere.
+(-1); and a filter of --group-vectors read as OGR reads it.  Synthetic: it checks that the code holds; no number from it goes anywhere.
 
     python3 test_caps_and_counts.py
 """
@@ -95,11 +95,43 @@ def the_tiled_distance():
     check("its nodata is fd3's", default, fd3.ATTRIBUTES["ldn"]["nodata"])
 
 
+def the_polygon_filter():
+    print("a filter of --group-vectors")
+    from osgeo import gdal, ogr, osr
+    gdal.UseExceptions()
+    source = ogr.GetDriverByName("Memory").CreateDataSource("filters")
+    reference = osr.SpatialReference()
+    reference.ImportFromEPSG(4326)
+    layer = source.CreateLayer("basins", reference, ogr.wkbPolygon)
+    layer.CreateField(ogr.FieldDefn("PFAF_ID", ogr.OFTInteger))
+    for code in (111, 353, 400):
+        feature = ogr.Feature(layer.GetLayerDefn())
+        feature.SetField("PFAF_ID", code)
+        layer.CreateFeature(feature)
+    for query, want in (("PFAF_ID == 353", [353]), ("PFAF_ID != 353", [111, 400]), ("PFAF_ID = 353", [353]),
+                        ("PFAF_ID IN (111, 400)", [111, 400]), ("PFAF_ID < 400 and PFAF_ID > 111", [353])):
+        layer.SetAttributeFilter(fd1.ogr_attribute_filter(query))
+        layer.ResetReading()
+        check("the polygons of %r" % query, sorted(f.GetField("PFAF_ID") for f in layer), want)
+    try:
+        fd1.ogr_attribute_filter("PFAF_ID IN [111, 400]")
+        refused = False
+    except fd1.FlowDivideError:
+        refused = True
+    check("a list in square brackets", "refused" if refused else "taken", "refused")
+    check("no filter", fd1.ogr_attribute_filter(None), None)
+    check("== inside a string", fd1.ogr_attribute_filter("NAME = 'a==b' AND PFAF_ID == 353"), "NAME = 'a==b' AND PFAF_ID = 353")
+    check("brackets inside a string", fd1.ogr_attribute_filter("NAME = '[x]'"), "NAME = '[x]'")
+    check("a quote inside a string", fd1.ogr_attribute_filter("NAME = 'it''s' AND PFAF_ID != 1"), "NAME = 'it''s' AND PFAF_ID <> 1")
+    check("<= and >= kept", fd1.ogr_attribute_filter("PFAF_ID >= 100 AND PFAF_ID <= 200"), "PFAF_ID >= 100 AND PFAF_ID <= 200")
+
+
 if __name__ == "__main__":
     the_upstream_count()
     the_top_tier()
     the_highest_order()
     the_tiled_distance()
+    the_polygon_filter()
     print()
     print("ALL PASSED" if not FAILED else "%d FAILED" % len(FAILED))
     sys.exit(1 if FAILED else 0)

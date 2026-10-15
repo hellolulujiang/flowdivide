@@ -36,7 +36,8 @@ MERIT Hydro at 3 arc-seconds (global). Download the inputs from their producers
     python flowdivide.py run south-america --out-root /data/flowdivide
     python flowdivide.py run south-america --out-root /data/flowdivide --steps fd3 --capacity 2^31
 
-Any other flow-direction grid, in any coding or projection, at any resolution down to 1 m:
+Any other north-up flow-direction grid with a coordinate reference system, geographic (degrees) or projected
+(metres), in any coding, at any resolution down to 1 m:
 
     python flowdivide.py run mygrid --dir /data/mygrid_dir.tif --convention esri --out-root /data/flowdivide
     python flowdivide.py run mygrid --dir /data/mygrid_dir.tif --convention esri --out-root /data/flowdivide --steps fd3
