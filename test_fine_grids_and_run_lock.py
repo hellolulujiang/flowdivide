@@ -16,7 +16,7 @@
      (the list of the basins cut, where none had to be): a finished run is not made again for it
   9  (1.0.0) the default views of a small grid of one's own leave out a view a quarter of whose cell is larger than
      the whole grid (all its tiles), the finest made finer if it must be, and the partition and its views are made;
-     --view-factors sets the views as they are given
+     --view-factors sets the views as they are given, each lowered to a divisor of the block
  10  (1.0.0) the MERIT recode on disk: refused when its marker is gone while the steps after it keep theirs, or when
      it was made before 0.7.9 (the rule read as a whole argument); --only fd1.0 and --summary-only make or plan the
      recode again
@@ -246,7 +246,7 @@ def main():
     check([factor for _, factor in flowdivide.views_by_cell_size(probe, pixels=16)] == [5],
           "a grid of 4 x 4 pixels: the finest view made finer, 5 pixels to a cell (a quarter of it below the 16 pixels)")
     check([factor for _, factor in flowdivide.views_by_cell_size(probe, (250,), prune=False)] == [250],
-          "views given by name are taken as they are")
+          "views given by name are kept (250 divides the block)")
     metre = os.path.join(directory, "one_metre.tif")
     with rasterio.open(metre, "w", driver="GTiff", height=124, width=126, count=1, dtype="uint8", crs="EPSG:32633",
                        transform=from_origin(500000.0, 4000000.0, 1.0, 1.0), nodata=255) as dataset:

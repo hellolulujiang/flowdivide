@@ -1375,8 +1375,8 @@ def _resolve_labels_over_exit_graph(next_exit, inlet_of_exit, inlet_label, exit_
 #  local total (what drains to it from inside its tile); the exit graph gives every exit its full
 #  total and every inlet what arrives there; pass 2 accumulates every tile again with the arrivals
 #  added at the inlets, and the result is final everywhere in the tile.  The channel mask (upstream
-#  area at least the threshold) is written at the same time, so that the area raster can be dropped
-#  as soon as the outlets have been read.
+#  area at least the threshold) is written at the same time, so that the steps that need only the
+#  channel network read the mask and not the area.
 
 @njit(cache=True)
 def _pass_one_local_totals(drain, exit_count, ncol, row_area_m2):
@@ -3326,8 +3326,8 @@ def fd1_4_group_whole_basins(bsn_path, l3_path, basin_table_path, grid,
 #  [6b] FD1.4  the automatic groups: whole basins along a Hilbert curve (the appendix of the paper)
 # =============================================================================
 #
-#  The groups of FD1.4 made from the basins alone, without the Level-03 units
-#  them.  Everything works on the block cells (one degree) of the grid:
+#  The groups of FD1.4 made from the basins alone, without the Level-03 units.  Everything works on the
+#  block cells (one degree) of the grid:
 #    [0] where a basin's land is: the coarse basin view (400 cells to the degree) is read one block
 #        row at a time and the land of every basin on every block cell is counted; a basin's cell is the
 #        one holding most of its land, or the cell of its outlet when it is too small to show
@@ -5757,7 +5757,7 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
     of fd1_5_pfafstetter_cut (cuts: {basin id: (its piece table, its piece raster)}).  A group whose
     window fits is one region; a group over the capacity is divided along block lines; a cut basin's
     regions are taken from the cut and the other basins of its group form regions of their own; groups
-    under the capacity are merged under merge_policy (none, within_parent, any, balanced).  Writes the
+    under the capacity are merged under merge_policy (none, within_parent, any, balanced, level2).  Writes the
     files named in `outputs`:
         regions       one row per region (region_fine): the codes, the window, the land, the counts,
                       cut_basin_id, the rectangle of its pixels, topological_level

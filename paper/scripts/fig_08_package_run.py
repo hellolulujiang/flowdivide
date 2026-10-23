@@ -83,9 +83,9 @@ def value_of(lines, label):
 
 
 def strip_lines(dataset):
-    """The run as a READER would type it on a grid of their own: the options are the package's own, the values
-    that belong to our run are placeholders (<name>, <flow directions>, <polygons>, <directory>), and the grey
-    note to the right says what this run used or what the option accepts."""
+    """The run as one command on the built-in grid: the options are the package's own, the values that belong
+    to our run are placeholders, and the grey note to the right says what this run used or what the option
+    accepts."""
     lines = read_page(dataset)
     out = []
     flow = value_of(lines, "flow directions")

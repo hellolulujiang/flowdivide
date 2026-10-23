@@ -12,7 +12,7 @@ directory layout, the same file names and table columns as the published product
 |---|---|
 | `flowdivide.py` | the datasets, the chain (markers, timing, the keep option), the command line |
 | `fd1_partition.py` | stage 1, the partition: FD1.0 recoding, FD1.1 accumulation, FD1.2 outlets, FD1.3 delineation, FD1.4 grouping (by Level-03 unit, and automatically along a Hilbert curve), FD1.5 fitting to memory |
-| `fd2_views.py` | stage 2, the views: folding, vectorisation, colouring, the Level-02 tables; and Figures 3, 4 and 5 of the paper |
+| `fd2_views.py` | stage 2, the views: folding, vectorisation, colouring; and Figures 3, 4 and 5 of the paper |
 | `fd3_attributes.py` | stage 3, the attributes region by region: Shreve, distance to outlet, Hack, upstream flow length, longest flow path, Strahler, and a rule of your own |
 | `fd_tables.py` | the tables: one writer and one reader for each |
 | `tile_kernels.py`, `test_tile_kernels.py` | the same four kernels on the tiles the data are distributed in, one tile at a time (see below) |
@@ -464,5 +464,5 @@ this region's pixels), a value that travels upstream at the pixel this region's 
 the pixels of member -1 as they are, since the window is written back whole, and counts the pixels it gives a value,
 member by member, into `visited_of_member`, which goes into the table.  A registered rule is given the whole window,
 so it holds the window's arrays (12 bytes a window pixel for the order, the downstream pixel and the member,
-besides the output window), where the six provided attributes hold only the region's own pixels
+besides the output window), where the five swept attributes hold only the region's own pixels
 ([the memory of FD3](#the-memory-of-fd3)); GDAL's block cache is bounded the same way (`gdal_cache_mb`).

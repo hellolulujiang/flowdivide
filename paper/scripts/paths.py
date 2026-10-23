@@ -26,7 +26,7 @@ FIGURE_DIRECTORY = os.path.join(PAPER, "figures")
 PACKAGE_DIRECTORY = os.environ.get("FLOWDIVIDE_PACKAGE", os.path.dirname(PAPER))
 COLOR_PALETTE = os.environ.get("FLOWDIVIDE_PALETTE", os.path.join(DATA_DIRECTORY, "color_id_palette.csv"))
 
-# the inputs of the data scripts, set only when their environment variable is
+# the inputs of the data scripts, set only when their environment variable is set
 INPUTS = {"HYDROSHEDS30M_ROOT": "FLOWDIVIDE_PRODUCTS", "BENCHMARK_RUNS": "FLOWDIVIDE_BENCHMARK",
           "PACKAGE_RUNS": "FLOWDIVIDE_RUNS", "RAW_HYDROSHEDS": "HYDROSHEDS_V2"}
 for _name, _variable in INPUTS.items():

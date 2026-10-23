@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.1.3 (2026-10-23)
+
+No result changes: only comments, docstrings, messages and the documentation. Four sentences that had lost words are
+whole again; descriptions that no longer matched the code are set right: the five swept attributes (all but `lfp`)
+hold only the region's own pixels; the Level-02 groups are written by fd1.4, not by FD2; `merge_policy` also takes
+`level2`; FD3 refuses to run without the system's file locks; a Strahler or Hack order stops at 254, the cap of
+the C programs; the length rasters of `test_tile_kernels.py` are compared to a relative 2⁻²²; `test_fd3_sweeps.py` compares the rasters, not
+the tables; `--view-factors` lowers each factor to a divisor of the block; the block a capacity directory leaves out
+of its name. The messages of the Figure 7 script no longer name scripts outside this repository.
+
 ## 1.1.2 (2026-10-15)
 
 No result changes for the built-in grids, whose only filter (`PFAF_ID != 353`, North America) was read right.

@@ -37,7 +37,7 @@ def main(argv):
     parser.add_argument("capacity_directory")
     parser.add_argument("attribute", choices=["shv", "ldn", "hck", "lup", "ord", "lfp"])
     parser.add_argument("out")
-    parser.add_argument("--block", type=int, default=None, help="the pixels of a block (default one degree)")
+    parser.add_argument("--block", type=int, default=None, help="the pixels of a block (default: the block the capacity directory names, else the grid's default)")
     parser.add_argument("--periodic", action="store_true")
     parser.add_argument("--channel", default=None)
     parser.add_argument("--area", default=None)
@@ -65,7 +65,7 @@ def main(argv):
     blocks = int(named.group(2))
     grouping = "hilbert" if named.group(1) else "l3"
     block = arguments.block
-    # <N>blocks without _block<B> is a projected grid's own block of 5000 pixels (capacity_directory_name leaves it out)
+    # <N>blocks without _block<B> is a projected grid's block of 5000 pixels (capacity_directory_name leaves it out)
     named_block = named.group(4) if named.group(4) is not None else ("5000" if named.group(3) == "blocks" else None)
     if named_block is not None:
         if block is not None and block != int(named_block):

@@ -14,8 +14,9 @@ is computed once per region, exactly, with one value crossing each cut:
 
     a region is read as one window, the rectangle its members cover plus one pixel; the flow
     directions are the mask, since an upstream walk from a basin's outlet cannot leave the basin.
-    Since 0.7.7 the window holds the flow directions (and the channel mask) only, and everything else
-    is held for the region's own pixels (section [2c]), as in the C programs;
+    Since 0.7.7, for the five swept attributes (all but lfp), the window holds the flow directions (and
+    the channel mask, and for hck the upstream area) only, and everything else is held for the region's
+    own pixels (section [2c]), as in the C programs;
 
     every member (a whole basin, or a piece of a cut basin) is taken from its outlet upstream: the five
     swept attributes number its pixels in a visiting order and sweep the rule over them (sections [2b] and
@@ -64,7 +65,7 @@ import resource
 import time
 
 try:
-    import fcntl                                   # not on Windows: there the output is not locked
+    import fcntl                                   # not on Windows: there FD3 refuses to run, unable to lock its output
 except ImportError:
     fcntl = None
 
@@ -606,13 +607,13 @@ def paint_path_downstream(dir_window, out_window, lengths, start_row, start_col,
 #  [2b] The ordered sweeps: the same rules, over a visiting order built once
 # =============================================================================
 #
-#  The walks of section [2] do the arithmetic inside a depth-first traversal, so every pixel pays a push,
-#  a pop and eight neighbour tests, and the traversal jumps about the window.  The sweeps here do the same
+#  A walk that does the arithmetic inside a depth-first traversal makes every pixel pay a push, a pop and
+#  eight neighbour tests, and jumps about the window.  The sweeps here do the same
 #  arithmetic over an order built once for the whole window in three linear passes; the loops then read
 #  two arrays and nothing else.  Measured on basin 4 (903 million land pixels, one process): the walk
 #  costs 236 ns a pixel for the accumulation, the tile kernels, which sweep an order, 118.
 #
-#  Since 0.7.7 the six provided attributes number the region's own pixels instead (section [2c]); the order over
+#  Since 0.7.7 the five swept attributes number the region's own pixels instead (section [2c]); the order over
 #  the whole window below is what a registered rule (derive_user_attribute) is still given, and what the tests
 #  compare section [2c] with.  It costs 13 bytes for every pixel of the window, and with the member of every pixel
 #  and the output window the provided attributes held 23 to 25 bytes a window pixel up to 0.7.6.
@@ -810,7 +811,7 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
 #  [2c] The region's own pixels, numbered in a visiting order (0.7.7)
 # =============================================================================
 #
-#  The six provided attributes no longer build the order over the whole window.  The window holds the
+#  The five swept attributes do not build the order over the whole window.  The window holds the
 #  flow directions (one byte a pixel), the channel mask when the class lives on the network (one byte),
 #  and, while the structure is built, the number of every pixel of this region (int32): four arrays
 #  over the window shrank to one, as in the C code.
@@ -1312,8 +1313,8 @@ def sweep_strahler_order(count_in_order, member_of_compact, downstream_of_compac
 def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_path, member_table_path,
                               channel_path=None, area_path=None, tag=None, started=None):
     """One attribute of the labelling, maximum or stream-order class over the whole partition, computed by
-    sweeping a visiting order instead of walking with a stack (section [2b]).  The products, the tables and
-    the states across the cuts are those of derive_attribute; only the traversal differs."""
+    sweeping a visiting order instead of walking with a stack (section [2b]); derive_attribute calls it for the
+    five swept attributes."""
     spec = ATTRIBUTES[attribute]
     tag = tag or "fd3." + attribute
     started = started if started is not None else time.time()
@@ -1325,7 +1326,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     states = {}                      # member_id -> the value that crosses its cut, in full precision
     # which visit writes each block of the raster last: a block no later region will touch goes out as
     # soon as this region has filled it, the others are held (in memory up to the budget of
-    # the held blocks, on disk beyond it) until their last region has
+    # the held blocks, on disk beyond it) until their last region has written them
     last_writer = np.full(((grid.nrow + RASTER_BLOCK - 1) // RASTER_BLOCK,
                            (grid.ncol + RASTER_BLOCK - 1) // RASTER_BLOCK), -1, np.int32)
     for visit, region_id in enumerate(regions_in_order):

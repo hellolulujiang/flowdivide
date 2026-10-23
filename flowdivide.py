@@ -24,7 +24,7 @@ published basin ids.  The chain, in the order of the paper:
          -> fd1.3 delineation -> fd2.1 the basin views (the automatic grouping reads one)
          -> fd1.4 the basin groups: by Level-03 unit, and automatically along a Hilbert curve
          -> fd1.5 the Pfafstetter cut and the regions, once per capacity
-    FD2  the Level-02 tables; the group and region views at every factor, as rasters and coloured polygons
+    FD2  the group and region views at every factor, as rasters and coloured polygons
     figures  Figures 3, 4 and 5 of the manuscript (South America and North America; not for MERIT)
     FD3  the attributes on one capacity: shv ldn hck lup lfp ord, or those asked for
 
@@ -315,7 +315,7 @@ class Dataset:
         self.land_merge_below = land_merge_below
         self.island_reach_blocks = island_reach_blocks
         self.island_max_blocks = island_max_blocks
-        self.cut_cap_pixels = cut_cap_pixels            # the needs_cut column of the outlet table
+        self.cut_cap_pixels = cut_cap_pixels            # a basin of more pixels needs a cut (fd1.2 counts them)
         self.views = list(views)                        # [(name, factor), ...]
         self.hilbert = hilbert                          # the automatic grouping as well (Figure 3c)
         self.figures = figures
@@ -541,9 +541,9 @@ class Layout:
 
     # ---- the partitions ----
     def capacity_directory_name(self, blocks, grouping="l3"):
-        """<N>deg2 on a geographic grid with blocks of one degree, else <N>blocks; a block other than the
-        grid's own (one degree, or 5000 pixels on a projected grid) is part of the name,
-        since two block sizes can give the same number of blocks but not the same windows"""
+        """<N>deg2 on a geographic grid with blocks of one degree, else <N>blocks; the block is part of the name
+        (_block<B>) unless it is one degree on a geographic grid or 5000 pixels on a projected one, since two block
+        sizes can give the same number of blocks but not the same windows"""
         grid = self.grid
         block_is_one_degree = grid is not None and grid.geographic and abs(grid.block_pixels * abs(grid.pixel_width) - 1.0) < 1e-6
         text = "%ddeg2" % blocks if block_is_one_degree else "%dblocks" % blocks
@@ -1992,7 +1992,7 @@ def main(argv=None):
                 raise FlowDivideError("--acc replaces the count raster of a built-in grid that reads one; %s computes its own" % dataset.name)
             dataset.acc_path = arguments.acc
     else:
-        raise FlowDivideError("unknown dataset '%s'; the built-in ones are %s, or give --dir and --l3" % (arguments.dataset, ", ".join(datasets)))
+        raise FlowDivideError("unknown dataset '%s'; the built-in ones are %s, or give --dir (and --group-vectors, or none for the Hilbert groups)" % (arguments.dataset, ", ".join(datasets)))
     steps = [s.strip() for s in arguments.steps.split(",") if s.strip()]
     for step in steps:
         if step not in ("fd1", "fd2", "figures", "fd3"):

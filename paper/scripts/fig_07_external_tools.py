@@ -95,8 +95,9 @@ NAME_OF = {basin: name for basin, name, _ in BASINS}
 # the two FlowDivide lines read one part at a time, so their peak is set by the part, not by the basin
 BOUNDED_BY = {"fd_tiles": "bounded by the tile", "fd_pub": "bounded by the capacity"}
 
-# the four groups: key, the row of Table 3 as the legend reads it, the colour.  Four colours, and they
-# stay apart in greyscale as well (0.78, 0.62, 0.30, 0.44 of white)
+# the five groups: key, the row of Table 3 as the legend reads it, the colour, the hatch.  Four colours (the
+# two resident groups share one and differ by the hatch), and they stay apart in greyscale as well (0.78, 0.62,
+# 0.30, 0.44 of white)
 # The groups are what bounds the memory, which is what this figure measures: everything resident (in one
 # process, or in stripes across processes -- TauDEM's stripes are all resident at once, so its memory grows
 # with the grid like the others'), the grid paged from disk, or one part at a time.  Table 3 groups by where
@@ -395,7 +396,7 @@ def check_every_bar_is_there(timings, every_row):
     if not trouble:
         print("every one of the %d pairs of basin %d was measured %d times" % (len(runs_of_pair), BODY_BASIN, counts[0]))
         return
-    message = ("the timings table is not a whole run of basin %d: %s. Run runs/multi/run_basins.py to the end, "
+    message = ("the timings table is not a whole run of basin %d: %s. Give the table of a whole run (FD_TIMINGS), "
                "or set FIG7_ALLOW_PARTIAL=1 to draw what there is" % (BODY_BASIN, "; ".join(trouble)))
     if os.environ.get("FIG7_ALLOW_PARTIAL", "0") == "1":
         print("WARNING: " + message)
@@ -418,7 +419,7 @@ def draw(out):
     axis_b = figure.add_subplot(grid[0, 1])
     axis_c = figure.add_subplot(grid[1, 1])
 
-    # ---- the legend of the four groups, across the top: the rows of Table 3
+    # ---- the legend of the five groups, across the top: the rows of Table 3
     handles = [Patch(facecolor=colour, hatch=hatch, edgecolor="#3d3a34", linewidth=0.5, label=name)
                for _, name, colour, hatch in WAYS]
     figure.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.52, 0.998), ncol=1, frameon=False,
@@ -513,7 +514,7 @@ def draw(out):
     # panel (c) is computed by needs_model.py from the same table; if that file is older than the timings,
     # the panel would show numbers from an earlier run while (a) and (b) show this one
     if os.path.exists(NEEDS) and os.path.getmtime(NEEDS) < os.path.getmtime(TIMINGS):
-        raise SystemExit("%s is older than %s: run needs/needs_model.py again before drawing panel (c)"
+        raise SystemExit("%s is older than %s: build the needs table from this timing table again before drawing panel (c)"
                          % (NEEDS, TIMINGS))
     needs = pd.read_csv(NEEDS) if os.path.exists(NEEDS) else pd.DataFrame()
     # the two files must be the same measurements: a time is not a strong enough tie, since the model can be
@@ -521,12 +522,12 @@ def draw(out):
     if len(needs):
         if "timings_fingerprint" not in needs.columns:
             raise SystemExit("%s does not say which timing table it was built from (no timings_fingerprint "
-                             "column): run needs/needs_model.py again" % NEEDS)
+                             "column): build it again from the timing table" % NEEDS)
         written_from = sorted(set(needs["timings_fingerprint"].astype(str)))
         mine = timings_fingerprint(TIMINGS)
         if written_from != [mine]:
-            raise SystemExit("%s was built from the timing table %s, and this figure reads %s (%s): run "
-                             "needs/needs_model.py on this table before drawing panel (c)"
+            raise SystemExit("%s was built from the timing table %s, and this figure reads %s (%s): "
+                             "build it again from this table before drawing panel (c)"
                              % (NEEDS, ", ".join(written_from), mine, TIMINGS))
         # and on the same rectangles: (c) is each basin's pixels times a measured bytes a pixel, so a
         # different rectangle there would be a different number here

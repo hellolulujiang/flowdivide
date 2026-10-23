@@ -3,7 +3,7 @@
 Every table of the partition listed below (the basin, group, region and piece tables and the basin maps) is written by
 one writer here and read by one reader here, with its header, its columns and its number formats, so that a table
 written and read back gives the same text; the tables of FD3 have their own in fd3_attributes.  A table of another layout is refused, not read:
-the FlowDivide results are read by FlowDivide only, and a run is made again rather than an old layout kept.
+the readers take the current layout only, and a run is made again rather than an old layout kept.
 
 THE WORDS: a count of pixels (fine resolution) or of cells (coarse) is <what>_grid_count in every column name.  A BASIN is the whole drainage area of one outlet; a GROUP a set of whole basins read together (a
 HydroBASINS Level-01, Level-02 or Level-03 unit, or a run of the Hilbert curve); a REGION what is computed at once
@@ -62,7 +62,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1

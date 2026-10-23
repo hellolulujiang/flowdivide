@@ -66,9 +66,11 @@ Version 1.0.0 is the version described in
 > outgrow a computer's memory. Submitted to *Environmental Modelling & Software*.
 
 Versions 1.1.0 and 1.1.1 give the same results as 1.0.0 on the Sri Lanka sample, and 1.1.0 the partition of the
-whole MERIT Hydro grid published as FullDivide v1.1. 1.1.0 closes two ways a run could stand still with GDAL 3.6, and
-1.1.1 holds four limits to the C programs' and sets the documentation right (see the [changelog](CHANGELOG.md)). The scripts that draw the figures are in [`paper/`](paper/), and the repository as it was
-at submission is the tag `paper-v1.0`; the data they read are at <https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
+whole MERIT Hydro grid published as FullDivide v1.1. 1.1.0 closes two ways a run could stand still with GDAL 3.6;
+1.1.1 checks four limits as the C programs do; 1.1.2 reads a filter of `--group-vectors` as OGR reads it, which
+changes no result on the built-in grids; 1.1.3 corrects comments, messages and the documentation only (see the
+[changelog](CHANGELOG.md)). The scripts that draw the figures are in
+[`paper/`](paper/), and the repository as it was at submission is the tag `paper-v1.0`; the data they read are at <https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
 
 ## Tests
 

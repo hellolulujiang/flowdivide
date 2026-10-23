@@ -452,8 +452,8 @@ def upa_on_tiles(dir_path, out_path, channel_path, grid, tiles, channel_threshol
     if status != 0:
         raise FlowDivideError("the exit graph of the tiles has a cycle")
     ended_area_total = 0.0
-    # the threshold in float32 and in the raster's unit, compared with the area as float32, as FD3 does
-    # compares them; a double threshold against the float32 area comes out otherwise at 1.00000001 km2
+    # the threshold in float32 and in the raster's unit, compared with the area as float32, as FD3 compares
+    # them; a double threshold against the float32 area comes out otherwise at 1.00000001 km2
     threshold_m2 = np.float32(channel_threshold_km2 * 1e6)
     temporary = fd_tables.free_name(out_path + ".partial.tif")
     channel_temporary = fd_tables.free_name(channel_path + ".partial.tif") if channel_path else None
@@ -896,7 +896,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
                                                  arriving_largest[first_inlet:last_inlet], arriving_second[first_inlet:last_inlet],
                                                  exit_pixel_per_tile[tile_index], new_exit_order, value)
                 if status == 1:
-                    raise FlowDivideError("a Strahler order does not fit a byte in the tile at row %d col %d" % (row0, col0))
+                    raise FlowDivideError("a Strahler order passes 254, the cap of the C programs, in the tile at row %d col %d" % (row0, col0))
                 if status != 0:
                     raise FlowDivideError("the channel mask is broken in the tile at row %d col %d: a channel pixel flows into a "
                                           "land pixel off the channel (status %d)" % (row0, col0, status))
@@ -942,7 +942,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
                                              exit_pixel_per_tile[tile_index], settled_exit_order, value)
             if status != 0:
                 raise FlowDivideError("the Strahler order of the tile at row %d col %d stopped with status %d (1 an order past "
-                                      "a byte, 2 and 3 a broken channel mask)" % (row0, col0, status))
+                                      "254, 2 and 3 a broken channel mask)" % (row0, col0, status))
             if not np.array_equal(settled_exit_order, exit_order_value[first_exit:last_exit]):
                 raise FlowDivideError("the orders of the tile at row %d col %d are not the ones the sweeps settled on" % (row0, col0))
             out_dataset.write(value.reshape(nrow, ncol), 1, window=Window(col0, row0, ncol, nrow))

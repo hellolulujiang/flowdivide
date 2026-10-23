@@ -10,8 +10,8 @@ the region's rectangle the basin's own -- computes the attributes with fd3_attri
 pixel with the answer three_ways.py computes on the whole basin in memory.  The channel network and the
 upstream area the channel classes need are computed here as well, from the same flow directions.
 
-What this checks: that the ordered sweeps of fd3_attributes section [2b] give the whole-basin answer, that
-the member and basin tables agree with it, and that the raster carries nothing outside the basin.  What it
+What this checks: that the ordered sweeps of fd3_attributes section [2b] give the whole-basin answer, and
+that the raster carries nothing outside the basin.  What it
 does not check: the states across a cut, which need a basin the capacity cuts (test_three_ways_on_one_basin
 covers the cut on the pieces, and the comparison runs of Figure 7 cover a cut basin on the published
 partition).
@@ -36,7 +36,8 @@ import three_ways
 
 
 # The three classes that live on the channel network are computed here over the whole basin, in the order
-# three_ways builds, so that the reference shares nothing with the code it checks but the flow directions:
+# three_ways builds, so that the reference shares nothing with the code it checks but its inputs (the flow
+# directions, and the channel mask and the upstream area made from them here):
 # three_ways' own shreve, strahler and hack count every land pixel as a source, while the third stage
 # counts the heads of the channel network, so they are different quantities and cannot be compared.
 

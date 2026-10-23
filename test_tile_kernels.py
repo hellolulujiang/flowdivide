@@ -24,8 +24,8 @@ across a tile edge, or for a tile with no exits.
 
 --tile-degrees is 1 by default, not 10: on a basin of a few degrees the 10-degree tiles of HydroSHEDS would
 often be a single tile, and then nothing crosses a tile edge and the test would check nothing.  The lengths
-are compared within a metre (tile_kernels writes Float32 rasters, as the package's own attributes do, and a
-metre in 10^7 is that format's own step) and the integers exactly.
+are compared to a relative 2^-22, a few units in the last place of the Float32 rasters tile_kernels writes (as the
+package's own attributes are), and the integers exactly.
 """
 import argparse
 import os
@@ -173,7 +173,7 @@ def compare(name, mine, reference, mask, tolerance=0.0, relative=0.0):
     worst = float(difference.max()) if difference.size else 0.0
     differing = int((difference > allowed).sum())
     if differing == 0:
-        log("%-12s identical to the whole-domain answer on all %d pixels (largest difference %.3g)" % (name, difference.size, worst))
+        log("%-12s agrees with the whole-domain answer on all %d pixels (largest difference %.3g)" % (name, difference.size, worst))
         return True
     first = int(np.flatnonzero(difference > allowed)[0])
     log("%-12s DIFFERS on %d of %d pixels; first: tiles %.6f, whole domain %.6f" % (name, differing, difference.size, mine[first], reference[first]))
