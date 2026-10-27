@@ -1,4 +1,4 @@
-"""Very fine geographic grids, and the lock of a run (0.7.9).  No data needed.
+"""Very fine geographic grids, and the lock of a run.  No data needed.
 
   1  a geographic grid whose largest pixels are below a square metre is refused when it is opened
   2  a geographic grid finer than about a sixth of an arc-second gets a default block smaller than a degree, on which
@@ -14,13 +14,13 @@
      rename); GDAL's side files .aux.xml, .msk and .ovr go aside with a raster, and without it when it is gone
   7  an empty output is one that was not written whole, but for an output its step says may be empty
      (the list of the basins cut, where none had to be): a finished run is not made again for it
-  9  (1.0.0) the default views of a small grid of one's own leave out a view a quarter of whose cell is larger than
+  9  the default views of a small grid of one's own leave out a view a quarter of whose cell is larger than
      the whole grid (all its tiles), the finest made finer if it must be, and the partition and its views are made;
      --view-factors sets the views as they are given, each lowered to a divisor of the block
- 10  (1.0.0) the MERIT recode on disk: refused when its marker is gone while the steps after it keep theirs, or when
-     it was made before 0.7.9 (the rule read as a whole argument); --only fd1.0 and --summary-only make or plan the
+ 10  the MERIT recode on disk: refused when its marker is gone while the steps after it keep theirs, or when
+     its marker lacks the refusal of directions into nodata (read as a whole argument); --only fd1.0 and --summary-only make or plan the
      recode again
- 11  (1.0.0) the tile kernels' command is refused while another run holds the lock of its output
+ 11  the tile kernels' command is refused while another run holds the lock of its output
 """
 import errno
 import os
@@ -303,18 +303,18 @@ def main():
     os.rename(marker, aside)
     status, text = run(*(common + ["--steps", "fd3", "--attributes", "ldn"]))
     check(status != 0 and "no marker of their recode" in text, "without the recode's marker, the steps after it keep theirs: fd3 is refused")
-    with open(aside) as handle:              # a marker as 0.7.8 wrote it: no refusal in its arguments, another signature
+    with open(aside) as handle:              # a marker without the refusal in its arguments, with another signature
         old = re.sub(r"(?m)^signature: .*$", "signature: 0000000000000000", handle.read().replace(" into_nodata=refused", ""))
     with open(marker, "w") as handle:
         handle.write(old)
     status, text = run(*(common + ["--steps", "fd3", "--attributes", "ldn"]))
-    check(status != 0 and "before 0.7.9" in text, "a recode made before 0.7.9: fd3 is refused")
+    check(status != 0 and "recoded by an earlier version" in text, "a recode without the refusal of directions into nodata: fd3 is refused")
     for prefix in ("/data/into_nodata=refused/", "/data/case into_nodata=refused old/",
                    "/data/case into_nodata=refused periodic=False input=old/"):
         with open(marker, "w") as handle:          # the rule's text inside a path is not the rule
             handle.write(old.replace("args: recode ", "args: recode " + prefix, 1))
         status, text = run(*(common + ["--steps", "fd3", "--attributes", "ldn"]))
-        check(status != 0 and "before 0.7.9" in text, "a path that holds the rule's text does not pass for the rule (%s)" % prefix)
+        check(status != 0 and "recoded by an earlier version" in text, "a path that holds the rule's text does not pass for the rule (%s)" % prefix)
     with open(marker, "w") as handle:
         handle.write(old)
     status, text = run(*(common + ["--steps", "fd1", "--summary-only"]))

@@ -24,13 +24,14 @@ published basin ids.  The chain, in the order of the paper:
          -> fd1.3 delineation -> fd2.1 the basin views (the automatic grouping reads one)
          -> fd1.4 the basin groups: by Level-03 unit, and automatically along a Hilbert curve
          -> fd1.5 the Pfafstetter cut and the regions, once per capacity
-    FD2  the group and region views at every factor, as rasters and coloured polygons
+    FD2  the group rasters on the fine grid; the group and region views at every factor, as rasters and coloured polygons
     figures  Figures 3, 4 and 5 of the manuscript (South America and North America; not for MERIT)
     FD3  the attributes on one capacity: shv ldn hck lup lfp ord, or those asked for
 
 The products are laid out as follows:
 
     <out-root>/<dataset>/global/fineresolution/{dir,upg,upa,str,l3,bsn}/   the continental rasters
+    <out-root>/<dataset>/global/fineresolution/grp/                        the basin groups on the fine grid
     <out-root>/<dataset>/global/table/                                     outlets, basins, groups
     <out-root>/<dataset>/global/coarseresolution/{bsn,grp}/, global/vector/  the views (GeoParquet, GeoPackage or both: --vector)
     <out-root>/<dataset>/partitions/<capacity>/global/{table,preview,fineresolution,coarseresolution,vector}/
@@ -80,10 +81,8 @@ import fd3_attributes as fd3
 from fd1_partition import FlowDivideError, log
 
 VERSION = fd_tables.VERSION  # the package; pyproject.toml says the same (test_native_cache_provenance.py checks it)
-RULES_VERSION = 2          # 2 since 0.7.1: every rectangle left closed and right open, so every marker of 0.7.0 is stale
-                           # and a run into an old tree makes everything again instead of reading closed tables.
-                           # The rules that make the results; a step's marker is tied to this, not to the
-                           # package version, so that a change of wording or timing reruns nothing
+RULES_VERSION = 2          # version 2 uses left-closed, right-open rectangles; a marker of another version is stale.
+                           # Step signatures use this value, so a change of wording or timing reruns nothing.
 REGIONS_RULES_VERSION = 2  # the rules of fd1.5.regions_final that are not its arguments (the order of the
                            # joins of merge=level2, partition_config.txt)
 FD2_VECTOR_RULES_VERSION = 4  # the rules of the polygons of stage 2: the boundary lines carry their table row as the
@@ -98,14 +97,12 @@ CHANNEL_RULES_VERSION = 2  # the test of a channel pixel in fd1.1: the threshold
                            # against the float32 area, as in FD3 (a double threshold decides otherwise at
                            # 1.00000001 km2).  In fd1.1's arguments, so that a mask of another test is made again,
                            # and asked of fd1.1's marker when fd3 runs alone
-LFP_RULES_VERSION = 2      # the longest flow path's own rules, in its step's signature only (the other five attributes
-                           # keep their markers): 2 (0.7.8): on a periodic grid the tie between the heads of a cut basin's
-                           # members is broken with the members laid out by their links, not in their regions' windows
-FD3_RULES_VERSION = 7      # 7 (0.7.9): every cut's piece table checked against the flow directions (the child's outlet
-                           # flows into the table's inlet pixel, which belongs to the parent), and a region window of
-                           # more than 2^31 - 1 pixels refused, which 0.7.8 indexed with 32 bits: a product of 0.7.8 that
-                           # these checks would have stopped is made again, not kept
-                           # 6: the channel and area grids must agree over the whole raster within 0.01 pixel
+LFP_RULES_VERSION = 2      # the longest flow path's rules, in its step's signature only; other attributes keep
+                           # their markers.  On a periodic grid, ties between members' heads use the members
+                           # laid out by their links, not their regions' windows.
+FD3_RULES_VERSION = 7      # each child's outlet must flow into the table's inlet pixel, belonging to the parent;
+                           # region windows must fit 2^31 - 1 pixels.  Products under other rules are made again.
+                           # The channel and area grids must agree over the whole raster within 0.01 pixel.
                            # the rules of stage 3 alone: the distance and the upstream flow length cover every basin
                            # however small, their tables still list the basins of min_basin_area_km2 and more; the
                            # basin tables are printed column by column, with the longitudes and
@@ -122,18 +119,13 @@ HYBAS_ROOT_DEFAULT = os.environ.get("FLOWDIVIDE_HYBAS", "")
 # FLOWDIVIDE_HYDROSHEDS names the directory.
 HYDROSHEDS_RAW_DEFAULT = os.environ.get("FLOWDIVIDE_HYDROSHEDS", "")
 MERIT_RAW_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT", "")
-# MERIT Hydro's own upstream count and upstream area, which the MERIT 90 m products are built on: the same
-# two files the published products were made from.  The published MERIT-FullBasin v1.0 and v1.1 took their basin areas
-# and their basin numbers from these rasters, and a re-run must carry the same numbers, so this line reads
-# them instead of computing its own area.
+# The built-in MERIT Hydro grid reads MERIT Hydro's own upstream count and area instead of computing them.
 MERIT_ACC_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT_ACC", "")
 MERIT_ACA_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT_ACA", "")
-# The outlet table of MERIT-FullBasin v1.0 / v1.1, whose basin ids a re-run carries over pixel by pixel.
-# Why carried over and not worked out again: no rule computed from today's rasters
-# reproduces those ids (ordering one band of rows by MERIT's own Float32 upstream area agrees with the
-# published numbers on 85.9% of neighbouring pairs, and the pairs that disagree are one or two Float32
-# steps apart), because the areas the published run sorted on differ from the distributed raster by about
-# 1e-5 and cannot be reconstructed.  A re-run gives every basin the id v1.0 and v1.1 published.
+# The outlet table of the published MERIT Hydro basins: the built-in MERIT Hydro grid takes its basin ids from it,
+# pixel by pixel.  No sort of today's rasters gives them back: ordering one band of rows by MERIT's own Float32
+# upstream area agrees with the published ids on 85.9% of neighbouring pairs, the others one or two Float32 steps
+# apart, since the areas the published run sorted on differ from the distributed raster by about 1e-5.
 MERIT_BASIN_IDS_DEFAULT = os.environ.get("FLOWDIVIDE_MERIT_BASIN_IDS", "")
 ALL_ATTRIBUTES = ["shv", "ldn", "hck", "lup", "lfp", "ord"]
 DROPPABLE = ["acc", "aca", "str", "l3", "bsn", "rgn", "pieces"] + ALL_ATTRIBUTES
@@ -294,8 +286,7 @@ class Dataset:
         if earth_model not in fd1.EARTH_MODELS:
             raise ValueError("unknown earth model '%s': it must be one of %s" % (earth_model, ", ".join(fd1.EARTH_MODELS)))
         self.earth_model = earth_model
-        # how the basins are numbered (fd1.BASIN_ORDER_RULES): the MERIT 90 m products keep the rule their
-        # v1.0 and v1.1 were numbered with, so that a re-run carries the published basin ids
+        # how basins are numbered (fd1.BASIN_ORDER_RULES): the built-in MERIT Hydro grid keeps the published ids
         if basin_order not in fd1.BASIN_ORDER_RULES:
             raise ValueError("unknown basin order '%s': it must be one of %s" % (basin_order, ", ".join(fd1.BASIN_ORDER_RULES)))
         if basin_order == "from-a-published-table" and basin_id_table is None:
@@ -408,9 +399,7 @@ def builtin_datasets(hybas_root=HYBAS_ROOT_DEFAULT, hydrosheds_raw=HYDROSHEDS_RA
             # too and add up to the basin exactly; the exact ellipsoid is what this code integrates pixel
             # areas with -- the region windows and the land share.
             acc_path=MERIT_ACC_DEFAULT, aca_path=MERIT_ACA_DEFAULT, aca_unit="km2",
-            # The basin ids are the published ones, carried over pixel by pixel: a re-run gives every basin
-            # the id v1.0 and v1.1 published.  No sort of today's areas gives
-            # them back (see fd1.BASIN_ORDER_RULES), so the table is the only source of the ids.
+            # Basin ids come from the published outlet table (see fd1.BASIN_ORDER_RULES).
             basin_order="from-a-published-table", basin_id_table=MERIT_BASIN_IDS_DEFAULT,
             island_reach_blocks=18, island_max_blocks=1296, cut_cap_pixels=2 ** 31 - 1, views=[("400th", 3), ("200th", 6), ("120th", 10), ("20th", 60)], hilbert=False,
             figures=False, vectorise_basins=False,
@@ -529,6 +518,11 @@ class Layout:
 
     def group_view(self, grouping, view_name):
         return os.path.join(self.root, "global", "coarseresolution", "grp", "grp_%s_%s_%s.tif" % (grouping, self.name, view_name))
+
+    def group_raster(self, grouping):
+        directory = os.path.join(self.root, "global", "fineresolution", "grp")
+        fd1.ensure_directory(directory)
+        return os.path.join(directory, "grp_%s_%s_%s.tif" % (grouping, self.name, self.tag))
 
     def vector(self, stem, view_name):
         """bsn_, bnd_, grp_<g>_ polygons of one view: the path without its extension (.parquet, .gpkg: --vector)"""
@@ -1023,7 +1017,7 @@ class Chain:
             self.done.add(step.label)
             return None
         # one run at a time on a step: two runs on one output root that reach the same step would write the same
-        # temporary files and take each other's (0.7.9; the lock is the system's, gone with the process however it ends)
+        # temporary files and take each other's; the system releases the lock when the process ends
         with fd3._the_only_run_writing(self.marker(step.label)):
             return self._execute_alone(step)
 
@@ -1226,6 +1220,7 @@ class Chain:
             labels |= {"fd1.4_groups_l3"}
         elif variable == "bsn":
             labels |= {"fd1.4_groups_l3", "fd1.4_groups_hilbert", "fd2_basin_views", "figures"} | {"fd2_group_views_%s" % g for g in ("l3", "l2", "l1", "hilbert")}
+            labels |= {"fd2_group_raster_%s" % g for g in ("l3", "l2", "l1", "hilbert")}
             labels |= {"fd1.5_cut_%s" % name for name in capacities} | {"fd1.5_regions_%s" % name for name in capacities}
             labels |= {"fd2_region_views_%s" % name for name in capacities}          # the region view reads the basin mask beside the region mask
         elif variable == "rgn":
@@ -1245,7 +1240,7 @@ class Chain:
 
     def drop_what_is_no_longer_read(self):
         """every dropped variable that no step still to execute reads is moved into _tmp_/ beside it (nothing is
-        deleted, 0.7.9: the space is freed when that directory is deleted by hand)"""
+        deleted; the space is freed when that directory is deleted by hand)"""
         partitions = [(blocks, self.grouping) for _, blocks, _ in self.dataset.capacities]
         for variable in sorted(self.drop):
             if self.still_needed(variable):
@@ -1311,8 +1306,7 @@ class Chain:
             candidates = sorted(glob.glob(os.path.join(native, "*.tif")))
             if not candidates:
                 raise FlowDivideError("no .tif tile in %s" % native)
-            # every run, also one that takes up a tree whose tiles are assembled already: 0.7.8 wrote one tile over
-            # the other without a word, and its result must not pass for a current one by being there
+            # check even when an assembled raster is reused: overlapping source tiles must not pass
             fd1.refuse_tiles_that_overlap(candidates)
             layout.set_grid(fd1.Grid(candidates[0], periodic=dataset.periodic, block_pixels=dataset.block_pixels, earth_model=dataset.earth_model))
         else:
@@ -1336,10 +1330,8 @@ class Chain:
                 coding = " codes=%s sink=%s nodata=%s mouth=%s" % (
                     ",".join("%s=%s" % (name, code) for name, code in sorted(convention["codes"].items())),
                     convention["sink"], convention["nodata"], convention["mouth"])
-            # 0.7.9: in the MERIT convention a direction that points into nodata or off the grid is
-            # refused, where 0.7.8 made the pixel a mouth.  The recode of a tree finished with 0.7.8 in that convention
-            # is therefore made again (and the steps that read it), so that it cannot pass the refusal by being there
-            # already; the other conventions' signature is 0.7.8's and nothing of theirs is made again
+            # a MERIT recode must have refused directions into nodata or off the grid.
+            # Name that rule in the signature so a recode made without the check is made again.
             if dataset.convention == "merit":
                 coding += " into_nodata=refused"
             first = self.plan([Step("fd1.0", "recode %s -> %s convention=%s%s periodic=%s input=%s" % (native, dir_path, dataset.convention, coding, dataset.periodic, identity),
@@ -1372,8 +1364,7 @@ class Chain:
         else:
             if not os.path.exists(dir_path):
                 raise FlowDivideError("the recoded flow directions %s are not there; run fd1 first" % dir_path)
-            # the recode is taken as it lies on disk: one of the MERIT convention made before 0.7.9 turned a direction
-            # into no data into a river mouth where this version refuses it, and never passed that refusal.  So is a
+            # a MERIT recode made without refusing directions into nodata cannot be reused.  Nor can a
             # recode whose marker is gone while the steps after it keep theirs: a recode made again (its old marker
             # set aside first) that stopped on the refusal left the old file in place.  When this run makes the recode
             # (fd1 among --steps, FD1.0 not left out by --only), --summary-only and the check of --only only plan it,
@@ -1389,7 +1380,7 @@ class Chain:
                 body = recorded[:-len(tail)] if recorded is not None and identity is not None and recorded.endswith(tail) \
                     else (recorded or "").rsplit(" input=", 1)[0]
                 if recorded is not None and not re.search(r" into_nodata=refused periodic=(True|False)$", body):
-                    raise FlowDivideError("the flow directions %s were recoded by a version before 0.7.9, which made a direction "
+                    raise FlowDivideError("the flow directions %s were recoded by an earlier version, which made a direction "
                                           "that points into no data a river mouth; this version refuses such a direction: add "
                                           "fd1 to --steps so that the recode is made again" % dir_path)
             self.grid = fd1.Grid(dir_path, periodic=dataset.periodic, block_pixels=dataset.block_pixels, earth_model=dataset.earth_model)
@@ -1398,11 +1389,10 @@ class Chain:
         self.note("grid %d x %d pixels, block %d pixels, %s, %s, tag %s" % (grid.ncol, grid.nrow, grid.block_pixels, "geographic" if grid.geographic else "projected",
                                                                              "periodic in longitude" if grid.periodic else "not periodic", layout.tag))
         views_text = ",".join("%s:%d" % (n, f) for n, f in dataset.views) + " vector=%s colours=%d rule=%d" % ("+".join(self.vector_formats), self.colours, fd2.VIEW_RULE)
-        # 0.7.9: the smallest basin of a view is the cell's width times its height, and keeps four significant digits
-        # under 0.01 km2.  Where that changed a view's area from 0.7.8's (pixels that are not square, cells under
-        # some 200 m) the areas are named in the signature, so that views made with the old areas are made again;
-        # elsewhere the signature is 0.7.8's and nothing is made again
-        if any(self.min_basin_area_km2_of_view(f) != fd2.min_basin_area_km2_until_0_7_8(self.view_side_km(f)) for _, f in dataset.views):
+        # the smallest basin is a quarter of a cell's width times height, with four significant digits
+        # under 0.01 km2 (cells under some 200 m).  Where this differs from a quarter of the width squared to four
+        # decimals, the areas are named in the signature, so views made with another threshold are made again.
+        if any(self.min_basin_area_km2_of_view(f) != fd2.min_basin_area_km2_width_squared(self.view_side_km(f)) for _, f in dataset.views):
             views_text += " min_areas=" + ",".join(fd2.area_text(self.min_basin_area_km2_of_view(f)) for _, f in dataset.views)
         first_view = dataset.views[0][0]
         grouping = self.grouping
@@ -1477,7 +1467,8 @@ class Chain:
                                   refresh=lambda blocks=blocks, grouping=grouping: self.cut_step_files(blocks, grouping),
                                   # no basin over the capacity: the listing is an empty file, and the step is done
                                   may_be_empty=[layout.cut_listing(blocks, grouping)]))
-                merge_text = dataset.merge_policy if dataset.merge_policy == "none" else "%s(%s)" % (dataset.merge_policy, fd1.MERGE_RULE)
+                # no merge rule under none and level2, which do not use it (balanced ranks partners by it)
+                merge_text = dataset.merge_policy if dataset.merge_policy in ("none", "level2") else "%s(%s)" % (dataset.merge_policy, fd1.MERGE_RULE)
                 # regions_rules (REGIONS_RULES_VERSION): the order of the joins of merge=level2 and partition_config.txt
                 # -- in the arguments so that a partition made under other rules is made again, not reused
                 steps.append(Step("fd1.5_regions_%s" % label, "capacity=%d block=%d grouping=%s merge=%s land_cut_above=%s land_merge_below=%s ids=%s regions_rules=%d" % (
@@ -1522,6 +1513,11 @@ class Chain:
             dataset.figures = False
         if "fd2" in self.steps:
             for group in (("l3", "l2", "l1") if dataset.has_given_groups else ()) + (("hilbert",) if dataset.hilbert else ()):
+                steps.append(Step("fd2_group_raster_%s" % group, "grouping=%s" % group, self.step_fd2_group_raster, (group,),
+                                  outputs=[layout.group_raster(group)],
+                                  inputs=[layout.raster("bsn"), layout.group_table(group), layout.basin_table()] +
+                                         ([layout.basin_group_table(group)] if group == "hilbert" else []),
+                                  depends_on=["fd1.4_groups_%s" % ("l3" if group in ("l2", "l1") else group), "fd1.3"], kind="fd2"))
                 steps.append(Step("fd2_group_views_%s" % group, "views=%s %s" % (views_text, self.vector_rules_text()), self.step_fd2_group_views, (group,),
                                   outputs=[layout.group_view(group, n) for n, _ in dataset.views] + [layout.group_view(group, n) + ".objects.csv" for n, _ in dataset.views] +
                                   sum((layout.vector_files(layout.vector("grp_%s" % group, n), self.vector_formats) for n, _ in dataset.views), []),
@@ -1689,9 +1685,8 @@ class Chain:
 
     def vector_rules_text(self):
         """the rules of the polygons, as the steps that write them name them: on a grid periodic in longitude the
-        outline of an object across the 180th meridian is traced with the object in one piece and cut at the meridian
-        (0.7.9), so the polygons of 0.7.8 there are made again; elsewhere the outlines did not change and
-        the signature is 0.7.8's"""
+        outline of an object across the 180th meridian is traced with the object in one piece and cut at the meridian.
+        Its rule tag enters the signature so polygons made under another rule are made again"""
         return "vector_rules=%d%s" % (FD2_VECTOR_RULES_VERSION, " outline_across_the_seam=v10.35" if self.grid.periodic else "")
 
     def view_side_km(self, factor):
@@ -1729,6 +1724,10 @@ class Chain:
                 fd2.vectorise_mask(layout.basin_view(name), basins, "basin_id", layout.vector("bsn", name), "basins", in_the_view[name], self.cells_per_degree_of_view(factor),
                                    min_basin_area_km2=self.min_basin_area_km2_of_view(factor), formats=self.vector_formats, boundaries_stem=layout.vector("bnd", name),
                                    periodic=self.grid.periodic, colours_at_least=self.colours, resolution_text=self.view_resolution_text(factor))
+
+    def step_fd2_group_raster(self, grouping):
+        layout = self.layout
+        return fd2.fine_group_raster(layout.raster("bsn"), layout.group_raster(grouping), layout.root, layout.name, grouping)
 
     def step_fd2_group_views(self, group):
         """the basin mask read as group ids through the basin-group table and folded, following the basin view of the

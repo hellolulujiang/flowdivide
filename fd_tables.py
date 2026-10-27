@@ -32,7 +32,7 @@ A column not filled yet holds 0 (an id or a place), -1 (a row or a column; then 
 -1.0 (basin_area_km2, NO_AREA) or -9999 (a longitude or latitude).  Every table here is written under a temporary
 name, renamed when whole, and given a .done marker; the basin table's marker says "basins=<n> stage=<step>", which its
 reader checks.  Of FD3's outputs only the longest flow path's raster and table get .done markers (the others are
-marked by the run's step marker in _logs/); the C programs mark every attribute's raster and basin table.
+marked by the run's step marker in _logs/).
 
 Function index:
     [1] Markers and publication: write_done_marker, read_marker_checks, file_is_complete, publish_with_marker
@@ -62,7 +62,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1
@@ -127,10 +127,9 @@ _SET_ASIDE_STAMP = [None]
 
 
 def rename_exclusive(source, destination):
-    """The system's rename that never replaces a file, as in the C implementation: renamex_np with
-    RENAME_EXCL on macOS, renameat2 with RENAME_NOREPLACE on Linux.  True when moved, False when the name is taken;
-    TableError where the system or the file system has no such rename: refused rather than risk replacing a file, as
-    the C code refuses."""
+    """The system's rename that never replaces a file: renamex_np with RENAME_EXCL on macOS,
+    renameat2 with RENAME_NOREPLACE on Linux.  Returns True when moved, False when the name is taken.
+    Raises TableError where the system or file system has no such rename."""
     if sys.platform != "darwin" and not sys.platform.startswith("linux"):
         raise TableError("%s cannot be moved to %s: this system has no rename that never replaces a file"
                          % (source, destination))
@@ -172,12 +171,11 @@ GDAL_SIDE_FILES = (".aux.xml", ".msk", ".ovr")     # statistics and metadata, an
 
 
 def set_aside(path):
-    """A file a step is about to replace (an output of an earlier run, or its .done marker) is moved into
-    _tmp_/<date>_<time>_<process>/ beside it, under its own name, and stays there: nothing a run replaces is
-    deleted or written over, as in the C implementation.  A second file of one name in one run gets a number.
-    GDAL's side files <path>.aux.xml, .msk and .ovr go first, and whether or not the file itself is there, as the C
-    implementation moves them: left behind, GDAL would lay the old statistics, mask or overviews over the new file,
-    also after a run that stopped between the two moves.  Returns where the file went, or None when there was none."""
+    """Move an output or its .done marker into _tmp_/<date>_<time>_<process>/ beside it.
+    Nothing is deleted or written over.  A second file of one name in one run gets a number.
+    GDAL's side files <path>.aux.xml, .msk and .ovr go first, whether or not the file itself is there:
+    left behind, GDAL would lay old statistics, masks or overviews over the new file.
+    Returns where the file went, or None when there was none."""
     for suffix in GDAL_SIDE_FILES:
         _set_one_aside(path + suffix)
     return _set_one_aside(path)
@@ -232,7 +230,7 @@ def the_only_run_on(root):
     run on the same outputs, whatever its steps, is refused before it writes anything; steps of two runs would read
     and replace the same basin table.  The lock is the system's (flock) on the directory itself, released when the
     process ends however it ends.  No lock file is made: a run that is refused by its own checks leaves no file under
-    root, as before.  A file system that gives no lock on a directory (NFS takes an exclusive lock only on a file
+    root.  A file system that gives no lock on a directory (NFS takes an exclusive lock only on a file
     open for writing) gets the lock on the file <root>/_logs/run.lock, which stays: a lock is on the file, not on
     its name.  Every run on one root meets the same file system and so takes the same lock.  Without the system's
     file locks (Windows) a run is refused: FlowDivide runs on Linux and macOS."""
@@ -470,9 +468,9 @@ def _check_basin_rows(table, source):
     if has_area.any() and not has_area.all():
         raise TableError("%s gives an area for some basins and none for others" % source)
     if has_area.all():
-        # the order of the areas as the table writes them, six decimals: MERIT-FullBasin v1.0
-        # numbered its basins by that value, and its ids rise in the raw Float32 upa at 4,031,320 rows and at none
-        # once rounded.  Only the pairs that rise as read are formatted again
+        # compare areas as the table writes them, to six decimals: the published MERIT basin ids rise in
+        # the raw Float32 upa at 4,031,320 rows and at none once rounded.
+        # Only the pairs that rise as read are formatted again
         rising = np.flatnonzero(np.diff(area) > 0)
         if any(float("%.6f" % area[index + 1]) > float("%.6f" % area[index]) for index in rising):
             raise TableError("%s is not sorted by area" % source)
@@ -555,8 +553,7 @@ def read_basin_table(path):
 # the columns the checks of a basin table read (_check_basin_rows, _check_box_sizes)
 BASIN_TABLE_CHECKED_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_flag", "basin_grid_count", "basin_area_km2",
                                "basin_row_min", "basin_row_max", "basin_col_min", "basin_col_max", "basin_nrow", "basin_ncol")
-# rows parsed at once: the parser's buffers grow with the chunk (on 3 million made-up rows the peak above the
-# kept columns was 2.6 GB for chunks of 2 million rows and 0.6 GB for chunks of 250,000)
+# rows parsed at once: the parser's buffers grow with the chunk
 BASIN_TABLE_CHUNK_ROWS = 250000
 
 

@@ -1,22 +1,20 @@
-"""GDAL's threads (1.1.0).  No data needed: synthetic rasters in a temporary directory, which is left there.
+"""GDAL's threads.  No data needed: synthetic rasters in a temporary directory, which is left there.
 
 With GDAL 3.6 a compressed raster that is written piece by piece and read between the pieces can stand still when
 GDAL decodes on its own threads: one of them, needing room in the block cache, pushes out a written tile, waits for
-a free thread to compress it and holds the lock the other decoding threads wait for.  Until 1.0.0 the burn of fd1.4
-did so with a second layer (three runs of six with GDAL 3.6.2), and the steps that write strips or tiles did so with
-GDAL_NUM_THREADS above 1 in the environment (six runs of six).  Scenarios 1 to 3 run in a process of their own with
+a free thread to compress it and holds the lock the other decoding threads wait for.
+Scenarios 1 to 3 run in a process of their own with
 a block cache of 16 MB, which their rasters outgrow; a process that has not ended after the time limit is stopped
 and counted as failed: it stands still, or the machine is too slow for the limit (FLOWDIVIDE_TEST_LIMIT_SECONDS,
 300 by default; a run takes a few seconds).
 
   1  two layers of squares burned by fd1.4 into a grid of 6016 x 8192, the second over half of the first, six times
      over: each run ends, every pixel holds the code of the last square burned over it, and the thread's own
-     GDAL_NUM_THREADS is afterwards what it was before (not set, or the value it had).  The burn of 1.0.0 stood
-     still in three runs of six, so a single run would often pass it by; hence six.
+     GDAL_NUM_THREADS is afterwards what it was before (not set, or the value it had).
+     Six repetitions check a failure that need not appear on every run.
   2  strips of a raster of 16384 x 4096 written in turn with reads of the rows around them from another raster, a
      GeoTIFF whose name does not end in .tif, opened with fd1.open_raster, GDAL_NUM_THREADS=8 in the environment:
-     the run ends and the raster holds what was written.  (With the other raster opened as in 1.0.0,
-     rasterio.open(path), four runs of four stood still.)
+     the run ends and the raster holds what was written.
   3  a raster opened to update with fd1.open_raster(path, "r+"), read back and written window after window as FD3
      writes an attribute region after region, GDAL_NUM_THREADS=8 in the environment: the run ends and the raster
      holds what was written
@@ -148,8 +146,8 @@ def value_strip(row0):
 def strips_in_this_process(directory, label, how):
     """scenario 2's own process: two rasters written strip by strip, the second after the rows of the first around
     each strip were read (a ring of one row, as the steps read the flow directions around a tile).  how: "package"
-    opens the first raster with fd1.open_raster; "as_1.0.0" with rasterio.open(path), to see this machine's GDAL
-    stand still (not part of the test)."""
+    opens the first raster with fd1.open_raster; any other value uses rasterio.open(path), to check whether
+    this machine's GDAL can stand still (not part of the test)."""
     import numpy as np
     import rasterio
     from rasterio.windows import Window

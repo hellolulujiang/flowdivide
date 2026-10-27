@@ -56,23 +56,25 @@ def the_basin_ids_carried_over_from_a_table():
     print("the basin ids carried over from a published table")
     import tempfile
     import numpy as np
+    import pandas as pd
     work = tempfile.mkdtemp(prefix="flowdivide_carried_ids_")
     ncol = 1000
 
-    def a_table(name, rows):
-        path = os.path.join(work, name)
-        with open(path, "w") as handle:
-            handle.write("basin_number idxs_outlet_row idxs_outlet_col\n")
-            for number, row, col in rows:
-                handle.write("%d %d %d\n" % (number, row, col))
+    def a_table(name, rows, form):
+        path = os.path.join(work, name + (".parquet" if form == "parquet" else ".csv"))
+        columns = (["basin_number", "idxs_outlet_row", "idxs_outlet_col"] if form == "space" else
+                   ["global_basin_id", "global_outlet_row", "global_outlet_col"])
+        table = pd.DataFrame(rows, columns=columns)
+        if form != "space":
+            table["region_id"], table["basin_cell_count"], table["basin_area_km2"] = 1, 1, 0.01
+            table["outlet_lon"], table["outlet_lat"] = 0.0, 0.0
+            table = table[["region_id", "global_basin_id", "basin_cell_count", "basin_area_km2",
+                           "global_outlet_row", "global_outlet_col", "outlet_lon", "outlet_lat"]]
+        if form == "parquet":
+            table.to_parquet(path, index=False)
+        else:
+            table.to_csv(path, sep=" " if form == "space" else ",", index=False)
         return path
-
-    # three outlets: the published ids are 1, 2, 3 at three pixels
-    published = a_table("published.csv", [(2, 5, 7), (1, 9, 3), (3, 0, 1)])
-    ours = np.array([0 * ncol + 1, 5 * ncol + 7, 9 * ncol + 3], np.int64)      # our outlets, by pixel
-    order = fd1._basin_ids_from_a_published_table(published, ours, _Grid(ncol), "test")
-    check("the outlet that carries id 1 comes first", int(ours[order][0]), 9 * ncol + 3)
-    check("then id 2, then id 3", [int(v) for v in ours[order][1:]], [5 * ncol + 7, 0 * ncol + 1])
 
     def refused(what, path, outlets):
         try:
@@ -81,20 +83,27 @@ def the_basin_ids_carried_over_from_a_table():
         except fd1.FlowDivideError:
             check(what, "FlowDivideError", "FlowDivideError")
 
-    refused("an outlet that is not in the table is refused", published,
-            [0 * ncol + 1, 5 * ncol + 7, 9 * ncol + 4])
-    refused("a table of another size is refused", published, [0 * ncol + 1, 5 * ncol + 7])
-    refused("ids that are not 1 .. N are refused",
-            a_table("gap.csv", [(2, 5, 7), (1, 9, 3), (4, 0, 1)]),
-            [0 * ncol + 1, 5 * ncol + 7, 9 * ncol + 3])
-    refused("a repeated id is refused",
-            a_table("repeat.csv", [(2, 5, 7), (1, 9, 3), (2, 0, 1)]),
-            [0 * ncol + 1, 5 * ncol + 7, 9 * ncol + 3])
-    # a table whose header this package does not know
-    no_columns = os.path.join(work, "no_columns.csv")
-    with open(no_columns, "w") as handle:
-        handle.write("a b c\n1 2 3\n")
-    refused("a table without the columns I know is refused", no_columns, [0 * ncol + 1])
+    for form in ("space", "comma", "parquet"):
+        print("  %s table" % form)
+        published = a_table("published_" + form, [(2, 5, 7), (1, 9, 3), (3, 0, 1)], form)
+        ours = np.array([0 * ncol + 1, 5 * ncol + 7, 9 * ncol + 3], np.int64)
+        order = fd1._basin_ids_from_a_published_table(published, ours, _Grid(ncol), "test")
+        check("the outlet that carries id 1 comes first", int(ours[order][0]), 9 * ncol + 3)
+        check("then id 2, then id 3", [int(v) for v in ours[order][1:]], [5 * ncol + 7, 0 * ncol + 1])
+        refused("an outlet that is not in the table is refused", published, [1, 5007, 9004])
+        refused("a table of another size is refused", published, [1, 5007])
+        refused("ids that are not 1 .. N are refused",
+                a_table("gap_" + form, [(2, 5, 7), (1, 9, 3), (4, 0, 1)], form), ours)
+        refused("a repeated id is refused",
+                a_table("repeat_" + form, [(2, 5, 7), (1, 9, 3), (2, 0, 1)], form), ours)
+        refused("two outlets taking the same id are refused", published, [1, 5007, 5007])
+        no_columns = os.path.join(work, "no_columns_" + form + (".parquet" if form == "parquet" else ".csv"))
+        table = pd.DataFrame({"a": [1], "b": [2], "c": [3]})
+        if form == "parquet":
+            table.to_parquet(no_columns, index=False)
+        else:
+            table.to_csv(no_columns, sep=" " if form == "space" else ",", index=False)
+        refused("a table without the columns I know is refused", no_columns, [1])
 
 
 def main():

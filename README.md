@@ -14,7 +14,7 @@ South America (259,200 × 219,600 pixels) and over North America (277,200 × 424
 
 [![](docs/media/workflow.png)](docs/media/workflow.png)
 
-*The workflow. FD1 makes the partition, FD2 the coarse views and polygons, FD3 the attributes region by region.*
+*The workflow. FD1 makes the partition, FD2 the fine group rasters, coarse views and polygons, FD3 the attributes region by region.*
 
 [![](docs/media/amazon_cut_into_regions.png)](docs/media/amazon_cut_into_regions.png)
 
@@ -43,7 +43,7 @@ Any other north-up flow-direction grid with a coordinate reference system, geogr
     python flowdivide.py run mygrid --dir /data/mygrid_dir.tif --convention esri --out-root /data/flowdivide --steps fd3
 
 Out come the partition at three capacities (2³¹, 2³⁰, 2²⁹ pixels), the basin and region tables, the coarse views
-as rasters and GeoParquet polygons, and, with `--steps fd3`, six attributes: Shreve magnitude, distance to the outlet, Hack order,
+as rasters and GeoParquet polygons, the basin groups on the fine grid, and, with `--steps fd3`, six attributes: Shreve magnitude, distance to the outlet, Hack order,
 upstream flow length, longest flow path and Strahler order. You can add your own attribute as a Numba kernel.
 
 Every step checks its own output, and a stopped run resumes where it stopped.
@@ -56,27 +56,26 @@ flow directions of its window. GDAL's block cache is bounded at 512 MiB while th
 ## Documentation
 
 - [User guide](docs/user-guide.md): all options, the output files, the checks, adding an attribute
+- Published partitions made with this workflow: FullDivide for HydroSHEDS v2.0 at 30 m over North and South
+  America (<https://fullhydro.org/downloads/hydrosheds-v2.0-30m/fullbasin/fulldivide/v1.0/>)
+  and for MERIT Hydro at 90 m, with 90 regions of at most 2³¹ pixels
+  (<https://fullhydro.org/downloads/merit-hydro-v1.0.1-90m/fullbasin/fulldivide/v1.1/>).
 - Products and the other FullHydro tools: <https://fullhydro.org/tools/>
 
 ## Paper
 
-Version 1.0.0 is the version described in
-
 > Jiang, L., Chen, W. FlowDivide: a standard workflow for hydrographic attributes from flow-direction grids that
 > outgrow a computer's memory. Submitted to *Environmental Modelling & Software*.
 
-Versions 1.1.0 and 1.1.1 give the same results as 1.0.0 on the Sri Lanka sample, and 1.1.0 the partition of the
-whole MERIT Hydro grid published as FullDivide v1.1. 1.1.0 closes two ways a run could stand still with GDAL 3.6;
-1.1.1 checks four limits as the C programs do; 1.1.2 reads a filter of `--group-vectors` as OGR reads it, which
-changes no result on the built-in grids; 1.1.3 corrects comments, messages and the documentation only (see the
-[changelog](CHANGELOG.md)). The scripts that draw the figures are in
-[`paper/`](paper/), and the repository as it was at submission is the tag `paper-v1.0`; the data they read are at <https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
+The paper describes version 1.0.0. The scripts that draw its figures are in [`paper/`](paper/), the repository as
+it was at submission is the tag `paper-v1.0`, and the data the scripts read are at
+<https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
 
 ## Tests
 
     python test_region_numbering.py
 
-Fourteen tests need no data; the rest run on a basin cut from a finished run
+Sixteen tests need no data; the rest run on a basin cut from a finished run
 (see the [user guide](docs/user-guide.md#tests)).
 
 ## Acknowledgements

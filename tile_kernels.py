@@ -534,8 +534,8 @@ def _ldn_write_tile(halo_dir, order, drain, distance_to_drain, exit_distance_to_
 
 
 def ldn_on_tiles(dir_path, out_path, grid, tiles, tag="tiles.ldn", nodata=-1.0):
-    """the distance to the outlet, one tile at a time on the producer's tiles: two passes over the grid.  nodata -1, as
-    fd3's distance and the C code's (1.1.1; -9999 until 1.1.0)"""
+    """the distance to the outlet, one tile at a time on the producer's tiles: two passes over the grid.
+    Nodata is -1, as for fd3's distance."""
     started = time.time()
     records, land_total = _pass_one_over_tiles(dir_path, grid, tiles, tag)
     inlet_of_exit, next_exit = _exit_graph_of(records, tag)
@@ -896,7 +896,7 @@ def ord_on_tiles(dir_path, channel_path, out_path, grid, tiles, tag="tiles.ord")
                                                  arriving_largest[first_inlet:last_inlet], arriving_second[first_inlet:last_inlet],
                                                  exit_pixel_per_tile[tile_index], new_exit_order, value)
                 if status == 1:
-                    raise FlowDivideError("a Strahler order passes 254, the cap of the C programs, in the tile at row %d col %d" % (row0, col0))
+                    raise FlowDivideError("a Strahler order passes 254, the highest order the package writes, in the tile at row %d col %d" % (row0, col0))
                 if status != 0:
                     raise FlowDivideError("the channel mask is broken in the tile at row %d col %d: a channel pixel flows into a "
                                           "land pixel off the channel (status %d)" % (row0, col0, status))

@@ -9,19 +9,19 @@
    column twice; such a region is not computed).
 3. A partition read with raster_min_basin_area_km2=0, as for the distance and the upstream flow length, that holds a
    region of small basins only and a basin below the tables' area that is cut: the longest flow path on it equals the
-   one on a partition read for lfp (up to 0.7.7: KeyError; in the first 0.7.8: the cut basin's path drawn too), and a
+   one on a partition read for lfp, and a
    registered rule runs on it.
 4. A registered rule takes the output lock: a second run on the same output is refused.
 5. Two pixels equally far from the outlet of a basin across the seam: lfp draws the same path whether the basin is one
    region or three pieces in three regions, also when the basin table gives the basin a box over every column and a
    region's window is unrolled a whole turn away (the members' heads placed by the links between the members).
-6. The piece table against the flow directions at a cut (0.7.9): a basin cut into three pieces in two regions runs
+6. The piece table against the flow directions at a cut: a basin cut into three pieces in two regions runs
    with the right table, and every attribute is refused when the table names another inlet pixel, when it names
    another parent, when the child's outlet flows nowhere, when the piece without a parent does not end at the basin's
    outlet and when two pieces have no parent; lfp is also refused on the table that names another
    parent when it is given the distance table of the right pieces (the distance walk, which refuses it, not run).
-7. A region window of more than 2^31 - 1 pixels (0.7.9): refused before anything is read, as in the C code, since a
-   pixel of the window is named by a 32-bit index (until 0.7.8 a capacity above 2^31 would have wrapped the indices).
+7. A region window of more than 2^31 - 1 pixels: refused before anything is read, since a pixel of the window
+   is named by a 32-bit index.
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
 """
@@ -306,8 +306,8 @@ def test_lfp_tie_across_the_seam(scratch):
     """a basin over columns 9, 0 and 1 of a periodic grid, its outlet at (2, 0), and two pixels equally far from it:
     (0, 9) and (0, 1) (each a step south, a step east or west, a step south).  Computed as one region, the head is the
     one further west in the basin, column 9; cut into three pieces in three regions (column 0, the outlet piece; 9 and
-    1 flowing into it), the members' heads are compared across regions, and in a first version of 0.7.8 the column of
-    each was taken in its own region's window, which made it column 1.  Both must give the same lfp"""
+    1 flowing into it), the members' heads must be compared in the basin's frame rather than each region's window.
+    Both partitions must give the same lfp"""
     directions = np.full((NROW, NCOL), fd1.MERIT_NODATA, np.uint8)
     directions[0, 0], directions[1, 0], directions[2, 0] = 4, 4, 0            # column 0: south to the mouth (2, 0)
     directions[0, 9], directions[1, 9], directions[2, 9] = 4, 1, 64           # column 9: to (1, 9), then east across the seam
@@ -438,7 +438,7 @@ def test_the_piece_table_against_the_directions(scratch):
              ("the table names another parent", [right[0], right[1], piece(5, 4, 4, 7, 8, 6, 8, 1)], False,
               "does not belong to piece 4"),
              ("the child's outlet flows nowhere", right, True, "flows nowhere"),
-             # 0.7.9: the piece without a parent ends at the basin's outlet, and there is one such piece
+             # the piece without a parent ends at the basin's outlet, and there is one such piece
              ("the root piece ends a pixel before the basin's outlet", [piece(4, 0, 3, 8, -1, 9, 10, 0), right[1], right[2]],
               False, "is not the outlet of its basin"),
              ("two pieces without a parent", [right[0], piece(6, 0, 3, 8, -1, 8, 9, 0), right[2]], False,
@@ -483,7 +483,7 @@ def test_the_piece_table_against_the_directions(scratch):
                   % (upstream_length[2, 7], upstream_length[2, 8], upstream_length[2, 9]),
                   0 < upstream_length[2, 7] < upstream_length[2, 8] < upstream_length[2, 9])
     # lfp given the distance's member table of the right pieces, on a piece table that names another parent for piece 5
-    # (0.7.9): the distance walk that refuses such a table does not run, and the path from the
+    # the distance walk that refuses such a table does not run, and the path from the
     # inlet named would run through the outlet of piece 6, which the table leaves off the chain
     directory = os.path.join(scratch, "cuts_given_table")
     os.makedirs(directory)

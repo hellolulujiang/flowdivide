@@ -1,4 +1,4 @@
-"""test_fd3_memory.py -- the changes of 0.7.4 and 0.7.5 that bound the memory of FD3, checked on made-up data.
+"""test_fd3_memory.py -- the memory bounds of FD3, checked on made-up data.
 
     python3 test_fd3_memory.py
 
@@ -7,9 +7,9 @@
 2. fd_tables.read_basin_table_columns: on a made-up table read in chunks of a few rows, the columns equal those of
    read_basin_table, and every damaged table is refused with the very message read_basin_table gives, the damage
    placed across a chunk boundary.
-3. sweep_main_stem_donor (int32 donor, the donor's area read from the window; since 0.7.7 one per pixel of the region):
-   the same donors as the 0.7.3 rule (an int64 donor and a Float32 array of the best areas) on random windows without
-   a cycle, full of tied areas.
+3. sweep_main_stem_donor (int32, one donor per pixel of the region, its area read from the window):
+   the same donors as a whole-window reference with int64 donors and a Float32 array of the best areas,
+   on random windows without a cycle, full of tied areas.
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
 """
@@ -71,10 +71,10 @@ def test_held_blocks():
                     handle.write("left over by a run")
             held = fd3.HeldBlocks(prefix, budget)
             check("budget %d: the directory is the prefix and this process's id" % budget, held.directory == directory)
-            check("budget %d: what a stopped run left is cleared at the start (0.7.4's name, a dead process's)" % budget,
+            check("budget %d: what a stopped run left is cleared at the start (the name without a process id, and a dead process's)" % budget,
                   not os.path.exists(prefix) and not os.path.exists("%s.%d" % (prefix, dead)))
             aside = glob.glob(os.path.join(scratch, "_tmp_", "*", "out.tif.held_blocks*", "block_9_9.npy"))
-            check("budget %d: and it is kept in _tmp_, not deleted (0.7.9)" % budget,
+            check("budget %d: and it is kept in _tmp_, not deleted" % budget,
                   len(aside) >= 2 and all(open(path).read() == "left over by a run" for path in aside))
             check("budget %d: a live process's directory is left alone" % budget,
                   os.path.isdir("%s.%d" % (prefix, os.getppid())))
@@ -118,12 +118,12 @@ def test_held_blocks():
             check("budget %d: items gives every block bit for bit" % budget,
                   all(rest[index].tobytes() == kept[index].tobytes() and rest[index].dtype == kept[index].dtype for index in rest))
             popped_files = len(glob.glob(os.path.join(directory, "block_*.npy")))
-            check("budget %d: a block read back leaves its file where it was (0.7.9)" % budget,
+            check("budget %d: a block read back leaves its file where it was" % budget,
                   popped_files == held.written_to_disk)
             held.clear()
             check("budget %d: clear leaves nothing, the scratch directory gone" % budget,
                   len(held) == 0 and not os.path.exists(directory))
-            check("budget %d: the scratch directory is in _tmp_ with every file it held (0.7.9)" % budget,
+            check("budget %d: the scratch directory is in _tmp_ with every file it held" % budget,
                   held.written_to_disk == 0 or any(
                       len(glob.glob(os.path.join(path, "block_*.npy"))) == popped_files
                       for path in glob.glob(os.path.join(scratch, "_tmp_", "*", os.path.basename(directory) + "*"))))
@@ -274,8 +274,8 @@ def test_read_basin_table_columns():
 # =============================================================================
 
 @njit(cache=False)
-def donor_as_in_0_7_3(order, downstream, member, channel_window, area_window, ncol, best_donor, best_area):
-    """sweep_main_stem_donor of 0.7.3, word for word"""
+def donor_whole_window_reference(order, downstream, member, channel_window, area_window, ncol, best_donor, best_area):
+    """the whole-window donor reference, with int64 donors and a Float32 array of best areas"""
     for position in range(order.size):
         pixel = order[position]
         if member[pixel] < 0:
@@ -300,10 +300,8 @@ def donor_as_in_0_7_3(order, downstream, member, channel_window, area_window, nc
 
 
 def test_main_stem_donor():
-    """the main-stem donors of 0.7.7 (int32, one per pixel of the region, swept over its numbered pixels) against the
-    0.7.3 rule (an int64 donor and a Float32 array of the best areas over the whole window), on random windows without a
-    cycle and full of tied areas.  Until 0.7.6 the directions here were drawn at random, which nearly always holds a
-    cycle, so every window was drawn again and the comparison was never reached"""
+    """the region's main-stem donors (int32, one per numbered pixel) against a whole-window reference
+    with int64 donors and a Float32 array of best areas, on random windows without a cycle and full of tied areas"""
     import test_fd3_compact
     rng = np.random.default_rng(3)
     compared = 0
@@ -323,14 +321,14 @@ def test_main_stem_donor():
         area = rng.choice(np.array([1.5, 2.25, 7.0, 7.0, 11.125], np.float32), (nrow, ncol))   # ties on purpose
         old_donor = np.full(pixel_count, -1, np.int64)
         old_area = np.zeros(pixel_count, np.float32)
-        donor_as_in_0_7_3(order, downstream, member, channel, area, ncol, old_donor, old_area)
+        donor_whole_window_reference(order, downstream, member, channel, area, ncol, old_donor, old_area)
         status, count, count_in_order, _, pixel_of_compact, _, downstream_of_compact, _ = fd3.compact_the_pixels_of_the_region(
             directions, channel, True, outlets, np.arange(outlets.size, dtype=np.int64), np.zeros(0, np.int64), pixel_count)
         new_donor = np.full(count, -1, np.int32)
         fd3.sweep_main_stem_donor(count_in_order, pixel_of_compact, downstream_of_compact, area.reshape(-1), new_donor)
         on_the_network = np.zeros(pixel_count, bool)
         on_the_network[pixel_of_compact[:count]] = True
-        check("random window %d (%d x %d, %d channel pixels): the same main-stem donors as 0.7.3" % (trial, nrow, ncol, count),
+        check("random window %d (%d x %d, %d channel pixels): the same main-stem donors as the whole-window reference" % (trial, nrow, ncol, count),
               status == 0 and count == int(channel.sum())
               and np.array_equal(old_donor[pixel_of_compact[:count]], new_donor.astype(np.int64))
               and bool(np.all(old_donor[~on_the_network] == -1)))
@@ -367,9 +365,7 @@ def test_the_lock():
 
 
 def test_release_free_memory():
-    """which call release_free_memory makes, with a stand-in C library: the drop itself was measured on North America
-    (the process after the partition, 6.61 GB, then 1.88 GB), which made-up objects do not reproduce (the allocator hands
-    back a block of them at once)"""
+    """which calls release_free_memory makes, with a stand-in C library"""
     calls = []
 
     def function(name):

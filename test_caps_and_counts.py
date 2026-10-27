@@ -1,4 +1,4 @@
-"""The limits the package shares with the C code, on made-up values: the upstream count read from a raster (whole
+"""The package's limits, on made-up values: the upstream count read from a raster (whole
 counts, halves up), the top tier of the capacities, the highest stream order (254) and the tiled distance's nodata
 (-1); and a filter of --group-vectors read as OGR reads it.  Synthetic: it checks that the code holds; no number from it goes anywhere.
 

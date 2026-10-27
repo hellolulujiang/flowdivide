@@ -1,22 +1,22 @@
-"""test_fd2_outline_across_the_seam.py -- the boundary lines of a basin astride the 180th meridian (0.7.9).
+"""test_fd2_outline_across_the_seam.py -- the boundary lines of a basin astride the 180th meridian.
 
     python3 test_fd2_outline_across_the_seam.py
 
 On a grid round the earth a basin with cells in the first and the last column is outlined in one piece and its lines
-are cut at the meridian (fd2_views.outline_across_the_seam, as in the C implementation).  Checked on made-up masks of
+are cut at the meridian (fd2_views.outline_across_the_seam).  Checked on made-up masks of
 10 columns of 36 degrees and 6 rows of 30:
 
 1. a block of 4 x 3 cells across the meridian with a hole of two cells across it: 14 cell sides in two lines, every
-   point within -180 .. 180, no line along the meridian (until 0.7.8: 24 cell sides, 4 of them along the meridian
-   and 6 round the hole);
+   point within -180 .. 180, no line along the meridian; outlining the two halves apart gives 24 cell sides,
+   4 along the meridian and 6 round the hole;
 2. the same lines, moved, as the block gives when it lies away from the meridian (the columns rolled);
 3. a block with its east side exactly on the meridian and a second part beyond it: the block is one closed ring;
    the part beyond has its three sides at -180 .. -144 and its side on the meridian at +180 (a point on the meridian
-   is taken on the east side, as in the C code: the same meridian, written with the other sign);
+   is taken on the east side: the same meridian, written with the other sign);
 4. random objects across the meridian: the length of the lines is the length of the outer rings of the object laid
    out flat, and no side lies along the meridian unless the flat outline has it;
 5. an object with a cell in every column is refused;
-6. vectorise_mask on a periodic view writes those lines for the basin across the meridian and the old ones for a
+6. vectorise_mask on a periodic view writes those lines for the basin across the meridian and the flat outline for a
    basin away from it.
 
 Synthetic: it checks that the code holds; no number from it goes anywhere.
@@ -85,7 +85,7 @@ def test_the_block_with_a_hole():
     check("each line starts and ends on the meridian, once on each side",
           all(abs(abs(line[0][0]) - 180.0) < 1e-9 and abs(abs(line[-1][0]) - 180.0) < 1e-9 for line in lines)
           and sorted(line[0][0] for line in lines) == [-180.0, 180.0])
-    # until 0.7.8: the grid's own frame, the two halves apart
+    # the grid's own frame, the two halves apart
     halves = flat_outline(astride)
     check("in the grid's own frame the two halves give 24 cell sides, 4 of them along the meridian (%s)" % (sides_of(halves),),
           sides_of(halves) == (12.0, 12.0, 4.0))

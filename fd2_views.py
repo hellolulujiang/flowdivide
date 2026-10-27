@@ -63,7 +63,7 @@ from numba import njit
 from rasterio.windows import Window
 
 from fd1_partition import (FlowDivideError, GDAL_WRITE_THREADS, RASTER_BLOCK, checking, timing, log, open_raster, publish, read_table, write_json, write_table, ensure_directory,
-                           basin_rectangles)
+                           basin_rectangles, Grid, raster_profile, strip_rows_for)
 import fd_tables
 
 FLOWDIVIDE_VERSION = fd_tables.VERSION  # named in the metadata of every vector file
@@ -75,8 +75,7 @@ VIEW_RULE_TAG = ("v9.63: the view holds the basins of at least its minimum area,
                  "largest of them (the smallest id) holding a quarter of that land; the region view follows the basin view")   # written into every view
 # the rule of the polygons and the boundary lines, written last among the
 # metadata items of every vector file (the polygons given to users must be OGC-valid)
-# (word for word the text the published files carry; a basin astride the 180th meridian is outlined in one piece
-# since 0.7.9)
+# a basin astride the 180th meridian is outlined in one piece
 VECTOR_RULE_TAG = ("v10.35: the polygons are GDAL Polygonize's with 4-connected cells, OGC-valid (two cells that meet only at a corner are "
                    "two polygons of the MultiPolygon); the boundary lines are the outer rings of the 8-connected polygons, those of a "
                    "basin astride the 180th meridian made with the basin in one piece and cut at the meridian")
@@ -108,9 +107,8 @@ PALETTES = {
     "greys": ["#f2f2f2", "#d9d9d9", "#bfbfbf", "#a6a6a6", "#8c8c8c", "#737373", "#595959", "#404040", "#e6e6e6", "#cccccc", "#b3b3b3", "#999999"],
 }
 COLOR_ID_PALETTE = PALETTES["okabe-ito"]
-# The default style of a GeoPackage view: its palette
-# (eight colours and three reserves; the grey the older table ended with read as "no value" on a map and was taken
-# out), one fill per color_id number, outlines of 0.1 mm in COLOR_ID_STYLE_OUTLINE.  A color_id past the last entry
+# The default style of a GeoPackage view: eight colours and three reserves, one fill per color_id number,
+# outlines of 0.1 mm in COLOR_ID_STYLE_OUTLINE.  A color_id past the last entry
 # stops the step: the palette is extended by hand, a colour is never used for two numbers.
 COLOR_ID_STYLE_PALETTE = [("#E69F00", "orange"), ("#56B4E9", "sky blue"), ("#009E73", "bluish green"), ("#F0E442", "yellow"),
                           ("#0072B2", "blue"), ("#D55E00", "vermillion"), ("#CC79A7", "reddish purple"), ("#8064A2", "purple"),
@@ -121,12 +119,11 @@ COLOURS_AT_LEAST = 8
 
 
 def min_basin_area_km2_of(cell_side_km, cell_height_km=None):
-    """the smallest basin of a view: a quarter of a cell of that side (at the equator on a geographic grid),
-    rounded to four decimals half up (0.0194 / 0.0775 / 0.2151 / 7.7450 km2 for
-    1/400, 1/200, 1/120 and 1/20 degree, the C code's).  Under 0.01 km2 (cells under some 200 m) it keeps four
-    significant digits instead: four decimals would take a 1 m grid's quarter cell of 25 m2 to 0, and every basin
-    into the view (0.7.9).  cell_height_km: the cell's other side when its pixels are not square (until 0.7.8 the
-    width was squared whatever the height: on pixels of 10 m by 20 m the threshold was half of a quarter cell)"""
+    """the smallest basin of a view: a quarter of a cell (at the equator on a geographic grid),
+    rounded to four decimals half up: 0.0194 / 0.0775 / 0.2151 / 7.7450 km2 for 1/400, 1/200, 1/120
+    and 1/20 degree.  Under 0.01 km2 (cells under some 200 m) it keeps four significant digits instead:
+    four decimals would round a 1 m grid's quarter cell of 25 m2 to 0 and put every basin in the view.
+    cell_height_km gives the other side when pixels are not square, such as 10 m by 20 m."""
     if cell_height_km is None or float(cell_height_km) == float(cell_side_km):
         quarter = Decimal(repr(float(cell_side_km))) ** 2 / Decimal(4)
     else:
@@ -136,15 +133,15 @@ def min_basin_area_km2_of(cell_side_km, cell_height_km=None):
     return float(quarter.quantize(Decimal(1).scaleb(quarter.adjusted() - 3), rounding=ROUND_HALF_UP))
 
 
-def min_basin_area_km2_until_0_7_8(cell_side_km):
-    """the smallest basin of a view as 0.7.8 took it (the width squared, four decimals): a run whose views had
-    another is told so in the views' signature, and its views are made again"""
+def min_basin_area_km2_width_squared(cell_side_km):
+    """a quarter of a cell's width squared, rounded to four decimals: where a view's smallest basin differs from
+    it, the areas enter the views' signature (flowdivide.py)"""
     quarter = Decimal(repr(float(cell_side_km))) ** 2 / Decimal(4)
     return float(quarter.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
 
 def area_text(area_km2):
-    """the smallest basin of a view as text: four decimals (the C's), four significant digits under 0.01 km2"""
+    """the smallest basin of a view as text: four decimals, four significant digits under 0.01 km2"""
     return "%.4f" % area_km2 if area_km2 >= 0.01 else "%.4g" % area_km2
 
 
@@ -188,6 +185,61 @@ def basins_of_the_view(basins, min_area_km2, table_path=""):
         raise FlowDivideError("no basin of %s has the %s km2 of the view (a quarter of its cell): the view is coarser than every "
                               "basin of the grid; on a grid of your own give finer views with --view-factors" % (table_path, area_text(min_area_km2)))
     return in_the_view
+
+
+def fine_group_raster(basin_path, out_path, root, run, grouping, tag="fd2"):
+    """One raster of the grouping on the basin grid: every pixel holds its basin's group id, 0 for no basin.
+    The basin and group counts, including a read-back count, must agree with the tables before publication."""
+    with checking():
+        try:
+            basins = fd_tables.read_basin_table(fd_tables.basin_table_path(root, run))
+            groups = fd_tables.read_group_table(fd_tables.group_table_path(root, run, grouping), 0)
+            lookup = fd_tables.group_of_basin(root, run, grouping, basins)
+        except fd_tables.TableError as error:
+            raise FlowDivideError(str(error)) from error
+        basin_pixels = basins["basin_grid_count"].to_numpy(np.int64)
+        group_ids = groups["group_id"].to_numpy(np.int64)
+        if (basin_pixels < 1).any():
+            raise FlowDivideError("a basin of the table has no pixel")
+        if not np.isin(lookup[1:], group_ids).all():
+            raise FlowDivideError("a basin's group is not in the group table")
+        limit = int(group_ids.max()) + 1
+        group_basins = np.bincount(lookup[1:], minlength=limit)
+        group_pixels = np.zeros(limit, np.int64)
+        np.add.at(group_pixels, lookup[1:], basin_pixels)
+        if not np.array_equal(group_basins[group_ids], groups["basin_count"].to_numpy(np.int64)) or \
+                not np.array_equal(group_pixels[group_ids], groups["land_grid_count"].to_numpy(np.int64)):
+            raise FlowDivideError("the group table's basin_count or land_grid_count differs from its basins")
+    grid = Grid(basin_path)
+    strip_rows = max(RASTER_BLOCK, strip_rows_for(grid.ncol) // RASTER_BLOCK * RASTER_BLOCK)
+    counted = np.zeros(lookup.size, np.int64)
+    temporary = fd_tables.free_name(out_path + ".partial.tif")
+    with open_raster(basin_path) as source, rasterio.open(temporary, "w", **raster_profile(grid, "uint32", 0)) as out:
+        for row0 in range(0, grid.nrow, strip_rows):
+            nrow = min(strip_rows, grid.nrow - row0)
+            window = Window(0, row0, grid.ncol, nrow)
+            basin = source.read(1, window=window)
+            with checking():
+                if basin.min() < 0 or basin.max() >= lookup.size:
+                    raise FlowDivideError("the basin raster holds a basin the table does not name")
+                counted += np.bincount(basin.ravel(), minlength=lookup.size)
+            out.write(lookup[basin], 1, window=window)
+    with checking():
+        if not np.array_equal(counted[1:], basin_pixels):
+            raise FlowDivideError("the basin raster's pixel counts differ from basin_grid_count")
+        read_back = np.zeros(limit, np.int64)
+        with open_raster(temporary) as source:
+            for row0 in range(0, grid.nrow, strip_rows):
+                nrow = min(strip_rows, grid.nrow - row0)
+                group = source.read(1, window=Window(0, row0, grid.ncol, nrow))
+                if group.max() >= limit:
+                    raise FlowDivideError("the group raster holds a group the table does not name")
+                read_back += np.bincount(group.ravel(), minlength=limit)
+        if not np.array_equal(read_back[1:], group_pixels[1:]):
+            raise FlowDivideError("the group raster's pixel counts differ from land_grid_count")
+    publish(temporary, out_path)
+    log(tag, "written %s: %d groups, %d land pixels" % (out_path, len(groups), int(basin_pixels.sum())))
+    return out_path
 
 
 # =============================================================================
@@ -736,7 +788,7 @@ def _multipolygon_as_gdal_gives_it(polygons, cell_count, cell_area):
 
 def _ring_lines_across_the_seam(points, east_x, turn, tolerance):
     """One ring of an object's outline in a frame unrolled across the 180th meridian, as lines on the grid's own
-    longitudes (as the C implementation draws them): a point east of the grid's east edge (east_x) is
+    longitudes: a point east of the grid's east edge (east_x) is
     moved a turn west, and the ring is cut where it crosses that edge (a side along a row passes it at a grid line;
     the crossing point ends one line at east_x and starts the next at east_x less a turn).  A point on the edge is
     taken on its east_x side.  The ring's last line runs into its first when the ring was cut.  points: the ring's
@@ -778,17 +830,14 @@ def _ring_lines_across_the_seam(points, east_x, turn, tolerance):
 
 def outline_across_the_seam(rows_of_the_object, transform, row0, object_id=0):
     """The boundary lines of an object that holds cells in the first and the last column of a grid round the earth
-    (as the C implementation outlines it).
+    outlined in one piece.
 
     rows_of_the_object: the object's rows over the whole width of the grid, 1 where a cell is the object's.  The
     widest run of columns without a cell of it (going round) is found, and the columns are taken from the first
     column after that run on, round past the last column into the first ones: the object lies in one piece there, as
     on the earth.  Its 8-connected polygons in that frame have its holes as inner rings, so their outer rings are
-    the divide alone; the lines go back to the grid's longitudes, cut at the meridian.  Until 0.7.8 the object was
-    polygonised in the grid's own frame, where it is in two halves, and their sides along the meridian were drawn as
-    a divide although the same basin lies across: a block of 4 x 3 cells with a hole of two cells across the meridian
-    had 24 cell sides of lines, not 14 (4 along the meridian and 6 round the hole).  Returns the lines as lists of (x, y); an object holding a cell in every
-    column is refused (no basin goes round the earth)."""
+    the divide alone; the lines go back to the grid's longitudes, cut at the meridian.
+    Returns the lines as lists of (x, y); an object holding a cell in every column is refused."""
     from rasterio import features
     nrow, ncol = rows_of_the_object.shape
     column_held = rows_of_the_object.any(axis=0)
@@ -1121,7 +1170,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
                 # rest at a corner only is not a ring of its own (it would show as a dot inside the Mississippi)
                 if periodic and col0 == 0 and col1 == coarse.width:
                     # cells in the first and the last column of a grid round the earth: the object lies astride the
-                    # 180th meridian and is outlined in one piece (0.7.9, as in the C implementation)
+                    # 180th meridian and is outlined in one piece
                     boundary_geometries.append(MultiLineString([LineString(line) for line in
                                                                 outline_across_the_seam(mask, transform, row0, object_id)]))
                 else:

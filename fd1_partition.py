@@ -58,8 +58,7 @@ MERIT_MOUTH = 0            # a river mouth: the water reaches the sea here
 MERIT_SINK = 255           # an inland sink: the water ends in a closed depression here
 # the largest accumulation a raster can carry before it is nodata or garbage
 ACCUMULATION_MAX = 9.0e18
-# the largest Hack or Strahler order fd3 writes: the rasters are one byte a pixel and the C code stops at 254 (1.1.1;
-# 255 until 1.1.0)
+# the largest Hack or Strahler order fd3 writes; the rasters are one byte a pixel
 ORDER_CAP = 254
 MERIT_NODATA = 247         # no data: sea, or outside the continent
 HYDROSHEDS_SINK = 0        # HydroSHEDS v2 marks an inland sink with 0 ...
@@ -210,29 +209,22 @@ def log(tag, message):
 
 
 def open_raster(path, mode="r"):
-    """the raster at `path` opened to be read ("r") or to be read and written in place ("r+").  A GeoTIFF, whatever
-    its name, is opened with the open option NUM_THREADS=1 (1.1.0): GDAL then decodes its tiles on the thread that
-    asks for them, whatever GDAL_NUM_THREADS says in the environment or in GDAL's configuration (an open option is
-    looked at first).  Every raster whose pixels the package itself reads or updates is opened here (the look at
-    the driver below and the three places of fd1.4 that ask GDAL for a raster's size and georeference read no
-    pixel); a dataset a caller hands to a function of the package (read_block, the windows of FD3) is the caller's,
-    and should be opened here too.
-    The steps write a compressed raster piece by piece and read other rasters between the pieces.  When a setting
-    asks GDAL for more than one thread, GDAL 3.6 decodes a read of several tiles on its own threads; one of them that
-    needs room in the block cache pushes out a written tile, waits for a free thread to compress it and holds the
-    lock the other decoding threads wait for, and the run stands still without an error (six runs of six on a
-    synthetic raster with GDAL 3.6.2 and GDAL_NUM_THREADS=8, none without the variable).  Where no setting asks for
-    threads GDAL reads on the calling thread already, and nothing changes for such a run.  A raster the package
-    creates ("w") is still given GDAL_WRITE_THREADS for its compression; one it opens again to update ("r+")
-    compresses on the calling thread, as it did where no setting asked for threads.
-    Not covered: a raster in another format (the VRT driver does not take the option, and opens its sources itself)
-    and the overviews of a GeoTIFF kept in a file of their own (.ovr), which GDAL opens without the option.  With
-    such inputs, leave GDAL without a setting for threads."""
+    """Open a raster for reading ("r") or updating ("r+").
+    GeoTIFFs use NUM_THREADS=1, whatever GDAL_NUM_THREADS says, so decoding stays on the calling thread.
+    GDAL 3.6 can otherwise stand still when a decoding thread evicts an uncompressed output tile and waits
+    for a compression thread while holding the cache lock.  Reads between writes can trigger this.
+
+    Newly created rasters use GDAL_WRITE_THREADS for compression; a GeoTIFF reopened to update compresses
+    on the calling thread.  Every raster whose pixels the package reads or updates is opened here.
+    A dataset supplied by a caller should also be opened here.
+
+    The option does not cover other formats, including VRT sources, or external GeoTIFF overviews (.ovr).
+    With such inputs, leave GDAL without a setting for threads."""
     try:
         with rasterio.open(path) as looked_at:      # which driver takes it: the name does not say
             is_geotiff = looked_at.driver == "GTiff"
     except rasterio.errors.RasterioIOError:
-        is_geotiff = False                          # not there, or no raster: the open below says so, as in 1.0.0
+        is_geotiff = False                          # not there, or no raster: the open below reports the error
     if is_geotiff:
         return rasterio.open(path, mode, NUM_THREADS=1)
     return rasterio.open(path, mode)
@@ -335,11 +327,8 @@ def earth_distance_m(lat1, lon1, lat2, lon2):
     la1 = lat1 * to_rad
     la2 = lat2 * to_rad
     a = math.sin(dlat / 2.0) ** 2 + math.cos(la1) * math.cos(la2) * math.sin(dlon / 2.0) ** 2
-    # rounding must not carry a above 1 (1.1.0, as in the C implementation): for two points opposite each other, or
-    # within rounding of it, a can come out one unit in the last place above 1, and the root of 1 - a, and with it the
-    # distance, was then not a number.  A value up to 1 is left as it is, so every distance that was a number is the
-    # number it was; the package measures between neighbouring pixels, which are that far apart on no grid finer than
-    # half the globe a pixel
+    # for points opposite each other, rounding can carry a one unit in the last place above 1.
+    # Hold it at 1 so sqrt(1 - a) stays real; values up to 1 are unchanged.
     if a > 1.0:
         a = 1.0
     d_sphere = R_AUTHALIC * 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
@@ -397,17 +386,16 @@ class Grid:
         self.earth_model = earth_model
         self.pixel_width = float(self.transform.a)
         self.pixel_height = float(self.transform.e)       # negative on a north-up grid
-        # the upstream area is kept in whole square metres: a pixel below one would count as 0 (0.7.9: said here,
-        # before FD1.2 stopped at an outlet of area 0)
+        # upstream area is kept in whole square metres: a pixel below one would count as 0
         if not self.geographic and abs(self.pixel_width * self.pixel_height) < 1.0:
             raise FlowDivideError("the pixels are %.6g x %.6g m, less than a square metre; areas are kept in whole "
                                   "square metres, so the finest grid is 1 m"
                                   % (abs(self.pixel_width), abs(self.pixel_height)))
         if self.geographic:
-            # the same for a grid in degrees (0.7.9: 0.000001-degree pixels, 0.012 m2 at the equator,
-            # went as far as FD1.2).  Its pixels are largest in the row nearest the equator: when even that row is
-            # below a square metre no pixel of the grid can be counted.  A grid whose rows near a pole alone are
-            # that small is not refused here -- those rows are often empty; FD1.2 stops at an outlet of area 0
+            # a geographic grid's pixels are largest in the row nearest the equator: when even that row is
+            # below a square metre no pixel can be counted (0.000001-degree pixels are 0.012 m2 there).
+            # Small pixels near a pole alone do not refuse the grid: those rows are often empty;
+            # FD1.2 stops at an outlet of area 0.
             top_latitude = float(self.transform.f) + 0.5 * self.pixel_height
             bottom_latitude = float(self.transform.f) + (self.nrow - 0.5) * self.pixel_height
             if top_latitude * bottom_latitude <= 0.0:
@@ -425,20 +413,17 @@ class Grid:
             if self.geographic:
                 # one degree; a grid coarser than a degree (5-degree pixels) has blocks of one pixel
                 block_pixels = max(1, int(round(1.0 / abs(self.pixel_width))))
-                # a grid so fine that the smallest default capacity (2^29 pixels) does not hold one block of a
-                # degree (finer than about a sixth of an arc-second) stopped with "less than one block" (until
-                # 0.7.8): its default block goes down by tens, as a projected grid's below, until 2^29
-                # holds at least four.  Every grid of a third of an arc-second or coarser keeps its block of a degree
+                # if 2^29 pixels cannot hold one degree (finer than about a sixth of an arc-second), reduce
+                # the block by tens until 2^29 holds at least four blocks.  Grids of a third of an arc-second
+                # or coarser keep their block of a degree.
                 if block_pixels * block_pixels > (1 << 29):
                     while block_pixels >= 10 and 4 * block_pixels * block_pixels > (1 << 29):
                         block_pixels //= 10
             else:
                 # a projected grid: a block of about 100 km (10,000 pixels at 10 m, 3,333 at 30 m)
                 block_pixels = max(1, int(round(BLOCK_METRES_DEFAULT / abs(self.pixel_width))))
-                # a capacity is a number of whole blocks.  Below 10 m a block of 100 km is too many pixels: at 1 m
-                # it is 10^10, more than the largest capacity (2^31), and until 0.7.8 the run stopped with "less
-                # than one block".  The default block goes down by tens until a capacity of 2^29 pixels holds at
-                # least four of them: 10 km at 1 m, 2 m and 5 m
+                # a capacity holds whole blocks.  At 1 m a 100 km block has 10^10 pixels, more than 2^31.
+                # Reduce the default block by tens until 2^29 holds at least four: 10 km at 1 m, 2 m and 5 m.
                 while block_pixels >= 10 and 4 * block_pixels * block_pixels > (1 << 29):
                     block_pixels //= 10
         self.block_pixels = int(block_pixels)
@@ -672,15 +657,13 @@ def read_halo_tile(dataset, row0, nrow, col0, ncol, periodic, fill, dtype=None):
 
 
 def publish(temporary_path, final_path):
-    """a step writes to a temporary name and renames it when every check has passed, so that a file
-    under its final name is always a complete one.  A file already there under the final name is moved aside
-    first (fd_tables.set_aside), not deleted: until 0.7.8 it was removed before the rename, and a temporary that
-    was missing left neither"""
+    """Publish a temporary file under its final name once its checks have passed.
+    A file already there is moved aside first (fd_tables.set_aside).  A missing temporary leaves the
+    existing file in place and stops the step."""
     if not os.path.exists(temporary_path):
         raise FlowDivideError("%s was not written: %s keeps what it holds" % (temporary_path, final_path))
     fd_tables.set_aside(final_path)
-    # a move that never replaces a file: one that appeared in the meantime stops the step (as in the C
-    # implementation)
+    # a move that never replaces a file: one that appeared in the meantime stops the step
     if not fd_tables.move_without_replacing(temporary_path, final_path):
         raise FlowDivideError("%s appeared while it was being made; the new file is left at %s" % (final_path, temporary_path))
 
@@ -903,9 +886,9 @@ def _count_merit_strip(strip, counts):
 
 
 def refuse_tiles_that_overlap(tile_paths):
-    """No two tiles hold the same pixel: the later one would be written over the earlier, its nodata over the other's
-    land and its outlets over the other's (until 0.7.8 without a word).  Only the tiles' headers are read; the places
-    are counted in pixels of the first tile from the north-west corner of them all, as the assembly places them."""
+    """Refuse tiles that hold the same pixel: assembly would write one tile over another.
+    Only the headers are read.  Extents are counted in pixels of the first tile from the north-west
+    corner of the combined grid, as assembly places them."""
     extents = []
     pixel_width = pixel_height = None
     for path in tile_paths:
@@ -999,9 +982,8 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
     "custom" with direction_codes ("E=1,SE=2,..."); sink_code, nodata_code and mouth_code override the
     named coding's values.  A pixel whose direction points into nodata or off the grid becomes a river
     mouth; under the merit convention, whose own mouths are written, it is refused instead (the grid is then
-    verified and copied, as the C code does).  Any integer raster is read, and the convention's nodata is taken
-    whatever the file's own nodata says; the C check of a MERIT grid takes a Byte raster whose nodata is 247 only.
-    Both write a Byte raster with nodata 247.  Writes <out_path> and <out_path>.report.json."""
+    verified and copied).  Any integer raster is read, and the convention's nodata is taken whatever the file's
+    own nodata says.  Writes a Byte raster with nodata 247 to <out_path>, and <out_path>.report.json."""
     started = time.time()
     coding = direction_convention(convention, codes=direction_codes, sink=sink_code, nodata=nodata_code, mouth=mouth_code)
     merit_code_of_byte = merit_code_table_of(coding)
@@ -1034,9 +1016,7 @@ def fd1_0_recode(native_path, out_path, convention, periodic=False, strip_rows=2
         raise FlowDivideError("%d pixels carry a value that is no direction, no outlet and no nodata under the %s convention (%s)" % (counts[4], convention, coding))
     if convention == "merit" and counts[6] != counts[3]:
         # MERIT Hydro writes a river mouth (0) where the land ends: a direction pointing into nodata or off the grid
-        # is then a missing tile or a grid cut through its basins, and the C implementation refuses it
-        # (its check of fd1.0).  Until 0.7.8 such a pixel was made a river mouth without a word
-        # beyond the report's count
+        # indicates a missing tile or a grid cut through its basins, and is refused
         raise FlowDivideError("%d direction codes point into nodata or off the grid; in the MERIT convention a river mouth (0) "
                               "is written there, so the grid is not what it claims (a missing tile, or a window cut through "
                               "basins).  For a window cut out of a MERIT grid, give the coding as --convention custom with "
@@ -1797,11 +1777,9 @@ BASIN_ORDER_RULES = ("area-then-count", "from-a-published-table")
 #                      the ids are not worked out at all: every outlet takes the id the published table
 #                      gives its pixel, and the run is refused when an outlet is missing from that table,
 #                      when two outlets would take the same id, or when the ids are not 1 .. N.  What the
-#                      MERIT 90 m line uses, always: a re-run gives every basin the id v1.0 and v1.1 published.
-#                      A rule of the area rounded to Float32, ties by the scan, does not reproduce v1.0: over all
-#                      24,587,290 outlets it leaves 23,907,729 ids unlike v1.0's, and the area rounded to six
-#                      decimals, the order v1.0's ids keep, 22,784,002 (the order among equal areas is not the scan
-#                      order).  So no rule computed from today's rasters stands in for the published table.
+#                      MERIT Hydro products use: all 24,587,290 outlets keep their published ids.
+#                      Sorting today's areas as Float32 with scan-order ties changes 23,907,729 ids;
+#                      sorting to six decimals changes 22,784,002, so neither replaces the published table.
 
 
 def same_coordinate_system(first, second):
@@ -1917,7 +1895,7 @@ def fd1_2_outlet_indexing(dir_path, acc_path, aca_path, out_table_path, grid, cu
         # the bounds: the pixel area at 85 degrees and at the equator, 1e-4 either side.  A basin of one pixel
         # is held to its own row just below; tighter bounds at the grid's own latitude edges would refuse a
         # one-pixel basin the 0.5 % of the MERIT grid lets through
-        # a grid that reaches past 85 degrees (0.7.9): its own outermost row instead, so that a basin there passes
+        # a grid that reaches past 85 degrees uses its own outermost row, so that a basin there passes
         outermost = max(85.0, abs(grid.latitude_of_row(0)), abs(grid.latitude_of_row(grid.nrow - 1)))
         lowest = pixel_area_m2(outermost, grid.pixel_width, grid.pixel_height, grid.earth_model) / 1e6 * (1.0 - 1.0e-4)
         highest = pixel_area_m2(0.0, grid.pixel_width, grid.pixel_height, grid.earth_model) / 1e6 * (1.0 + 1.0e-4)
@@ -2141,20 +2119,28 @@ def basin_rectangles(basins):
 def _basin_ids_from_a_published_table(path, pixel_index, grid, tag):
     """the order that gives every outlet the id the published table gives its pixel.
 
-    The table is one of ours from an earlier run: it carries the basin number and the outlet's row and
-    column, whatever the column names of that version.  Returns the order that puts the outlet with id 1
+    The table carries basin ids and outlet rows and columns, as space- or comma-separated CSV or Parquet.
+    Earlier column names are read too.  Returns the order that puts the outlet with id 1
     first, so the table this step writes is in id order, as the published one is.  Refuses when an outlet
     of this run is not in the table, when two of ours would take the same id, or when the ids are not
     1 .. N: a product that carries the ids of an earlier one must carry all of them or none."""
     started = time.time()
-    header = pd.read_csv(path, sep=" ", nrows=0).columns.tolist()
-    id_column = next((name for name in ("basin_number", "basin_id", "Basin_ID") if name in header), None)
-    row_column = next((name for name in ("idxs_outlet_row", "outlet_row") if name in header), None)
-    col_column = next((name for name in ("idxs_outlet_col", "outlet_col") if name in header), None)
+    parquet = os.fspath(path).lower().endswith(".parquet")
+    if parquet:
+        import pyarrow.parquet
+        header = pyarrow.parquet.read_schema(path).names
+    else:
+        with open(path) as handle:
+            separator = "," if "," in handle.readline() else " "
+        header = pd.read_csv(path, sep=separator, nrows=0).columns.tolist()
+    id_column = next((name for name in ("basin_number", "basin_id", "Basin_ID", "global_basin_id") if name in header), None)
+    row_column = next((name for name in ("idxs_outlet_row", "outlet_row", "global_outlet_row") if name in header), None)
+    col_column = next((name for name in ("idxs_outlet_col", "outlet_col", "global_outlet_col") if name in header), None)
     if not id_column or not row_column or not col_column:
         raise FlowDivideError("the published table %s has no basin id and outlet columns I know (it has %s)"
                               % (path, ", ".join(header[:8])))
-    published = pd.read_csv(path, sep=" ", usecols=[id_column, row_column, col_column])
+    columns = [id_column, row_column, col_column]
+    published = pd.read_parquet(path, columns=columns) if parquet else pd.read_csv(path, sep=separator, usecols=columns)
     published_index = (published[row_column].to_numpy(np.int64) * grid.ncol
                        + published[col_column].to_numpy(np.int64))
     published_id = published[id_column].to_numpy(np.int64)
@@ -2338,8 +2324,8 @@ def ogr_attribute_filter(query):
     """a filter of --group-vectors as GDAL's OGR takes it: an SQL condition on the attribute table (PFAF_ID < 400,
     PFAF_ID IN (611, 612), PFAF_ID <> 353), None for none.  Outside quotes, pandas' == and != are taken as = and <>
     and a list in square brackets is refused; a string ('...', '' for a quote in it) and a quoted name ("...") are
-    kept as they are.  1.1.2: until 1.1.1 only != was converted, everywhere, and OGR reads PFAF_ID == 353 and
-    PFAF_ID IN [611, 612] without an error as conditions that keep every polygon"""
+    kept as they are.  Converting == and refusing square-bracket lists matters because OGR can read
+    PFAF_ID == 353 and PFAF_ID IN [611, 612] as conditions that keep every polygon without an error"""
     if not query:
         return None
     parts = re.split(r"""('(?:[^']|'')*'|"[^"]*")""", query)
@@ -2387,18 +2373,14 @@ def _open_level3_layer(path, query, codes_seen, tag):
 
 
 def _burn_level3_layers(dir_path, temporary, layers, tag):
-    """the empty output on the grid of DIR
-    (DIR's size, geotransform and spatial reference, 512 x 512 tiles, UInt16, nodata 0), and every layer burned
-    into it in the order given.  The output and the polygon files are closed on the way out, the output first.
-    Returns the codes the layers hold and their polygon count.
-    The output is created on one thread, and GDAL_NUM_THREADS is 1 for this thread from the creation to the close
-    (1.1.0, as in the C implementation).  GDAL burns layer after layer and reads the output back chunk by chunk
-    for each; created with NUM_THREADS=ALL_CPUS, as until 1.0.0, GDAL 3.6 decoded those chunks on its own threads,
-    and with a second layer and an output larger than GDAL's block cache one of them waited for a compression that
-    no thread was free to do: the burn stood still without an error (three runs of six on a synthetic grid with
-    GDAL 3.6.2).  The pixels burned are the same.  The output has no threads of its own from its creation, so it
-    does not matter whether it is closed before or after the thread's setting is put back (an exception GDAL raises
-    can hold it open until the exception is gone)."""
+    """Burn each layer, in the order given, onto an empty raster on DIR's grid.
+    The output is UInt16, nodata 0, with DIR's size, geotransform and spatial reference and 512 x 512 tiles.
+    Returns the codes the layers hold and their polygon count; closes the output before the polygon files.
+
+    Creation and burning use one thread.  GDAL reads the output back for each layer, and GDAL 3.6 can
+    otherwise wait for ever for compression while decoding an output larger than its block cache.
+    The output has no threads of its own, so it can close before or after the thread's setting is restored,
+    including when an exception holds it open."""
     from osgeo import gdal
     codes_seen = set()
     polygon_count = 0
@@ -2480,8 +2462,8 @@ def fd1_4_rasterise_level3(dir_path, l3_path, grid, layers, strip_rows=None, tag
     """the Level-03 polygons burned onto the grid of DIR: every pixel gets the PFAF_ID of the polygon
     that holds its centre, 0 where none does.  `layers` is a list of (shapefile path, attribute filter
     or None); the filter is an OGR SQL condition on the attribute table (ogr_attribute_filter), e.g. "PFAF_ID != 353".
-    Burned as the script that made the raster first burned them: GDAL's RasterizeLayer on the whole output, a GTiff of 512 x 512
-    tiles on the grid of DIR, the layers in the order given, GDAL's cache left at its default.  GDAL
+    Burned with GDAL's RasterizeLayer on the whole output, a GTiff of 512 x 512 tiles on the grid of DIR,
+    the layers in the order given, GDAL's cache left at its default.  GDAL
     burns a large output in chunks of rows, and the chunks follow the tiles and the cache;
     rasterio.features.rasterize over strips of its own, each with its own origin, gives a few dozen
     pixels of MERIT's raster otherwise at the polygons' edges.  The checks are: a
@@ -2657,7 +2639,7 @@ def _union_window(grid, rectangles):
     return grid.window_of_rectangle(row_min, row_max, col_min, col_max)
 
 
-# ---- [C] a small doubtful basin takes the code of its longest shared boundary (the rule of the C code) ----
+# ---- [C] a small doubtful basin takes the code of its longest shared boundary ----
 #
 #  A basin is doubtful when it holds at most SMALL_BASIN_MAX_PIXELS pixels and either has no code or its
 #  winning code covers less than half of them.  One pass over the basin mask counts, for every doubtful
@@ -2873,8 +2855,7 @@ def group_windows_in_pixels(groups, grid, block=None):
 
 
 def _fill_group_window_columns(table, grid, block):
-    """window_nrow .. window_maxlat of a group table whose window_* block columns are set,
-    as the C implementation fills them"""
+    """window_nrow .. window_maxlat of a group table whose window_* block columns are set"""
     table["window_nrow"] = (table["window_row_max"] - table["window_row_min"]) * block
     table["window_ncol"] = (table["window_col_max"] - table["window_col_min"]) * block
     table["window_grid_count"] = table["window_nrow"] * table["window_ncol"]
@@ -3044,7 +3025,7 @@ def fd1_6_basin_table(basin_table_path, basin_region_path, region_table_path, pi
       basin_id_in_region
 
     region_map_key: fd_tables.region_map_key of the partition, which the map must carry: the Level-03 partition of 2^31
-    and no other, as in the C code (1.1.1; until 1.1.0 the command line held to it and this function took any key)."""
+    and no other."""
     started = time.time()
     if region_map_key != level3_top_tier_key(region_map_key):
         raise FlowDivideError("region_id is written for the Level-03 partition of 2^31 (%s), not for %s"
@@ -4313,17 +4294,16 @@ class Piece:
 
 
 def acc_count(value):
-    """an upstream pixel count as the C programs read one and fd1.2 rounds one: the value v as a double,
-    floor(v + 0.5) when 1 <= v < ACCUMULATION_MAX (9e18), otherwise 0 (0, a fraction below 1, a nodata, a NaN).  A
-    whole count up to 2^52 comes through unchanged; above it the + 0.5 can round up by one, as in the C programs.
-    1.1.1: until 1.1.0 fd1.5 cut the fraction off (1.6 read 1), which a raster of whole counts never showed"""
+    """an upstream pixel count rounded as in fd1.2: read v as a double, then floor(v + 0.5) when
+    1 <= v < ACCUMULATION_MAX (9e18), otherwise 0 (0, a fraction below 1, a nodata, a NaN).
+    A whole count up to 2^52 comes through unchanged; above it the + 0.5 can round up by one."""
     value = float(value)
     return int(math.floor(value + 0.5)) if 1.0 <= value < ACCUMULATION_MAX else 0
 
 
 def acc_counts(values):
-    """acc_count over an array: int64.  Every type is read as a double first, as the C programs read it (a whole
-    count up to 2^52, which every grid's is, comes through unchanged)"""
+    """acc_count over an array: int64.  Every type is read as a double first;
+    a whole count up to 2^52 comes through unchanged."""
     values = np.asarray(values).astype(np.float64)
     good = (values >= 1.0) & (values < ACCUMULATION_MAX)
     return np.floor(np.where(good, values, 0.0) + 0.5).astype(np.int64)
@@ -5166,18 +5146,15 @@ def _split_basins_along_block_lines(grid, basins_rect, basins_land, member_indic
 
 # The rule the merge follows, in the step's arguments so that a change of the rule re-runs the step instead
 # of reusing its marker.  Of the partners a region may take, the one that:
-#   window-min    leaves the smallest joined window (the globe comes out as 107
-#                 regions at 1400 square degrees, the coded ones 28.74% land in their windows)
-#   window-max    fills the capacity furthest, "filling" read as the window (104
-#                 regions and 27.73% land, so a fuller window is mostly emptier space)
+#   window-min    leaves the smallest joined window
+#   window-max    leaves the largest joined window within the capacity
 #   land-max      brings the most land into the region, the window only the constraint
 #   density-max   leaves the most land per pixel of the joined window
-# The environment variable is for measuring the four on the real grid; the published runs take the default.
-MERGE_RULE = os.environ.get("FLOWDIVIDE_MERGE_RULE", "land-max")
+# FLOWDIVIDE_MERGE_RULE selects the rule; the default is window-max.
+MERGE_RULE = os.environ.get("FLOWDIVIDE_MERGE_RULE", "window-max")
 # Which joins may cross a Level-02 unit.  "leftovers-only" (the default): only in a second pass, and
 # only for a region under a quarter of the capacity.  "from-the-start": any two touching coded regions may
-# join as soon as the window fits.  Measured: the unit restriction refused 2,018,232 pairs where
-# the capacity refused 94, so this is what decides how many regions there are.
+# join as soon as the window fits.
 MERGE_ACROSS = os.environ.get("FLOWDIVIDE_MERGE_ACROSS", "leftovers-only")
 if MERGE_ACROSS not in ("leftovers-only", "from-the-start"):
     raise SystemExit("FLOWDIVIDE_MERGE_ACROSS is leftovers-only or from-the-start, not %r" % MERGE_ACROSS)
@@ -5402,12 +5379,7 @@ def _regions_of_the_level2_units(grid, regions, capacity_pixels, tag):
     does not fit is divided along its own Level-03 units, taken in code order, a new part started as soon as the
     window no longer fits, so that every part is a run of consecutive Level-03 codes.  The groups that carry no
     code (the islands, and on a periodic grid the groups the antimeridian cuts) and the regions of the
-    pieces of a cut basin are left as they are.
-
-    Measured on the globe at 1400 square degrees: 57 of the 61 coded units fit as they are, and the four that do not
-    (35 at 1.40 of the capacity, 56 at 1.10, 77 at 1.31, 91 at 1.12) come out as two regions each, so 65
-    coded regions.  Building upward from the Level-03 units instead (291 of them, all fitting) and joining
-    them two at a time stopped at 79, because a join had to stay inside one Level-02 unit."""
+    pieces of a cut basin are left as they are."""
     merges = []
     alive = [True] * len(regions)
 
@@ -5469,10 +5441,7 @@ def _regions_of_the_level2_units(grid, regions, capacity_pixels, tag):
         # the unit does not fit: its Level-03 units in code order, a new part started as soon as the window
         # no longer fits, so that every part is a run of consecutive Level-03 codes and its published id can
         # name the run it holds.  Level-03 codes
-        # run along the main stem, so consecutive codes are units that lie next to each other.  Measured on
-        # the globe at 1400 square degrees: the four units that do not fit still come out as two parts each,
-        # and their windows are more even than the packing gave (35: 1071 and 1035 blocks against 1395 and
-        # 819; 91: 989 and 1116 against 1197 and 234).
+        # run along the main stem, so consecutive codes are units that lie next to each other.
         parts = []
         # the code, then the build id: a Level-03 unit that was itself divided has two regions of the same
         # code, and without the second key their order would not be decided
@@ -5517,16 +5486,14 @@ def _merge_regions_under_the_capacity(grid, regions, capacity_pixels, policy, la
     joined window costs the fewest pixels over the two windows added up, only windows that touch or
     contain one another, never a region of pieces (within_parent: only two regions of one Level-02
     unit).  Policy "balanced": the smallest region that has a partner joins the partner in its Level-02
-    unit that MERGE_RULE ranks first (by default the one that brings the most land), a join adding no
+    unit that MERGE_RULE ranks first (by default the one that leaves the largest joined window), a join adding no
     more empty window than the smaller of the two windows holds; when nothing can grow inside its unit any more, a region under a quarter of
     the capacity may join a touching coded region of another unit.  Returns the merge records.
 
     Filling comes first, evenness second. The
     filling is the partner chosen: of the partners a region may take, the one MERGE_RULE ranks first (by
-    default the most land in the joined region, the window only the constraint). The evenness is the order: the smallest region goes first, so the
-    small ones are taken in rather than one region growing until it fills the capacity by itself. Choosing
-    the partner with the SMALLEST joined window instead leaves the regions small and their number large
-    (the globe at 1400 square degrees: 107 regions, 82 of them coded)."""
+    default the largest joined window within the capacity). The evenness is the order: the smallest region goes first, so the
+    small ones are taken in rather than one region growing until it fills the capacity by itself."""
     merges = []
     refused = {"not the same unit": 0, "a region of pieces": 0, "the windows do not touch": 0,
                "the joined window passes the capacity": 0, "the joined land passes the cut": 0,
@@ -6275,8 +6242,8 @@ def fd1_5_regions_final(basin_table_path, grouping, bsn_path, cuts, grid, capaci
 @njit(cache=True)
 def _merge_the_runs(area, grid_count, run_start, run_count_of, global_id):
     """the global ids of the basins of several runs laid end to end (run r at run_start[r] .. +run_count_of[r]): the
-    runs' own orders merged, the larger area first, then the larger pixel count, then the earlier run, as
-    the C implementation orders them, one comparison at a time"""
+    runs' own orders merged, the larger area first, then the larger pixel count, then the earlier run,
+    one comparison at a time"""
     runs = run_start.size
     next_of = np.zeros(runs, np.int64)
     total = 0

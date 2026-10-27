@@ -99,7 +99,7 @@ def the_columns_are_filled():
     check("places in the region (61201 holds 2 and 5)", table["basin_id_in_region"].tolist(), [1, 1, 1, 1, 2])
     other_key = fd_tables.region_map_key(80 * 3600 * 3600, 3600, "l3")
     refused("a map of another partition", lambda: fd1.fd1_6_basin_table(basin_table, map_path, region_path, piece_path, other_key))
-    # 1.1.1: the key itself must be the Level-03 partition of 2^31, whatever map is given with it
+    # the key itself must be the Level-03 partition of 2^31, whatever map is given with it
     hilbert_key = fd_tables.region_map_key(160 * 3600 * 3600, 3600, "hilbert")
     fd_tables.write_basin_map(map_path + ".hilbert", np.array([0, 0, 61201, 61101, 206001, 61201], np.int64), run_of(basin_table),
                               "region", hilbert_key)

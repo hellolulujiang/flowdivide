@@ -1,4 +1,4 @@
-"""test_fd3_compact.py -- the numbering of 0.7.7 (fd3_attributes section [2c]) against the whole-window order of 0.7.6.
+"""test_fd3_compact.py -- the region's pixel numbering against a whole-window order.
 
     python3 test_fd3_compact.py
 
@@ -6,11 +6,11 @@ On random windows of flow directions (no cycle by construction: every pixel flow
 random surface, or ends as a mouth or a sink, or leaves the window), with random members' outlets, outlets of child
 pieces another region works, and, for the network, a channel mask made from the upstream count:
 
-1. the structure: the pixels numbered are exactly the pixels 0.7.6 gives a member (window_flow_structure and
+1. the structure: the pixels numbered are exactly those the whole-window structure gives a member (window_flow_structure and
    window_member_of_pixel, which stay in the package for the registered rules), each with the same member, each
    numbered after the pixel it flows into, linked to the same downstream pixel; the outlets outside the order last;
-2. the six sweeps: the 0.7.6 kernels, copied here as they were, over the whole window, and the 0.7.7 kernels over
-   the numbered pixels, from the same starting values (values handed across cuts put at random pixels), give the same
+2. the six sweeps: the reference kernels here over the whole window and the package's kernels over the numbered
+   pixels, from the same starting values (values handed across cuts put at random pixels), give the same
    values bit for bit and the same counts, sources, maxima, heads and donors;
 3. the refusals: a cycle (one through the outlet of a child of another region too), two members on one outlet, a member
    numbered before the member it flows into, more pixels than the capacity.
@@ -35,7 +35,7 @@ def check(what, condition):
 
 
 # =============================================================================
-#  The 0.7.6 sweeps over the whole window, as they were (fd3_attributes 0.7.6, section [2b])
+#  Reference sweeps over the whole window
 # =============================================================================
 
 @njit(cache=True)
@@ -135,8 +135,8 @@ def ref_sweep_shreve_magnitude(order, downstream, member, channel_window, value,
 @njit(cache=True)
 def ref_sweep_main_stem_donor(order, downstream, member, channel_window, area_window, ncol, best_donor):
     """Which channel pixel that flows into a channel pixel carries the most upstream area, and so keeps
-    the Hack order of the pixel below.  A tie goes to the smaller index in this window, which is the
-    the rule (it compares the donor's place in the rectangle it read; for two neighbours of one pixel
+    the Hack order of the pixel below.  A tie goes to the smaller index in this window, which is the rule
+    (it compares the donor's place in the rectangle it read; for two neighbours of one pixel
     the row decides, and the rectangle is at least three columns wide).  One sweep upstream first;
     nothing depends on the order here, but the sweep is the cheapest way over the member's pixels.
     best_donor is int32 (the window holds at most 2^31 - 1 pixels), and the best donor's area is read from
@@ -494,7 +494,7 @@ def test_refusals():
     status = fd3.compact_the_pixels_of_the_region(directions, nothing, False, np.array([2], np.int64),
                                                   np.array([0], np.int64), np.zeros(0, np.int64), 6)[0]
     _, _, taken, _ = fd3.window_flow_structure(directions, nothing, False)
-    check("a cycle: refused (status %d), as 0.7.6 refuses it (taken %d)" % (status, taken), status == 2 and taken < 0)
+    check("a cycle: refused by the compact and whole-window structures (status %d, taken %d)" % (status, taken), status == 2 and taken < 0)
     directions = np.array([[1, 1, 0], [64, 64, 64]], np.uint8)
     status = fd3.compact_the_pixels_of_the_region(directions, nothing, False, np.array([2, 2], np.int64),
                                                   np.array([0, 1], np.int64), np.zeros(0, np.int64), 6)[0]
@@ -514,7 +514,7 @@ def test_refusals():
                                                                    np.array([0], np.int64), blocked, 6)[:3]
     check("a child's outlet of another region: it and the pixels above it are not ours (%d pixels)" % count,
           status == 0 and count == 2 and in_order == 2)
-    # a child's outlet of another region on a cycle: the cycle is refused as 0.7.6 refuses it
+    # a cycle through another region's child outlet is refused by both structures
     directions = np.array([[1, 1, 0], [1, 16, 0]], np.uint8)
     for mask, use_mask, what in ((nothing, False, "the land"), (np.ones((2, 3), np.uint8), True, "a mask of every pixel")):
         status = fd3.compact_the_pixels_of_the_region(directions, mask, use_mask, np.array([2], np.int64),

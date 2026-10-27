@@ -14,9 +14,9 @@ is computed once per region, exactly, with one value crossing each cut:
 
     a region is read as one window, the rectangle its members cover plus one pixel; the flow
     directions are the mask, since an upstream walk from a basin's outlet cannot leave the basin.
-    Since 0.7.7, for the five swept attributes (all but lfp), the window holds the flow directions (and
+    For the five swept attributes (all but lfp), the window holds the flow directions (and
     the channel mask, and for hck the upstream area) only, and everything else is held for the region's
-    own pixels (section [2c]), as in the C programs;
+    own pixels (section [2c]);
 
     every member (a whole basin, or a piece of a cut basin) is taken from its outlet upstream: the five
     swept attributes number its pixels in a visiting order and sweep the rule over them (sections [2b] and
@@ -80,7 +80,7 @@ from fd1_partition import (DROW, DCOL, IS_LAND, MERIT_NODATA, ORDER_CAP, FlowDiv
                            raster_profile, read_table, timing, write_block, write_json, write_table)
 
 PATH_FRAMES = 1 << 22         # the points lfp's path buffers start with (doubled for a longer path)
-LFP_LENGTH_TOLERANCE_M = 1e-3  # the painted path against the distance walk's length, as the C code
+LFP_LENGTH_TOLERANCE_M = 1e-3  # the painted path against the distance walk's length
 SWEPT_ATTRIBUTES = ("shv", "ldn", "hck", "lup", "ord")   # every class but the longest flow path, which
                                                          # walks one path and not a whole member
 # the columns of the basin table the partition reads (fd_tables.read_basin_table_columns keeps only these)
@@ -89,7 +89,7 @@ PARTITION_BASIN_COLUMNS = ("basin_id", "outlet_row", "outlet_col", "outlet_lon",
 # the output blocks two regions share are held in memory up to this many bytes, the rest on disk (HeldBlocks);
 # FLOWDIVIDE_HELD_MEMORY_MB sets another budget, in MiB
 HELD_MEMORY_BYTES_DEFAULT = 512 * 2 ** 20
-# GDAL's block cache while FD3 runs, 512 MiB, the bound the C programs set (GDALSetCacheMax64).  Unbounded, GDAL keeps
+# GDAL's block cache while FD3 runs, 512 MiB.  Unbounded, GDAL keeps
 # up to 5 % of the machine's memory of the blocks it has read (3.2 GB on a 64 GB machine, 0.8 GB on a 16 GB one), and
 # FD3 fills it, every window being read through it, though it reads each window once and never comes back for it.
 # --gdal-cache-mb of flowdivide.py, or FLOWDIVIDE_GDAL_CACHE_MB, sets another bound, in MiB
@@ -105,11 +105,9 @@ _LIBC = None
 
 
 def release_free_memory():
-    """Hand back to the system the memory the allocator keeps after it is freed.  Parsing North America's basin table
-    and basin map leaves the process at 6.6 GB resident with 1.9 GB of it in use: the rest is freed but kept by the
-    allocator, and the windows' large arrays cannot use it, so it adds to every region's peak.  macOS:
-    malloc_zone_pressure_relief(NULL, 0) on every zone; Linux with glibc: malloc_trim(0); elsewhere nothing.  It
-    changes no value, only what the process holds."""
+    """Hand back unused allocator memory so it does not add to the region arrays' peak.
+    macOS uses malloc_zone_pressure_relief(NULL, 0) on every zone; Linux with glibc uses malloc_trim(0);
+    elsewhere this does nothing.  Values are unchanged."""
     global _LIBC
     try:
         if _LIBC is None:
@@ -156,12 +154,11 @@ class HeldBlocks:
     A block is kept whole in the raster's own type.  The most recently held blocks stay in memory up to a budget of
     bytes; the older ones go to a scratch directory as raw .npy files and come back from there when a region needs
     them (np.save and np.load keep the dtype and every bit, so a block comes back as it went).  The directory is
-    <prefix>.<process id>.  Nothing is deleted (0.7.9): a block read back leaves its file where it is (the file is
+    <prefix>.<process id>.  Nothing is deleted: a block read back leaves its file where it is (the file is
     this run's own scratch, written again if the same block goes to disk a second time), the directory is moved
     into _tmp_/ beside the output when the step ends, and so are the directories of runs that are no longer alive,
-    never one in use; the scratch left in _tmp_ is at most every shared block once.  Without the budget the
-    held blocks grew with the continent and not with the capacity: up to 12,024 blocks, 12.6 GB, for the upstream flow
-    length on North America at 2^30.  Used as a dictionary by RegionWindow.write_back: `in`, pop, item assignment, len."""
+    never one in use; the scratch left in _tmp_ is at most every shared block once.
+    Used as a dictionary by RegionWindow.write_back: `in`, pop, item assignment, len."""
 
     def __init__(self, prefix, budget_bytes):
         self.directory = "%s.%d" % (prefix, os.getpid())
@@ -241,7 +238,7 @@ class HeldBlocks:
 
     @staticmethod
     def _put_aside_what_stopped_runs_left(prefix):
-        """the scratch directories of this output whose run is gone: <prefix> itself (0.7.4 named it so) and every
+        """the scratch directories of this output whose run is gone: <prefix> without a process id and every
         <prefix>.<process id> whose process no longer exists are moved into _tmp_/; a directory of a live process is
         left alone"""
         for path in [prefix] + glob.glob(glob.escape(prefix) + ".*"):
@@ -390,9 +387,8 @@ class Partition:
                 steps += 1
                 if steps > len(self.members):
                     raise FlowDivideError("the pieces of basin %d flow into each other in a cycle" % member.basin_id)
-        # a cut basin has one piece without a parent, and it ends at the basin's outlet (the C implementation
-        # refuses a chain whose root's outlet is not the basin's): a
-        # root piece that ended a pixel short gave a longest flow path a pixel short, within its length's tolerance
+        # a cut basin has one piece without a parent, ending at the basin's outlet:
+        # a root ending a pixel short would shorten the longest flow path by a pixel
         for basin_id, basin in self.basins.items():
             if int(region_of_basin[basin_id]) != 0:
                 continue
@@ -503,7 +499,6 @@ class Partition:
             # once: the tables do not say which column is free (the box of a region may span every column although one
             # is free, and the small basins' boxes are not kept), and with one copy of it the column of a child's outlet
             # there, which decides the tie of the Hack order's main stem, would depend on where the window starts
-            # (0.7.8)
             raise FlowDivideError("region %d spans %d of the %d columns of the periodic grid: its window, with a column of "
                                   "margin on each side, would hold a column twice, and a region all the way round the grid, "
                                   "or all but one column, is not computed; build the partition at a smaller capacity"
@@ -607,16 +602,12 @@ def paint_path_downstream(dir_window, out_window, lengths, start_row, start_col,
 #  [2b] The ordered sweeps: the same rules, over a visiting order built once
 # =============================================================================
 #
-#  A walk that does the arithmetic inside a depth-first traversal makes every pixel pay a push, a pop and
-#  eight neighbour tests, and jumps about the window.  The sweeps here do the same
-#  arithmetic over an order built once for the whole window in three linear passes; the loops then read
-#  two arrays and nothing else.  Measured on basin 4 (903 million land pixels, one process): the walk
-#  costs 236 ns a pixel for the accumulation, the tile kernels, which sweep an order, 118.
+#  A visiting order is built once for the whole window in three linear passes.
+#  Each sweep then reads that order and the downstream links.
 #
-#  Since 0.7.7 the five swept attributes number the region's own pixels instead (section [2c]); the order over
-#  the whole window below is what a registered rule (derive_user_attribute) is still given, and what the tests
-#  compare section [2c] with.  It costs 13 bytes for every pixel of the window, and with the member of every pixel
-#  and the output window the provided attributes held 23 to 25 bytes a window pixel up to 0.7.6.
+#  The five swept attributes number the region's own pixels (section [2c]).  A registered rule
+#  (derive_user_attribute) receives the whole-window order below, which the tests compare with section [2c].
+#  The whole-window structure costs 13 bytes per window pixel; the member and output arrays come on top.
 #
 #  Three arrays describe the window once:
 #      downstream  int32, the pixel each land pixel flows into inside the window; -1 when the flow leaves
@@ -638,8 +629,7 @@ def window_flow_structure(dir_window, mask, use_mask):
     is built over the pixels `mask` marks and no others, which is how the three classes that live on the
     channel network are computed: the upstream area only grows along the flow, so a channel pixel's
     downstream pixel is a channel pixel as well, and the masked pixels are the network itself.  The
-    channel network is about two pixels in a hundred, and building the order over every land pixel instead
-    cost those classes twice what the walk they replaced cost (measured).
+    order is built only for the pixels the kernel needs.
     Returns (downstream, order, taken, broken); taken is -2 when the directions hold a cycle, and
     broken is the first pixel of the mask whose downstream pixel is land inside the window and not of
     the mask, or -1 when there is none.  Such a pixel would lose everything above it: the link is not
@@ -808,13 +798,12 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
 
 
 # =============================================================================
-#  [2c] The region's own pixels, numbered in a visiting order (0.7.7)
+#  [2c] The region's own pixels, numbered in a visiting order
 # =============================================================================
 #
 #  The five swept attributes do not build the order over the whole window.  The window holds the
 #  flow directions (one byte a pixel), the channel mask when the class lives on the network (one byte),
-#  and, while the structure is built, the number of every pixel of this region (int32): four arrays
-#  over the window shrank to one, as in the C code.
+#  and, while the structure is built, the number of every pixel of this region (int32).
 #  Everything else is held for the pixels of the region only, in the order they are numbered:
 #      pixel_of_compact       int32, the window pixel
 #      member_of_compact      int32, the member (its index among the region's outlets)
@@ -825,23 +814,22 @@ def sweep_accumulate_area(order, downstream, member, areas_of_row, value, ncol, 
 #  order), swept downwards they are handed down from the divides (upstream length, Shreve, Strahler).
 #  The values do not depend on which such order is taken -- a sum of integers, a maximum, a value read
 #  from the pixel below, and the two ties (the farthest pixel of the distance, the main-stem donor of
-#  the Hack order) go to the smaller window index, not to the earlier one in the order -- so the rasters
-#  and the tables are those of 0.7.6 bit for bit.
+#  the Hack order) go to the smaller window index, not to the earlier one in the order.
 #
-#  The pixels are found as in 0.7.6: a pixel is this region's when the flow from it reaches the outlet
+#  A pixel is this region's when the flow from it reaches the outlet
 #  of one of the region's members through pixels of the order, without passing the outlet of a child
 #  piece that another region works.  Every pixel of the order is followed down once, in rows: the walk
 #  stops at the first pixel already decided, and the pixels it passed are numbered from there upwards, or
 #  marked as another region's (the outlet of such a child and the pixels above it are another region's,
-#  but the walk goes on through it).  A walk that comes back to a pixel it passed is a cycle, which is the
-#  check of 0.7.6 on the same pixels; nothing of the walk is kept but its length.
+#  but the walk goes on through it).  A walk that comes back to a pixel it passed is a cycle;
+#  nothing of the walk is kept but its length.
 
 # the state of a window pixel while the structure is built: its number + 1 once numbered, or one of these
 COMPACT_UNDECIDED = 0       # not reached yet (the array starts as zeros, which the system hands over without a fill)
 COMPACT_NOT_OURS = -2       # flows out of the window, into another region, or past a child's outlet
 COMPACT_BLOCKED = -3        # the outlet of a child piece another region works, not walked yet: never ours, and so
                             # is every pixel above it, but the walk goes on through it, so that a cycle through it
-                            # is found as 0.7.6 found it
+                            # is found too
 COMPACT_OUTLET_WAITING = -4  # the outlet of a member of this region, not numbered yet
 
 
@@ -965,7 +953,7 @@ def compact_the_pixels_of_the_region(dir_window, mask, use_mask, outlet_pixels, 
     pixel_of_compact, member_of_compact, downstream_of_compact and compact_of_outlet).  status 0; 1 more pixels
     than `capacity`; 2 a cycle; 3 two members share an outlet; 4 a member's outlet flows into a member numbered
     after it.  An outlet that is not of the order (not land, or outside the mask) is a pixel of the region all the
-    same, as in 0.7.6, and is numbered last: nothing flows into it, it flows nowhere, and a sweep runs over the
+    same, and is numbered last: nothing flows into it, it flows nowhere, and a sweep runs over the
     pixels of the order only (the first `count_in_order`)."""
     nrow, ncol = dir_window.shape
     state = np.zeros(nrow * ncol, np.int32)
@@ -1089,9 +1077,8 @@ def check_the_cuts_of_the_region(attribute, region_id, grid, window, members, st
     """Every cut of this region, the piece table against the flow directions, before anything crosses it.
 
     A child piece hands what it carries to the pixel its outlet flows into, and the piece table says which pixel
-    that is and which member it belongs to.  Until 0.7.8 the table was taken at its word: a table naming another
-    pixel, or another parent, gave the child's value to a stranger and every count still added up.  Checked here for
-    every child of every member of this region, whichever region the child lies in:
+    that is and which member it belongs to.  A wrong pixel or parent would give the child's value to another
+    member even if the counts added up.  Every child of every member is checked, whichever region it lies in:
 
       1. the child's outlet carries one of the eight directions, and the pixel it points to is the table's
          parent inlet pixel;
@@ -1627,7 +1614,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
                         continue
                     across = int(value[inlet_compact] if best_donor[inlet_compact] == outlet_pixel
                                  else value[inlet_compact] + 1)
-                    if across > ORDER_CAP:                  # 1.1.1: held here too, as in the C code
+                    if across > ORDER_CAP:                  # the order handed across a cut must fit the cap too
                         raise FlowDivideError("hck: the order handed to member %d is %d, past %d"
                                               % (child.member_id, across, ORDER_CAP))
                     states[child.member_id] = across
@@ -1753,7 +1740,7 @@ def derive_attribute_by_sweep(attribute, partition, dir_path, out_path, table_pa
     basin_table = _basin_table_from_members(attribute, partition, member_table)
     publish(temporary, out_path)
     write_table(member_table, member_table_path, float_format="%.17g")
-    write_basin_table_as_the_c_code_does(basin_table, table_path)
+    write_attribute_basin_table(basin_table, table_path)
     report = {"attribute": attribute, "regions_visited": len(regions_in_order), "members": len(member_rows),
               "basins": len(basin_table), "traversal": "order", "seconds": round(time.time() - started, 1)}
     write_json(out_path + ".report.json", report)
@@ -1798,7 +1785,7 @@ BASIN_TABLE_FORMAT = {
 }
 
 
-def write_basin_table_as_the_c_code_does(table, path):
+def write_attribute_basin_table(table, path):
     """a basin table with its header and its format column by column, published when complete"""
     formats = [BASIN_TABLE_FORMAT[column] for column in table.columns]
     line_format = " ".join(formats) + "\n"
@@ -1830,8 +1817,7 @@ class RegionWindow:
         """read_out_at: the pixels of the output raster an earlier region may have written, as local pixel
         indices (the outlets of the child pieces that lie in another region).  Only those are read; the
         rest of the output window starts at its nodata, and only the blocks this region writes go back.
-        Reading the whole output window again cost 7 GB of traffic a region on a continent and gave back
-        nothing but those few pixels (measured).  with_output False: no output window is made here (the swept
+        with_output False: no output window is made here (the swept
         classes hold their values for the region's own pixels and set `out` just before the write)."""
         self.rectangle = rectangle
         self.row0 = rectangle[0]
@@ -1840,8 +1826,7 @@ class RegionWindow:
         self.ncol = rectangle[3] - rectangle[2]
         self.grid = grid
         # a pixel of the window is named by a 32-bit index in the sweeps (downstream, order, member, the compact
-        # numbering), so the window must fit one, as in the C code; until 0.7.8
-        # a window past 2^31 - 1 pixels, from a capacity above 2^31, would have run on and wrapped the indices
+        # numbering), so the window must fit 2^31 - 1 pixels to avoid wrapping the indices
         if self.nrow * self.ncol > 2 ** 31 - 1:
             raise FlowDivideError("the window %s holds %d pixels, more than a 32-bit index can name; the attributes "
                                   "are computed on partitions of at most 2^31 pixels" % (rectangle, self.nrow * self.ncol))
@@ -1946,7 +1931,7 @@ class RegionWindow:
     def write_back(self, grid, out_dataset, dtype, mine=None, last_writer=None, visit=None, held=None):
         """The region's pixels written into a raster that is still being created, so that nothing is ever
         read back: in create mode GDAL compresses a block inside the write call, while in update mode it
-        keeps the block dirty until the close, which on basin 4 cost 59 to 79 s a region set.
+        keeps the block dirty until the close.
         A block a later region will also write is held whole (in memory up to the budget of `held`, on disk
         beyond it) until that region has put its pixels in; `last_writer` says which visit writes each block last.  With mine None the whole window
         goes back in one call, which is what the drivers that own their whole window do."""
@@ -2163,7 +2148,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # reads its members at the tables' area
     # the basins of the tables' area only: a partition read for the distance or the upstream flow length
     # (raster_min_basin_area_km2=0) also holds the cut basins below that area, which lfp leaves out as a partition
-    # read for it leaves them out (0.7.8)
+    # read for it leaves them out
     path_basins = np.asarray(sorted(basin_id for basin_id, basin in partition.basins.items()
                                     if basin["area_km2"] >= partition.table_min_basin_area_km2), np.int64)
     members_ldn = members_ldn[np.isin(members_ldn["basin_id"].to_numpy(np.int64), path_basins)]
@@ -2185,7 +2170,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     # outlet and its parent's inlet are neighbours, so the member's columns are shifted by the whole turns that bring the
     # two within a column of each other, from the outlet member down the tree.  That lays the basin out as one connected
     # run, the order a single window holding the whole basin gives its columns; inside one member the distance's sweep
-    # already broke the tie in its window, which holds the member as such a run too (0.7.8)
+    # already broke the tie in its window, which holds the member as such a run too
     turn_of_member = {}
     if grid.periodic:
         window_start = {}
@@ -2233,9 +2218,8 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
     path_cols = np.empty(PATH_FRAMES, np.int64)
     segments = {}
     # the outlet pixel of every member of the partition: a segment runs from its entry down to its own member's outlet
-    # and meets no other member's outlet on the way, or its entry is not a pixel of that member (0.7.9; a piece table
-    # that names another parent across a cut, whose outlet does flow into the inlet named, was taken at its word here
-    # while the distance table it reuses listed the right members)
+    # and meets no other member's outlet on the way, or its entry is not a pixel of that member; so a piece table
+    # that names a wrong parent across a cut is caught here too, where the path follows the distance table's members
     outlet_cells = np.unique(np.asarray([m.outlet_row * grid.ncol + m.outlet_col % grid.ncol
                                          for m in partition.members.values()], np.int64))
     with open_raster(dir_path) as dir_dataset, open_raster(temporary, "r+") as out_dataset:
@@ -2300,7 +2284,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
                                        grid.latitude_of_row(member.parent_inlet_row), grid.longitude_of_col(member.parent_inlet_col)) if grid.geographic \
                 else math.hypot((member.outlet_row - member.parent_inlet_row) * grid.pixel_height, (member.outlet_col - member.parent_inlet_col) * grid.pixel_width)
             member = parent
-        # 1 mm, as the C code (1.1.1; 1e-3 of the length until 1.1.0, 1 m in 1 km).  The two sums add the same steps
+        # the painted path and the distance walk agree to 1 mm.  The two sums add the same steps
         # in float64, the walk's from the outlet up and the path's segment by segment from the head down; each
         # addition rounds by at most half a unit in the last place of the total, so on a path of up to 7,000 km in up
         # to 700,000 steps each sum is within 0.33 mm of the exact length and a correct run passes; a longer path or
@@ -2333,7 +2317,7 @@ def _derive_longest_flow_path(partition, dir_path, out_path, table_path, member_
         fd_tables.set_aside(marked_path + ".done")
     publish(temporary, out_path)
     write_table(pd.DataFrame(segment_rows, columns=MEMBER_TABLE_COLUMNS["lfp"]), member_table_path, float_format="%.6f")
-    write_basin_table_as_the_c_code_does(table, table_path)
+    write_attribute_basin_table(table, table_path)
     lfp_checks = ("the longest flow path of every basin of at least %.3f km2 (%d basins, written by the Python package "
                   "flowdivide), every path ends at its basin's outlet" % (partition.table_min_basin_area_km2, len(table)))
     fd_tables.write_done_marker(out_path, lfp_checks)
@@ -2430,7 +2414,7 @@ def _check_on_the_grid_of_the_flow_directions(dir_dataset, dir_path, channel_dat
 def derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path=None,
                           area_path=None, tag=None, gdal_cache_mb=None):
     """the driver for a registered rule: the same visit as derive_attribute_by_sweep, the kernel the user's, over the whole
-    window (the order, the downstream pixel and the member of every pixel of it, as in 0.7.6); GDAL's block cache bounded and
+    window (the order, the downstream pixel and the member of every pixel of it); GDAL's block cache bounded and
     the output locked against a second run as in derive_attribute"""
     with rasterio.Env(GDAL_CACHEMAX=gdal_cache_bytes(gdal_cache_mb)), _the_only_run_writing(out_path):
         return _derive_user_attribute(code, partition, dir_path, out_path, table_path, channel_path, area_path, tag)
