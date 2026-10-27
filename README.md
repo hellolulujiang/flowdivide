@@ -1,92 +1,51 @@
 # FlowDivide
 
-Hydrographic attributes from flow-direction grids too large for a computer's memory.
+FlowDivide computes hydrographic attributes on D8 grids larger than memory by cutting them into connected regions.
 
-FlowDivide cuts a D8 grid into regions that fit a memory capacity you choose. The cuts follow the rivers:
-whole basins are grouped, and a basin that is too large is cut at its tributary outlets (Pfafstetter). Each
-region is then computed once, in the order the attribute needs (upstream first for a value that travels
-downstream, downstream first for one that travels upstream), and one value crosses each cut. The results are exact:
-the same, pixel for pixel, as a run on the whole grid in one array.
+![FlowDivide workflow](docs/media/workflow.png)
 
-Tested on three large grids, all on one laptop with 64 GB of memory: HydroSHEDS v2.0 at 1 arc-second (30 m) over
-South America (259,200 × 219,600 pixels) and over North America (277,200 × 424,800), and MERIT Hydro at
-3 arc-seconds (90 m) over the whole globe (174,000 × 432,000).
+*FD1 partitions the grid; FD2 makes views; FD3 computes attributes region by region.*
 
-[![](docs/media/workflow.png)](docs/media/workflow.png)
+![Amazon partition](docs/media/amazon_cut_into_regions.png)
 
-*The workflow. FD1 makes the partition, FD2 the fine group rasters, coarse views and polygons, FD3 the attributes region by region.*
-
-[![](docs/media/amazon_cut_into_regions.png)](docs/media/amazon_cut_into_regions.png)
-
-*The Amazon at a capacity of 160 deg² (2³¹ pixels at 1 arc-second): cut into Pfafstetter pieces, the pieces
-too large cut again, then merged into 11 regions numbered so that every flow goes to a larger number.*
+*The Amazon is cut and merged into 11 regions, numbered so every flow goes to a larger number.*
 
 ## Install
 
-    conda create -n flowdivide -c conda-forge python=3.11 numpy numba rasterio gdal pandas geopandas pyogrio pyarrow shapely scipy matplotlib
-    conda activate flowdivide
+```sh
+git clone https://github.com/hellolulujiang/flowdivide.git
+cd flowdivide
+conda create -n flowdivide -c conda-forge python=3.11 numpy numba rasterio gdal pandas geopandas pyogrio pyarrow shapely scipy matplotlib
+conda activate flowdivide
+```
 
 ## Run
 
-The three grids of the paper are built in: HydroSHEDS v2.0 at 1 arc-second (South America, North America) and
-MERIT Hydro at 3 arc-seconds (global). Download the inputs from their producers
-([`DATA_NOTICE.md`](DATA_NOTICE.md)) and point the package at them with environment variables
-(see the [user guide](docs/user-guide.md#running)). Then
+Set the input paths as described in [Running](docs/user-guide.md#running), then:
 
-    python flowdivide.py run south-america --out-root /data/flowdivide
-    python flowdivide.py run south-america --out-root /data/flowdivide --steps fd3 --capacity 2^31
+```sh
+python flowdivide.py run south-america --out-root out
+python flowdivide.py run south-america --out-root out --steps fd3 --capacity 2^31
+```
 
-Any other north-up flow-direction grid with a coordinate reference system, geographic (degrees) or projected
-(metres), in any coding, at any resolution down to 1 m:
-
-    python flowdivide.py run mygrid --dir /data/mygrid_dir.tif --convention esri --out-root /data/flowdivide
-    python flowdivide.py run mygrid --dir /data/mygrid_dir.tif --convention esri --out-root /data/flowdivide --steps fd3
-
-Out come the partition at three capacities (2³¹, 2³⁰, 2²⁹ pixels), the basin and region tables, the coarse views
-as rasters and GeoParquet polygons, the basin groups on the fine grid, and, with `--steps fd3`, six attributes: Shreve magnitude, distance to the outlet, Hack order,
-upstream flow length, longest flow path and Strahler order. You can add your own attribute as a Numba kernel.
-
-Every step checks its own output, and a stopped run resumes where it stopped.
-
-The capacity sets the memory: the attributes hold one region at a time, and only the region's own pixels beyond the
-flow directions of its window. GDAL's block cache is bounded at 512 MiB while they run (`--gdal-cache-mb`, or
-`FLOWDIVIDE_GDAL_CACHE_MB`); without a bound GDAL would keep 5 % of the machine's memory. See
-[the memory of FD3](docs/user-guide.md#the-memory-of-fd3).
+Each region fits the chosen capacity. One value crosses each cut; results match a whole-grid run pixel for pixel.
 
 ## Documentation
 
-- [User guide](docs/user-guide.md): all options, the output files, the checks, adding an attribute
-- Published partitions made with this workflow: FullDivide for HydroSHEDS v2.0 at 30 m over North and South
-  America (<https://fullhydro.org/downloads/hydrosheds-v2.0-30m/fullbasin/fulldivide/v1.0/>)
-  and for MERIT Hydro at 90 m, with 90 regions of at most 2³¹ pixels
-  (<https://fullhydro.org/downloads/merit-hydro-v1.0.1-90m/fullbasin/fulldivide/v1.1/>).
-- Products and the other FullHydro tools: <https://fullhydro.org/tools/>
+[User guide](docs/user-guide.md): inputs, options, outputs, memory, checks and custom attributes.
 
-## Paper
+## Data products
 
-> Jiang, L., Chen, W. FlowDivide: a standard workflow for hydrographic attributes from flow-direction grids that
-> outgrow a computer's memory. Submitted to *Environmental Modelling & Software*.
+FullDivide partitions: [HydroSHEDS v2.0, 30 m](https://fullhydro.org/downloads/hydrosheds-v2.0-30m/fullbasin/fulldivide/v1.0/) over North and South America; [MERIT Hydro, 90 m](https://fullhydro.org/downloads/merit-hydro-v1.0.1-90m/fullbasin/fulldivide/v1.1/) globally.
 
-The paper describes version 1.0.0. The scripts that draw its figures are in [`paper/`](paper/), the repository as
-it was at submission is the tag `paper-v1.0`, and the data the scripts read are at
-<https://fullhydro.org/downloads/papers/flowdivide/v1.0/>.
+[Paper data](https://fullhydro.org/downloads/papers/flowdivide/v1.0/) · [FullHydro tools](https://fullhydro.org/tools/)
 
-## Tests
+## Citing
 
-    python test_region_numbering.py
+Jiang, L., Chen, W. *FlowDivide: a standard workflow for hydrographic attributes from flow-direction grids that outgrow a computer's memory.* Submitted to *Environmental Modelling & Software*.
 
-Sixteen tests need no data; the rest run on a basin cut from a finished run
-(see the [user guide](docs/user-guide.md#tests)).
-
-## Acknowledgements
-
-MERIT Hydro (Yamazaki et al., 2019; [10.1029/2019WR024873](https://doi.org/10.1029/2019WR024873)), HydroSHEDS v2.0
-(<https://www.hydrosheds.org/hydrosheds-v2>) and HydroBASINS (Lehner and Grill, 2013;
-[10.1002/hyp.9740](https://doi.org/10.1002/hyp.9740)).
+Cite this repository with the release used. [Paper figures and archive](docs/user-guide.md#paper-and-reproducibility).
 
 ## Licence
 
-MIT; see [`LICENSE`](LICENSE). The data FlowDivide runs on keep their producers' terms; see
-[`DATA_NOTICE.md`](DATA_NOTICE.md).
-
-Author: Lulu Jiang (<https://lulujiang.me>) · <lulu_jiang@pku.edu.cn>
+MIT; see [LICENSE](LICENSE). Input data retain their producers' terms; see [DATA_NOTICE.md](DATA_NOTICE.md).
