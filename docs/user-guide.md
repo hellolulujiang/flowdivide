@@ -41,7 +41,7 @@ of this repository; download them from their producers and use them under their 
     export FLOWDIVIDE_MERIT=/data/merit/dir_global_90m.tif
     export FLOWDIVIDE_MERIT_ACC=/data/merit/upg_global_90m.tif     # MERIT Hydro's upstream pixel count
     export FLOWDIVIDE_MERIT_ACA=/data/merit/upa_global_90m.tif     # MERIT Hydro's upstream area
-    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/bat_global_90m.parquet  # MERIT-FullBasin's outlets; a re-run keeps their ids
+    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/bat_global_90m.parquet  # FullBasin's outlets; a re-run keeps their ids
     export FLOWDIVIDE_HYBAS=/data/hybas/L3                         # hybas_<xx>_lev03_v1c.shp (or --hybas-root)
 
 Download the outlet table from [bat_global_90m.parquet](https://data.fullhydro.org/dl/merit-hydro-v1.0.1-90m/fullbasin/fulldivide/v1.1/basins/bat_global_90m.parquet); the `.csv` beside it works as well.
