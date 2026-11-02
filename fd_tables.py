@@ -62,7 +62,7 @@ except ImportError:
 import numpy as np
 import pandas as pd
 
-VERSION = "1.2.0"
+VERSION = "1.1.5"
 
 UNSET_ID = 0
 UNSET_PIXEL = -1

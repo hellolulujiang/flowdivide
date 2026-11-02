@@ -14,7 +14,7 @@ their rows of the tables, and coloured so that no two neighbours share a number:
                    view.  Basin view: a cell that is at least a quarter land (pixels of any basin, the
                    small ones included) is land, less and it stays water; a land cell goes to the one,
                    of the basins of the view that hold at least a quarter of ITS LAND, holding the most
-                   of that land, a tie to the smallest id (1.2.0: the one rule).  The outlet of a basin
+                   of that land, a tie to the smallest id (1.1.5: the one rule).  The outlet of a basin
                    is the fine pixel of the tables; the coarse cell it falls in need not be the basin's.  Region and group views FOLLOW the basin view of the same resolution: a cell
                    the basin view gave a basin takes the region of that basin (a cut basin lies in
                    several regions: the one holding most of its pixels in the cell) or the group of
@@ -72,7 +72,7 @@ FLOWDIVIDE_VERSION = fd_tables.VERSION  # named in the metadata of every vector 
 CELL_MIN_LAND_PERCENT = 25              # a cell with less land than this stays water
 CELL_MIN_WINNER_PERCENT = 25            # a candidate basin holds at least this much of the cell's land
 VIEW_RULE = 4                           # the rule of the views: 4, the basins of at least an area, a cell to the one holding most of its land
-# 1.2.0 (the C code's v10.50, 2026-11-02): one rule, most_land.  A land cell goes to the candidate holding the MOST
+# 1.1.5 (the C code's v10.50, 2026-11-02): one rule, most_land.  A land cell goes to the candidate holding the MOST
 # of its land, a tie to the smallest id (the larger basin); the candidates and the two quarters are those of v9.63,
 # whose rule (the largest candidate) gave a border cell to the larger basin even when a smaller one held most of
 # its land, and is gone.  The text is the one the C code writes (v10.49 named the rule first)
@@ -429,7 +429,7 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
     """the fine mask folded at several factors in ONE pass over it: jobs is a list of (out_path, factor,
     basins_in_the_view or None, basin_view_path or None, min_basin_area_km2 or None); a strip of fine rows is a
     multiple of every factor, so every job folds whole coarse rows from it.  rule: "most_land" (the one
-    rule of 1.2.0: the candidate holding the most of a cell's land, a tie to the smallest id), the basin
+    rule of 1.1.5: the candidate holding the most of a cell's land, a tie to the smallest id), the basin
     view (the job names N, the basins of the view, ids 1..N, and the area of its smallest basin, which
     goes into the metadata); "region", the region or group view following the basin view named in the job
     (lookup: basin id -> group id for a group view, and the fine mask is the basin mask; for a capacity
@@ -1122,7 +1122,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
     # that had lost a row would draw that object as an empty geometry of 0 cells and publish it
     with open_raster(coarse_path) as coarse_dataset:
         # the polygons carry the rule of the mask they are drawn from; a mask of another rule (v9.63's, or none)
-        # is refused (1.2.0): make the views again first
+        # is refused (1.1.5): make the views again first
         view_rule_text = coarse_dataset.tags().get("FLOWDIVIDE_VIEW_RULE")
         if view_rule_text not in BASIN_VIEW_RULES.values():
             raise FlowDivideError("%s does not carry the rule of this version (%r); make the views again first" % (coarse_path, view_rule_text))

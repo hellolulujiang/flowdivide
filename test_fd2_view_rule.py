@@ -1,4 +1,4 @@
-"""Which basin one coarse cell of the basin view goes to (fd2), the one rule of 1.2.0 (most_land):
+"""Which basin one coarse cell of the basin view goes to (fd2), the one rule of 1.1.5 (most_land):
 
     python3 test_fd2_view_rule.py
 

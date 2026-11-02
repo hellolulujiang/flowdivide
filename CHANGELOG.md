@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.2.0 (2026-11-02)
+## 1.1.5 (2026-11-02)
 
 The coarse views have one rule, `most_land` (the C code's v10.50); the views of 1.1.4 and before are made again.
 
