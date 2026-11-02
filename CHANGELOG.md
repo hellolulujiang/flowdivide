@@ -12,7 +12,7 @@ The coarse views have one rule, `most_land` (the C code's v10.50); the views of 
 - The outlet of a basin is the fine pixel of the tables (`outlet_row`, `outlet_col`, `outlet_lon`, `outlet_lat`).
   The coarse cell it falls in need not belong to the basin.
 - `FLOWDIVIDE_VIEW_RULE` is the C code's text, word for word (`VIEW_RULE_TAG`); `VIEW_RULE` is 4, so a run left by
-  1.1.x folds its views again. The polygons refuse a mask that does not carry this rule.
+  1.1.4 or before folds its views again. The polygons refuse a mask that does not carry this rule.
 - `_fold_strip_largest_basin` is renamed `_fold_strip_basin` and loses `by_most_land`.
 - `test_fd2_view_rule.py`: the eight blocks of the C test, a whole fold with its tag, a group view following it.
 
