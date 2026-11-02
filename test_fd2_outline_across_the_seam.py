@@ -170,6 +170,7 @@ def test_vectorise_mask(scratch):
                "transform": TRANSFORM, "nodata": 0}
     with rasterio.open(coarse_path, "w", **profile) as dataset:
         dataset.write(view, 1)
+        dataset.update_tags(FLOWDIVIDE_VIEW_RULE=fd2.VIEW_RULE_TAG)   # 1.2.0: the polygons refuse a mask of another rule
     rows = []
     for object_id in (1, 2, 3):
         cells = np.argwhere(view == object_id)

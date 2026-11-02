@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.2.0 (2026-11-02)
+
+The coarse views have one rule, `most_land` (the C code's v10.50); the views of 1.1.4 and before are made again.
+
+- A land cell of the basin view goes to the candidate holding the most of its land, a tie to the smallest id (the
+  larger basin). The candidates and the two quarters are unchanged: a cell is land when at least a quarter of it
+  is pixels of any basin; a candidate is a basin of the view holding at least a quarter of that land. The rule of
+  v9.63 (`largest_basin`: the largest candidate) gave a border cell to the larger basin even when a smaller one
+  held most of its land; it is gone, and `rule="largest_basin"` is refused.
+- The outlet of a basin is the fine pixel of the tables (`outlet_row`, `outlet_col`, `outlet_lon`, `outlet_lat`).
+  The coarse cell it falls in need not belong to the basin.
+- `FLOWDIVIDE_VIEW_RULE` is the C code's text, word for word (`VIEW_RULE_TAG`); `VIEW_RULE` is 4, so a run left by
+  1.1.x folds its views again. The polygons refuse a mask that does not carry this rule.
+- `_fold_strip_largest_basin` is renamed `_fold_strip_basin` and loses `by_most_land`.
+- `test_fd2_view_rule.py`: the eight blocks of the C test, a whole fold with its tag, a group view following it.
+
+## 1.1.5.dev1 (2026-11-02, not released)
+
+A copy of 1.1.4. The published views are unchanged: the default rule and its text are those of 1.1.4.
+
+- `fd2_views.fold_mask_at_factors(..., rule="most_land")`: a second rule for the basin view (the C code's v10.49,
+  `PYFLWDIR_FD2_VIEW_RULE=most_land`). A land cell goes to the candidate holding the most of its land, a tie to the
+  smallest id (the larger basin). The candidates and the two quarters are those of `largest_basin` (v9.63), which
+  gave a border cell to the larger basin even when a smaller one held most of its land. Its views carry their own
+  `FLOWDIVIDE_VIEW_RULE` (`VIEW_RULE_TAG_MOST_LAND`, word for word the C code's); a region or group view follows a
+  basin view of either rule and carries its rule, and the polygons carry the rule of the mask they are drawn from.
+  The pipeline (`flowdivide.py`) still folds by `largest_basin`.
+- `test_fd2_view_rule.py`: the eight blocks of the C test under both rules, and a whole fold with its tags.
+
 ## 1.1.4 (2026-10-28)
 
 The published partitions are unchanged: MERIT uses `level2`, the 30 m grids `none`; neither uses `balanced`.

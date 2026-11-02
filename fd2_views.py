@@ -12,9 +12,10 @@ their rows of the tables, and coloured so that no two neighbours share a number:
                    down, those are the ids 1..N: the table of the view is the first N rows of the basin
                    table, and one index, basin_id - 1, reaches a basin in the fine table and in every
                    view.  Basin view: a cell that is at least a quarter land (pixels of any basin, the
-                   small ones included) is land, less and it stays water; a land cell goes to the largest
-                   -- the smallest id -- of the basins of the view that hold at least a quarter of ITS
-                   LAND.  Region and group views FOLLOW the basin view of the same resolution: a cell
+                   small ones included) is land, less and it stays water; a land cell goes to the one,
+                   of the basins of the view that hold at least a quarter of ITS LAND, holding the most
+                   of that land, a tie to the smallest id (1.2.0: the one rule).  The outlet of a basin
+                   is the fine pixel of the tables; the coarse cell it falls in need not be the basin's.  Region and group views FOLLOW the basin view of the same resolution: a cell
                    the basin view gave a basin takes the region of that basin (a cut basin lies in
                    several regions: the one holding most of its pixels in the cell) or the group of
                    that basin from the table; a cell the basin view left empty goes by majority,
@@ -70,9 +71,15 @@ FLOWDIVIDE_VERSION = fd_tables.VERSION  # named in the metadata of every vector 
 
 CELL_MIN_LAND_PERCENT = 25              # a cell with less land than this stays water
 CELL_MIN_WINNER_PERCENT = 25            # a candidate basin holds at least this much of the cell's land
-VIEW_RULE = 3                           # the rule of the views: 3, the basins of at least an area
-VIEW_RULE_TAG = ("v9.63: the view holds the basins of at least its minimum area, the ids 1..N; a cell of a quarter land goes to the "
-                 "largest of them (the smallest id) holding a quarter of that land; the region view follows the basin view")   # written into every view
+VIEW_RULE = 4                           # the rule of the views: 4, the basins of at least an area, a cell to the one holding most of its land
+# 1.2.0 (the C code's v10.50, 2026-11-02): one rule, most_land.  A land cell goes to the candidate holding the MOST
+# of its land, a tie to the smallest id (the larger basin); the candidates and the two quarters are those of v9.63,
+# whose rule (the largest candidate) gave a border cell to the larger basin even when a smaller one held most of
+# its land, and is gone.  The text is the one the C code writes (v10.49 named the rule first)
+VIEW_RULE_TAG = ("v10.49: the view holds the basins of at least its minimum area, the ids 1..N; a cell of a quarter land goes to the "
+                 "one of them holding the most of that land, of those holding a quarter of it, a tie to the smallest id; the region "
+                 "view follows the basin view")   # written into every view
+BASIN_VIEW_RULES = {"most_land": VIEW_RULE_TAG}   # rule -> the tag its views carry
 # the rule of the polygons and the boundary lines, written last among the
 # metadata items of every vector file (the polygons given to users must be OGC-valid)
 # a basin astride the 180th meridian is outlined in one piece
@@ -247,13 +254,13 @@ def fine_group_raster(basin_path, out_path, root, run, grouping, tag="fd2"):
 # =============================================================================
 
 @njit(cache=True)
-def _fold_strip_largest_basin(fine, factor, basin_count_in_the_view, out_row, min_land_pixels, count_of_basin, touched,
-                              cell_count, cell_row_min, cell_row_max, cell_col_min, cell_col_max, coarse_row, flags):
+def _fold_strip_basin(fine, factor, basin_count_in_the_view, out_row, min_land_pixels, count_of_basin, touched,
+                      cell_count, cell_row_min, cell_row_max, cell_col_min, cell_col_max, coarse_row, flags):
     """the basin view of one row of coarse cells: a cell of
-    at least min_land_pixels pixels of any basin (the basins beyond the view included) goes to the largest, that is
-    the smallest id, of the basins of the view (ids 1..basin_count_in_the_view) that hold at least
-    CELL_MIN_WINNER_PERCENT of the cell's land.  count_of_basin is one counter per basin id, zero between cells;
-    touched the ids seen in the cell.  A basin id beyond the table sets flags[0]."""
+    at least min_land_pixels pixels of any basin (the basins beyond the view included) goes to the one, of the
+    basins of the view (ids 1..basin_count_in_the_view) that hold at least CELL_MIN_WINNER_PERCENT of the cell's
+    land, holding the most of that land, a tie to the smallest id.  count_of_basin is one counter per basin id,
+    zero between cells; touched the ids seen in the cell.  A basin id beyond the table sets flags[0]."""
     fine_nrow, fine_ncol = fine.shape
     coarse_ncol = out_row.size
     limit = min(count_of_basin.size, cell_count.size)
@@ -277,14 +284,16 @@ def _fold_strip_largest_basin(fine, factor, basin_count_in_the_view, out_row, mi
                 count_of_basin[basin_id] += 1
         cell_is_land = land_pixels >= min_land_pixels
         winner = np.uint32(0)
+        winner_count = 0
         for k in range(touched_count):
             basin_id = touched[k]
             count_in_the_cell = count_of_basin[basin_id]
             count_of_basin[basin_id] = 0
             if not cell_is_land or count_in_the_cell * 100 < CELL_MIN_WINNER_PERCENT * land_pixels:
                 continue
-            if winner == 0 or basin_id < winner:
+            if winner == 0 or count_in_the_cell > winner_count or (count_in_the_cell == winner_count and basin_id < winner):
                 winner = basin_id
+                winner_count = count_in_the_cell
         out_row[coarse_col] = winner
         if winner != 0:
             cell_count[winner] += 1
@@ -416,10 +425,11 @@ def min_land_pixels_of(factor):
     return -(-CELL_MIN_LAND_PERCENT * factor * factor // 100)
 
 
-def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, tag="fd2.1", rule="largest_basin", basin_fine_path=None):
+def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, tag="fd2.1", rule="most_land", basin_fine_path=None):
     """the fine mask folded at several factors in ONE pass over it: jobs is a list of (out_path, factor,
     basins_in_the_view or None, basin_view_path or None, min_basin_area_km2 or None); a strip of fine rows is a
-    multiple of every factor, so every job folds whole coarse rows from it.  rule: "largest_basin", the basin
+    multiple of every factor, so every job folds whole coarse rows from it.  rule: "most_land" (the one
+    rule of 1.2.0: the candidate holding the most of a cell's land, a tie to the smallest id), the basin
     view (the job names N, the basins of the view, ids 1..N, and the area of its smallest basin, which
     goes into the metadata); "region", the region or group view following the basin view named in the job
     (lookup: basin id -> group id for a group view, and the fine mask is the basin mask; for a capacity
@@ -435,9 +445,10 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
     factors = [factor for _, factor, _, _, _ in jobs]
     if any(int(factor) != factor or factor < 1 for factor in factors):
         raise FlowDivideError("a fold factor must be a positive integer")
-    if rule not in ("largest_basin", "region"):
+    if rule not in BASIN_VIEW_RULES and rule != "region":
         raise FlowDivideError("unknown fold rule '%s'" % rule)
-    if rule == "largest_basin" and any(in_the_view is None or in_the_view < 1 or min_area is None for _, _, in_the_view, _, min_area in jobs):
+    basin_rule = rule in BASIN_VIEW_RULES
+    if basin_rule and any(in_the_view is None or in_the_view < 1 or min_area is None for _, _, in_the_view, _, min_area in jobs):
         raise FlowDivideError("a basin view names the basins of the view (ids 1..N) and the area of its smallest basin")
     if rule == "region" and any(view is None for _, _, _, view, _ in jobs):
         raise FlowDivideError("a region view follows the basin view of its resolution, which must be named")
@@ -495,15 +506,18 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                     raise FlowDivideError("the basin view %s is not the fold of %s at factor %d" % (basin_view_path, fine_path, factor))
                 if basin_view.dtypes[0] not in ("uint8", "uint16", "uint32"):          # unsigned, as the masks
                     raise FlowDivideError("%s is %s; the basin views are unsigned integers" % (basin_view_path, basin_view.dtypes[0]))
-                if basin_view.tags().get("FLOWDIVIDE_VIEW_RULE") != VIEW_RULE_TAG:
+                # the region view follows the basin view and carries its rule
+                view_rule_text = basin_view.tags().get("FLOWDIVIDE_VIEW_RULE")
+                if view_rule_text not in BASIN_VIEW_RULES.values():
                     raise FlowDivideError("the basin view %s does not carry the rule of this version; make the basin views first" % basin_view_path)
                 min_area_text = basin_view.tags().get("FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2")     # a region view carries the area of the basin view it follows
                 if min_area_text is None:
                     raise FlowDivideError("the basin view %s carries no FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2" % basin_view_path)
             else:
                 min_area_text = area_text(min_area_km2)
+                view_rule_text = BASIN_VIEW_RULES[rule]
             dataset = stack.enter_context(rasterio.open(fd_tables.free_name(out_path + ".partial.tif"), "w", **profile))
-            dataset.update_tags(FLOWDIVIDE_VIEW_RULE=VIEW_RULE_TAG, FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2=min_area_text)
+            dataset.update_tags(FLOWDIVIDE_VIEW_RULE=view_rule_text, FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2=min_area_text)
             states.append({
                 "out_path": out_path, "factor": factor, "coarse_nrow": coarse_nrow, "coarse_ncol": coarse_ncol,
                 "in_the_view": int(in_the_view) if in_the_view is not None else 0,
@@ -511,7 +525,7 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                 "row_max": np.full(object_count_limit, -1, np.int32), "col_min": np.full(object_count_limit, np.iinfo(np.int32).max, np.int32),
                 "col_max": np.full(object_count_limit, -1, np.int32), "scratch_id": np.zeros(factor * factor + 1, np.uint32),
                 "scratch_count": np.zeros(factor * factor + 1, np.int64),
-                "min_land": min_land_pixels_of(factor), "count_of_basin": np.zeros(object_count_limit if rule == "largest_basin" else 0, np.int64),
+                "min_land": min_land_pixels_of(factor), "count_of_basin": np.zeros(object_count_limit if basin_rule else 0, np.int64),
                 "flags": np.zeros(2, np.int64), "basin_view": basin_view, "dataset": dataset})
         strip_multiples = max(1, 200000000 // (common * fine_ncol))
         strip_rows = common * strip_multiples
@@ -529,9 +543,9 @@ def fold_mask_at_factors(fine_path, jobs, lookup=None, object_count_limit=None, 
                     basin_view_rows = state["basin_view"].read(1, window=Window(0, coarse_row0, state["coarse_ncol"], coarse_count))
                 for k in range(coarse_count):
                     block = strip[k * factor:min((k + 1) * factor, fine_count)]
-                    if rule == "largest_basin":
-                        _fold_strip_largest_basin(block, factor, state["in_the_view"], out_rows[k], state["min_land"], state["count_of_basin"], state["scratch_id"],
-                                                  state["cell_count"], state["row_min"], state["row_max"], state["col_min"], state["col_max"], coarse_row0 + k, state["flags"])
+                    if basin_rule:
+                        _fold_strip_basin(block, factor, state["in_the_view"], out_rows[k], state["min_land"], state["count_of_basin"], state["scratch_id"],
+                                          state["cell_count"], state["row_min"], state["row_max"], state["col_min"], state["col_max"], coarse_row0 + k, state["flags"])
                     else:
                         basin_block = basin_strip[k * factor:min((k + 1) * factor, fine_count)]
                         _fold_strip_region(block, basin_block, basin_view_rows[k], factor, lookup_array, out_rows[k], state["min_land"], state["scratch_id"], state["scratch_count"],
@@ -1107,6 +1121,11 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
     # the objects list checked against the mask itself: every id with a cell is listed, with its count.  A list
     # that had lost a row would draw that object as an empty geometry of 0 cells and publish it
     with open_raster(coarse_path) as coarse_dataset:
+        # the polygons carry the rule of the mask they are drawn from; a mask of another rule (v9.63's, or none)
+        # is refused (1.2.0): make the views again first
+        view_rule_text = coarse_dataset.tags().get("FLOWDIVIDE_VIEW_RULE")
+        if view_rule_text not in BASIN_VIEW_RULES.values():
+            raise FlowDivideError("%s does not carry the rule of this version (%r); make the views again first" % (coarse_path, view_rule_text))
         counted = np.zeros(max(rows_in_the_view, int(present_ids.max()) if present_ids.size else 0) + 1, np.int64)
         for strip_row0 in range(0, coarse_dataset.height, 4096):
             strip_count = min(4096, coarse_dataset.height - strip_row0)
@@ -1188,7 +1207,7 @@ def vectorise_mask(coarse_path, table, id_column, out_stem, layer, rows_in_the_v
     frame = geopandas.GeoDataFrame(attributes, geometry=geopandas.GeoSeries(geometries, crs=crs), crs=crs)
     rows_text = ("the basins of the view, ids 1..N, row k is basin k + 1 (row basin_id - 1 of the fine table), as the GeoPackage's fid = basin_id"
                  if id_column == "basin_id" else "every row of the fine table in its order, as the GeoPackage's fid = row number")
-    metadata = {"FLOWDIVIDE_VERSION": FLOWDIVIDE_VERSION, "FLOWDIVIDE_VIEW_RULE": VIEW_RULE_TAG, "FLOWDIVIDE_RESOLUTION": resolution_text, "FLOWDIVIDE_ROWS": rows_text}
+    metadata = {"FLOWDIVIDE_VERSION": FLOWDIVIDE_VERSION, "FLOWDIVIDE_VIEW_RULE": view_rule_text, "FLOWDIVIDE_RESOLUTION": resolution_text, "FLOWDIVIDE_ROWS": rows_text}
     if min_basin_area_km2 is not None:
         metadata["FLOWDIVIDE_VIEW_MIN_BASIN_AREA_KM2"] = area_text(min_basin_area_km2)
     metadata["FLOWDIVIDE_VECTOR_RULE"] = VECTOR_RULE_TAG

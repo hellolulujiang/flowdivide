@@ -1718,7 +1718,7 @@ class Chain:
             in_the_view[name] = fd2.basins_of_the_view(basins, min_area, layout.basin_table())
             jobs.append((layout.basin_view(name), factor, in_the_view[name], None, min_area))
             self.note("  the %s view holds the %d basins of at least %s km2 (ids 1..%d)" % (name, in_the_view[name], fd2.area_text(min_area), in_the_view[name]))
-        fd2.fold_mask_at_factors(layout.raster("bsn"), jobs, object_count_limit=limit, rule="largest_basin")
+        fd2.fold_mask_at_factors(layout.raster("bsn"), jobs, object_count_limit=limit, rule="most_land")
         if self.dataset.vectorise_basins:
             for name, factor in self.dataset.views:
                 fd2.vectorise_mask(layout.basin_view(name), basins, "basin_id", layout.vector("bsn", name), "basins", in_the_view[name], self.cells_per_degree_of_view(factor),

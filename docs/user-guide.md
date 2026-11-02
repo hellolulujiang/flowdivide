@@ -41,7 +41,7 @@ of this repository; download them from their producers and use them under their 
     export FLOWDIVIDE_MERIT=/data/merit/dir_global_90m.tif
     export FLOWDIVIDE_MERIT_ACC=/data/merit/upg_global_90m.tif     # MERIT Hydro's upstream pixel count
     export FLOWDIVIDE_MERIT_ACA=/data/merit/upa_global_90m.tif     # MERIT Hydro's upstream area
-    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/bat_global_90m.parquet  # FullBasin's outlets; a re-run keeps their ids
+    export FLOWDIVIDE_MERIT_BASIN_IDS=/data/merit/bat_global_90m.parquet  # MERIT-FullBasin's outlets; a re-run keeps their ids
     export FLOWDIVIDE_HYBAS=/data/hybas/L3                         # hybas_<xx>_lev03_v1c.shp (or --hybas-root)
 
 Download the outlet table from [bat_global_90m.parquet](https://data.fullhydro.org/dl/merit-hydro-v1.0.1-90m/fullbasin/fulldivide/v1.1/basins/bat_global_90m.parquet); the `.csv` beside it works as well.
@@ -237,8 +237,10 @@ Under `<out-root>/<dataset>/` (`<c>` the continent,
     rasters only. The views are folds of the masks, for drawing. A view holds the basins of at least
     a quarter of a cell at the equator (0.0194, 0.0775, 0.2151 and 7.7450 km² at 1/400°, 1/200°,
     1/120° and 1/20°). The basins are numbered from the largest down, so those are the ids 1..N.
-    A cell that is at least a quarter land goes to the largest of them — the smallest id — holding
-    at least a quarter of its land. The region and group views follow the basin view of the same
+    A cell that is at least a quarter land goes to the one of them, of those holding at least a
+    quarter of its land, that holds the most of it; a tie goes to the smallest id. The outlet of a
+    basin is the fine pixel of the tables (`outlet_row`, `outlet_col`, `outlet_lon`, `outlet_lat`);
+    the coarse cell it falls in need not belong to the basin. The region and group views follow the basin view of the same
     resolution. A cell with a basin lies in the region, or the group, of that basin. A cell without
     one takes the region or group holding most of it, the cell being a quarter land. Every view
     carries the rule in its metadata item `FLOWDIVIDE_VIEW_RULE`. A basin view carries the area of
